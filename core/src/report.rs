@@ -395,19 +395,23 @@ pub fn write_pdf(model: &Model, a: &Analysis, rep: Option<&Report>, opts: &Repor
 
     // ---- summary
     fl.heading("1  Summary");
-    let n_cols = model.members.iter().filter(|m| model.kind(m) == MemberKind::Column).count();
-    let n_beams = model.members.iter().filter(|m| model.kind(m) == MemberKind::Beam).count();
+    let frame: Vec<&Member> = model.members.iter().filter(|m| m.role.is_frame()).collect();
+    let n_cols = frame.iter().filter(|m| model.kind(m) == MemberKind::Column).count();
+    let n_beams = frame.iter().filter(|m| model.kind(m) == MemberKind::Beam).count();
     let mut s = format!(
-        "The model has {} nodes and {} members ({} columns, {} beams and {} other members), {} slabs, {} supports, {} load cases and {} combinations. ",
-        model.nodes.len(), model.members.len(), n_cols, n_beams, model.members.len() - n_cols - n_beams, model.slabs.len(), model.supports.len(), model.cases.len(), model.combos.len()
+        "The model has {} nodes and {} frame members ({} columns, {} beams and {} other members), {} structural walls, {} slabs, {} supports, {} load cases and {} combinations. ",
+        model.nodes.len(), frame.len(), n_cols, n_beams, frame.len() - n_cols - n_beams, model.walls.len(), model.slabs.len(), model.supports.len(), model.cases.len(), model.combos.len()
     );
+    if !model.walls.is_empty() {
+        s.push_str("Each wall is analysed by the wide-column analogy: a pier on its centre line with the wall's section, including shear deformation, and rigid arms at every level out to its ends. ");
+    }
     match rep {
         Some(r) => {
             let fails = r.failing();
             let worst = all_ratios(r).into_iter().fold((String::new(), 0.0f64), |b, x| if x.1 > b.1 { x } else { b });
             s.push_str(&format!(
-                "The design covers {} beams, {} columns, {} slabs, {} footings, {} steel members and {} members of other materials, and the largest design ratio is {:.2} ({}). ",
-                r.beams.len(), r.columns.len(), r.slabs.len(), r.footings.len(), r.steel.len(), r.others.len(), worst.1, worst.0
+                "The design covers {} beams, {} columns, {} wall storeys, {} slabs, {} footings, {} steel members and {} members of other materials, and the largest design ratio is {:.2} ({}). ",
+                r.beams.len(), r.columns.len(), r.walls.len(), r.slabs.len(), r.footings.len(), r.steel.len(), r.others.len(), worst.1, worst.0
             ));
             if fails.is_empty() {
                 s.push_str("Every designed element passes its checks at the target ratio.");
@@ -482,7 +486,7 @@ pub fn write_pdf(model: &Model, a: &Analysis, rep: Option<&Report>, opts: &Repor
     for c in &model.cases {
         if let Some(cr) = a.case(c.id) {
             let rs = cr.reaction_sum();
-            let bal = (0..3).all(|k| (cr.applied[k] + rs[k]).abs() <= 1e-6 * (1.0 + cr.applied[k].abs()));
+            let bal = (0..3).all(|k| (cr.applied[k] + rs[k]).abs() <= 1e-6 * (1.0 + cr.applied.iter().map(|x| x.abs()).fold(0.0, f64::max)));
             lrows.push((vec![c.name.clone(), format!("{:?}", c.kind), if c.self_weight { "yes".into() } else { "no".into() }, f(cr.applied[2], 2), f(rs[2], 2), f(cr.applied[0], 2), f(cr.applied[1], 2), if bal { "yes".into() } else { "NO".into() }], !bal));
         }
     }
@@ -620,6 +624,7 @@ fn all_ratios(r: &Report) -> Vec<(String, f64)> {
     v.extend(r.footings.iter().map(|b| (format!("footing at node {}: {}", b.node, b.governs), b.ratio)));
     v.extend(r.steel.iter().map(|b| (format!("steel member {}: {}", b.member, b.governs), b.ratio)));
     v.extend(r.others.iter().map(|b| (format!("member {}: {}", b.member, b.governs), b.ratio)));
+    v.extend(r.walls.iter().map(|b| (format!("wall {} at z {:.1}: {}", b.name, b.z0, b.governs), b.ratio)));
     v.into_iter().filter(|x| x.1.is_finite()).collect()
 }
 
@@ -644,6 +649,15 @@ fn design_tables(fl: &mut Flow, model: &Model, r: &Report) {
         fl.sub("Concrete columns (ACI 318-19)");
         let rows: Vec<(Vec<String>, bool)> = r.columns.iter().map(|c| (vec![c.member.to_string(), format!("{:.0} x {:.0}", c.b * 1e3, c.h * 1e3), c.bars.clone(), f(c.rho * 100.0, 2), c.ties.clone(), f(c.ratio, 2), c.governs.clone()], !c.ok)).collect();
         fl.table(&[0.6, 1.0, 1.4, 0.7, 1.4, 0.6, 2.0], &["Column", "b x h (mm)", "Bars", "ρ (%)", "Ties", "Ratio", "Governs"], &rows);
+    }
+    if !r.walls.is_empty() {
+        fl.sub(if r.walls.iter().any(|w| w.special) { "Structural walls (ACI 318-19 Ch. 11, special walls 18.10)" } else { "Structural walls (ACI 318-19 Ch. 11)" });
+        let rows: Vec<(Vec<String>, bool)> = r
+            .walls
+            .iter()
+            .map(|w| (vec![w.name.clone(), format!("{:.2} – {:.2}", w.z0, w.z1), format!("{:.0} × {:.2}", w.t * 1e3, w.lw), w.vertical.clone(), w.horizontal.clone(), format!("{:.0} / {:.0}", w.vu, w.phi_vn), if w.boundary.is_some() { "required".into() } else { "—".into() }, f(w.ratio, 2), w.governs.clone()], !w.ok))
+            .collect();
+        fl.table(&[0.6, 0.9, 0.9, 1.3, 1.3, 1.0, 0.8, 0.5, 1.7], &["Wall", "z (m)", "t (mm) × lw (m)", "Vertical", "Horizontal", "Vu / φVn (kN)", "Boundary", "Ratio", "Governs"], &rows);
     }
     if !r.slabs.is_empty() {
         fl.sub("Slabs");
@@ -736,6 +750,16 @@ fn details(fl: &mut Flow, model: &Model, r: &Report, all: bool) {
         fl.sub(&format!("Member {} ({}, {})", s.member, s.section, s.code));
         let rows: Vec<(Vec<String>, bool)> = s.checks.iter().map(|x| (vec![x.name.clone(), x.detail.clone(), f(x.ratio, 2)], x.ratio > 1.0)).collect();
         fl.table(&[1.6, 4.4, 0.6], &["Check", "Demand and capacity", "Ratio"], &rows);
+    }
+    let ww = worst(r.walls.iter().map(|b| b.ratio).collect());
+    for (_, w) in r.walls.iter().enumerate().filter(|(k, _)| pick(ww, *k)) {
+        fl.sub(&format!("Wall {} at z {:.2}–{:.2} m ({:.0} mm × {:.2} m)", w.name, w.z0, w.z1, w.t * 1e3, w.lw));
+        let rows: Vec<(Vec<String>, bool)> = w.checks.iter().map(|x| (vec![x.name.clone(), x.detail.clone(), f(x.ratio, 2)], x.ratio > 1.0)).collect();
+        fl.table(&[1.6, 4.4, 0.6], &["Check", "Demand and capacity", "Ratio"], &rows);
+        fl.para(&format!("Vertical bars {} (ρl = {:.4}) and horizontal bars {} (ρt = {:.4}) in {} curtain{}.{}", w.vertical, w.rho_l, w.horizontal, w.rho_t, w.curtains, if w.curtains == 2 { "s" } else { "" }, w.boundary.as_ref().map(|b| format!(" Boundary elements: {b}.")).unwrap_or_default()));
+        for n in &w.notes {
+            fl.note(&format!("• {n}"));
+        }
     }
     let wf = worst(r.footings.iter().map(|b| b.ratio).collect());
     for (_, x) in r.footings.iter().enumerate().filter(|(k, _)| pick(wf, *k)) {

@@ -613,10 +613,11 @@ impl App {
         let t = Tokens::get(ui.ctx());
         let m = self.live.as_ref().unwrap_or(&self.model).clone();
         ui.label(RichText::new(&m.name).font(theme::medium_font(14.0)));
-        ui.label(RichText::new(format!("{} nodes · {} members · {} supports · {} slabs", m.nodes.len(), m.members.len(), m.supports.len(), m.slabs.len())).small().color(t.text_dim));
+        let frame = m.members.iter().filter(|x| x.role.is_frame()).count();
+        ui.label(RichText::new(format!("{} nodes · {} members · {} walls · {} supports · {} slabs", m.nodes.len(), frame, m.walls.len(), m.supports.len(), m.slabs.len())).small().color(t.text_dim));
         ui.add_space(4.0);
         for (kind, title) in [(MemberKind::Column, "Columns"), (MemberKind::Beam, "Beams"), (MemberKind::Brace, "Braces")] {
-            let list: Vec<&Member> = m.members.iter().filter(|x| m.kind(x) == kind).collect();
+            let list: Vec<&Member> = m.members.iter().filter(|x| x.role.is_frame() && m.kind(x) == kind).collect();
             if list.is_empty() {
                 continue;
             }
@@ -629,6 +630,23 @@ impl App {
                             self.selected = vec![x.id];
                             self.selected_slab = None;
                             self.right = RightTab::Properties;
+                        }
+                        if let Some(r) = r {
+                            ui.label(ratio_text(&t, r).small());
+                        }
+                    });
+                }
+            });
+        }
+        if !m.walls.is_empty() {
+            egui::CollapsingHeader::new(format!("Walls ({})", m.walls.len())).id_salt("walls").show(ui, |ui| {
+                for w in &m.walls {
+                    let pier = m.members.iter().find(|x| x.role == pondus_core::model::Role::WallPier(w.id)).map(|x| x.id);
+                    let r = self.report.as_ref().map(|r| r.walls.iter().filter(|d| d.wall == w.id).map(|d| d.ratio).fold(0.0, f64::max)).filter(|r| *r > 0.0);
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(pier.is_some_and(|p| self.selected.contains(&p)), format!("{} · {:.0} mm × {:.2} m · z {:.1}–{:.1}", w.name, w.t * 1e3, w.length(), w.z0, w.z1)).clicked() {
+                            self.selected = pier.into_iter().collect();
+                            self.selected_slab = None;
                         }
                         if let Some(r) = r {
                             ui.label(ratio_text(&t, r).small());
@@ -1020,6 +1038,19 @@ impl App {
                         ui.label(RichText::new(&c.governs).small());
                         ui.label(RichText::new(format!("{} (ρ {:.2} %) | ties {}", c.bars, c.rho * 100.0, c.ties)).small().monospace());
                         ui.label(RichText::new(c.notes.first().cloned().unwrap_or_default()).small().color(t.text_dim));
+                        ui.end_row();
+                    }
+                    for w in &rep.walls {
+                        if ui.selectable_label(self.selected.contains(&w.member), format!("W {} z {:.1}", w.name, w.z0)).clicked() {
+                            self.selected = vec![w.member];
+                            self.selected_slab = None;
+                            self.right = RightTab::Properties;
+                        }
+                        ui.label(format!("{:.0} x {:.0}", w.t * 1e3, w.lw * 1e3));
+                        ui.label(ratio_text(&t, w.ratio));
+                        ui.label(RichText::new(&w.governs).small());
+                        ui.label(RichText::new(format!("vert {} | horiz {} | Vu {:.0}/φVn {:.0} kN", w.vertical, w.horizontal, w.vu, w.phi_vn)).small().monospace());
+                        ui.label(RichText::new(w.boundary.clone().unwrap_or_default()).small().color(t.warn));
                         ui.end_row();
                     }
                     for f in &rep.footings {

@@ -9,7 +9,7 @@ fn beam(len: f64, sup: [&str; 2]) -> Model {
     let a = m.node_at([0.0, 0.0, 3.0]);
     let b = m.node_at([len, 0.0, 3.0]);
     let s = m.rect_section(0.3, 0.6);
-    m.members.push(Member { id: 1, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: Some("B1".into()), tension: None, group: None });
+    m.members.push(Member { id: 1, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: Some("B1".into()), tension: None, role: Default::default(), group: None });
     for (n, k) in [(a, sup[0]), (b, sup[1])] {
         if k != "free" {
             let mut s = Support::of_kind(n, k).unwrap();
@@ -67,7 +67,7 @@ fn axial_sign_and_point_load() {
     let a = m.node_at([0.0, 0.0, 0.0]);
     let b = m.node_at([0.0, 0.0, 3.0]);
     let s = m.rect_section(0.4, 0.4);
-    m.members.push(Member { id: 1, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, group: None });
+    m.members.push(Member { id: 1, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, role: Default::default(), group: None });
     m.supports.push(Support::of_kind(a, "fixed").unwrap());
     m.loads.push(Load { case: 1, kind: LoadKind::Nodal { node: b, f: [0.0, 0.0, -100.0, 0.0, 0.0, 0.0] } });
     let r = analyze(&m).unwrap();
@@ -97,7 +97,7 @@ fn slab_load_balance_and_combination() {
     let mut add = |m: &mut Model, p: [f64; 3], q: [f64; 3], s: Id| {
         let (a, b) = (m.node_at(p), m.node_at(q));
         id += 1;
-        m.members.push(Member { id, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, group: None });
+        m.members.push(Member { id, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, role: Default::default(), group: None });
     };
     for &x in &xs {
         for &y in &ys {
@@ -143,7 +143,7 @@ fn roll_turns_a_column() {
         let a = m.node_at([0.0, 0.0, 0.0]);
         let b = m.node_at([0.0, 0.0, 3.0]);
         let s = m.rect_section(0.3, 0.6);
-        m.members.push(Member { id: 1, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, group: None });
+        m.members.push(Member { id: 1, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, role: Default::default(), group: None });
         m.supports.push(Support::of_kind(a, "fixed").unwrap());
         m.loads.push(Load { case: 1, kind: LoadKind::Nodal { node: b, f: [10.0, 0.0, 0.0, 0.0, 0.0, 0.0] } });
         let r = analyze(&m).unwrap();

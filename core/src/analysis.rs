@@ -620,9 +620,12 @@ pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analy
     for mt in &model.materials {
         input.materials.insert(mt.id.to_string(), SolverMaterial { id: mt.id, e: mt.e, nu: mt.nu });
     }
+    let piers = crate::walls::pier_sections(model);
     for s in &model.sections {
         let p = s.props();
-        input.sections.insert(s.id.to_string(), SolverSection3D { id: s.id, name: Some(s.name.clone()), a: p.a, iy: p.iy, iz: p.iz, j: p.j.max(1e-12), cw: None, as_y: None, as_z: None });
+        // wall piers deform in shear too (5/6 of the area, a rectangle)
+        let shear = piers.contains(&s.id).then_some(5.0 / 6.0 * p.a);
+        input.sections.insert(s.id.to_string(), SolverSection3D { id: s.id, name: Some(s.name.clone()), a: p.a, iy: p.iy, iz: p.iz, j: p.j.max(1e-12), cw: None, as_y: shear, as_z: shear });
     }
     for (k, pc) in pieces.iter().enumerate() {
         let m = model.member(pc.member).unwrap();

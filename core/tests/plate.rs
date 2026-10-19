@@ -19,7 +19,7 @@ fn square(mesh: f64) -> Model {
     for k in 0..4 {
         let (a, b) = (m.node_at(c[k]), m.node_at(c[(k + 1) % 4]));
         let id = m.next_member_id();
-        m.members.push(Member { id, i: a, j: b, section: sid, material: 1, kind: MemberKind::Beam, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, group: None });
+        m.members.push(Member { id, i: a, j: b, section: sid, material: 1, kind: MemberKind::Beam, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, role: Default::default(), group: None });
     }
     for n in m.nodes.clone() {
         m.supports.push(Support { node: n.id, fix: [true, true, true, false, false, true], springs: [0.0; 6], uplift: false });
@@ -65,7 +65,7 @@ fn plate_floor_on_frame_balances() {
     let add = |m: &mut Model, p: [f64; 3], q: [f64; 3], s: Id| {
         let (a, b) = (m.node_at(p), m.node_at(q));
         let id = m.next_member_id();
-        m.members.push(Member { id, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, group: None });
+        m.members.push(Member { id, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, role: Default::default(), group: None });
     };
     for x in [0.0, 6.0, 12.0] {
         for y in [0.0, 5.0] {

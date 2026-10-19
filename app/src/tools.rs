@@ -27,6 +27,7 @@ pub enum Tool {
     Column,
     Brace,
     Bay,
+    Wall,
     Slab,
     Support,
     Load,
@@ -45,6 +46,7 @@ impl Tool {
             Tool::Column => "C",
             Tool::Brace => "K",
             Tool::Bay => "Y",
+            Tool::Wall => "W",
             Tool::Slab => "B",
             Tool::Support => "S",
             Tool::Load => "L",
@@ -104,11 +106,16 @@ pub struct ToolOpts {
     pub drop_len: f64,
     pub bay_w: f64,
     pub bay_d: f64,
+    /// The wall tool's thickness (m), and its base and top (None: the model's lowest and
+    /// highest levels).
+    pub wall_t: f64,
+    pub wall_z0: Option<f64>,
+    pub wall_z1: Option<f64>,
 }
 
 impl Default for ToolOpts {
     fn default() -> Self {
-        ToolOpts { node: [0.0; 3], section: "300 x 600".into(), material: "auto".into(), chain: true, support: "fixed", load_type: LoadType::Line, load_case: 1, f: [0.0, 0.0, -10.0, 0.0, 0.0, 0.0], w: 10.0, w_dir: 2, p: 20.0, p_at: 0.5, hinge_end: "both", springs: [0.0, 0.0, 50_000.0, 0.0, 0.0, 0.0], settle: [0.0, 0.0, -0.01, 0.0, 0.0, 0.0], dt: 20.0, slab_h: 0.15, slab_dead: 1.5, slab_live: 2.0, work_z: 0.0, grid: 0.5, from: None, beam_section: "300 x 600".into(), col_section: "400 x 400".into(), brace_section: "H 150x150x7x10".into(), col_h: 3.5, col_up: true, bay_slab: true, bay_cols: false, drop_len: 6.0, bay_w: 6.0, bay_d: 5.0 }
+        ToolOpts { node: [0.0; 3], section: "300 x 600".into(), material: "auto".into(), chain: true, support: "fixed", load_type: LoadType::Line, load_case: 1, f: [0.0, 0.0, -10.0, 0.0, 0.0, 0.0], w: 10.0, w_dir: 2, p: 20.0, p_at: 0.5, hinge_end: "both", springs: [0.0, 0.0, 50_000.0, 0.0, 0.0, 0.0], settle: [0.0, 0.0, -0.01, 0.0, 0.0, 0.0], dt: 20.0, slab_h: 0.15, slab_dead: 1.5, slab_live: 2.0, work_z: 0.0, grid: 0.5, from: None, beam_section: "300 x 600".into(), col_section: "400 x 400".into(), brace_section: "H 150x150x7x10".into(), col_h: 3.5, col_up: true, bay_slab: true, bay_cols: false, drop_len: 6.0, bay_w: 6.0, bay_d: 5.0, wall_t: 0.25, wall_z0: None, wall_z1: None }
     }
 }
 
@@ -160,10 +167,10 @@ impl App {
     pub(crate) fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         self.opts.from = None;
-        if matches!(tool, Tool::Node | Tool::Member | Tool::Beam | Tool::Column | Tool::Brace | Tool::Bay | Tool::Support | Tool::Load | Tool::Hinge) {
+        if matches!(tool, Tool::Node | Tool::Member | Tool::Beam | Tool::Column | Tool::Brace | Tool::Bay | Tool::Wall | Tool::Support | Tool::Load | Tool::Hinge) {
             self.bottom = match tool {
                 Tool::Node => BottomTab::Nodes,
-                Tool::Member | Tool::Beam | Tool::Column | Tool::Brace | Tool::Bay | Tool::Hinge => BottomTab::Members,
+                Tool::Member | Tool::Beam | Tool::Column | Tool::Brace | Tool::Bay | Tool::Wall | Tool::Hinge => BottomTab::Members,
                 Tool::Support => BottomTab::Supports,
                 _ => BottomTab::Loads,
             };
@@ -199,6 +206,7 @@ impl App {
             Tool::Column => "Click a point for a column, or drag a rectangle for one at each corner.",
             Tool::Brace => "Drag a brace between two nodes (an elevation view is easiest).",
             Tool::Bay => "Drag a rectangle on a floor: four beams, a slab and, if chosen, columns under the corners.",
+            Tool::Wall => "Drag a wall along its plan line (a plan view is easiest); it runs from the base to the top level.",
             Tool::Slab => "In the plan of a floor, click inside a bay closed by beams to put a slab in it, or drag a rectangle for a panel.",
             Tool::Support => "Click a node to support it.",
             Tool::Load => "Click a node (nodal load) or a member (line or point load).",
@@ -214,9 +222,9 @@ impl App {
 
     /// The overlay of a tool, also for one dragged in from the palette (`dropping`).
     pub(crate) fn overlay_for(&self, tool: Tool, dropping: bool) -> Overlay {
-        let draws = matches!(tool, Tool::Node | Tool::Member | Tool::Beam | Tool::Column | Tool::Brace | Tool::Bay | Tool::Slab);
+        let draws = matches!(tool, Tool::Node | Tool::Member | Tool::Beam | Tool::Column | Tool::Brace | Tool::Bay | Tool::Wall | Tool::Slab);
         let drag = match tool {
-            Tool::Member | Tool::Beam | Tool::Brace => DragMode::Line,
+            Tool::Member | Tool::Beam | Tool::Brace | Tool::Wall => DragMode::Line,
             Tool::Bay | Tool::Slab | Tool::Column => DragMode::Rect,
             Tool::Select => DragMode::Move,
             _ => DragMode::Orbit,
@@ -236,7 +244,7 @@ impl App {
             grid: self.opts.grid,
             from: if dropping { None } else { self.opts.from },
             pan_tool: tool == Tool::Pan,
-            nodes: matches!(tool, Tool::Node | Tool::Member | Tool::Beam | Tool::Column | Tool::Brace | Tool::Support | Tool::Load | Tool::Delete),
+            nodes: matches!(tool, Tool::Node | Tool::Member | Tool::Beam | Tool::Column | Tool::Brace | Tool::Wall | Tool::Support | Tool::Load | Tool::Delete),
             marked_nodes: marked,
             drag: if dropping { DragMode::Orbit } else { drag },
             show_grid: draws,
@@ -248,7 +256,7 @@ impl App {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let keys = [(egui::Key::A, Tool::Pan), (egui::Key::V, Tool::Select), (egui::Key::N, Tool::Node), (egui::Key::E, Tool::Member), (egui::Key::G, Tool::Beam), (egui::Key::C, Tool::Column), (egui::Key::K, Tool::Brace), (egui::Key::Y, Tool::Bay), (egui::Key::B, Tool::Slab), (egui::Key::S, Tool::Support), (egui::Key::L, Tool::Load), (egui::Key::R, Tool::Hinge), (egui::Key::X, Tool::Delete)];
+        let keys = [(egui::Key::A, Tool::Pan), (egui::Key::V, Tool::Select), (egui::Key::N, Tool::Node), (egui::Key::E, Tool::Member), (egui::Key::G, Tool::Beam), (egui::Key::C, Tool::Column), (egui::Key::K, Tool::Brace), (egui::Key::Y, Tool::Bay), (egui::Key::W, Tool::Wall), (egui::Key::B, Tool::Slab), (egui::Key::S, Tool::Support), (egui::Key::L, Tool::Load), (egui::Key::R, Tool::Hinge), (egui::Key::X, Tool::Delete)];
         let cmd = ctx.input(|i| i.modifiers.command);
         for (k, t) in keys {
             if !cmd && ctx.input(|i| i.key_pressed(k)) {
@@ -300,6 +308,9 @@ impl App {
                 }
                 if big(ui, &t, "frame", "Bay", self.tool == Tool::Bay, "Bay (Y): drag a rectangle on a floor for its four beams and slab") {
                     self.set_tool(Tool::Bay);
+                }
+                if big(ui, &t, "brick-wall", "Wall", self.tool == Tool::Wall, "Shear wall (W): drag its plan line; it runs from the base to the top level") {
+                    self.set_tool(Tool::Wall);
                 }
                 if big(ui, &t, "slash", "Member", self.tool == Tool::Member, "Member (E): drag, or click its start and end") {
                     self.set_tool(Tool::Member);
@@ -619,6 +630,25 @@ impl App {
                     }
                     work_plane(ui, &mut self.opts, &levels, self.spec.view.as_str());
                 }
+                Tool::Wall => {
+                    ui.label("t");
+                    let mut t_mm = self.opts.wall_t * 1000.0;
+                    if ui.add(egui::DragValue::new(&mut t_mm).speed(5.0).range(100.0..=1000.0).suffix(" mm")).changed() {
+                        self.opts.wall_t = t_mm / 1000.0;
+                    }
+                    for (label, v, default) in [("base", &mut self.opts.wall_z0, levels.first().copied().unwrap_or(0.0)), ("top", &mut self.opts.wall_z1, levels.last().copied().unwrap_or(3.0))] {
+                        let mut on = v.is_some();
+                        if ui.checkbox(&mut on, label).changed() {
+                            *v = if on { Some(default) } else { None };
+                        }
+                        if let Some(z) = v.as_mut() {
+                            ui.add(egui::DragValue::new(z).speed(0.1).suffix(" m"));
+                        } else {
+                            ui.label(RichText::new(if label == "base" { "lowest level" } else { "highest level" }).small().color(t.text_dim));
+                        }
+                    }
+                    ui.label(RichText::new("analysed as piers with rigid arms; designed per storey to ACI 318-19 Ch. 11").small().color(t.text_dim));
+                }
                 Tool::Slab => {
                     ui.label("h");
                     let mut h = self.opts.slab_h * 1000.0;
@@ -800,6 +830,18 @@ impl App {
                 }
                 true
             }
+            Tool::Wall => {
+                let Some(pt) = p.plane else { return true };
+                match self.opts.from {
+                    None => self.opts.from = Some(pt),
+                    Some(a) if dist([a[0], a[1], 0.0], [pt[0], pt[1], 0.0]) > 0.1 => {
+                        self.opts.from = None;
+                        self.add_wall(a, pt);
+                    }
+                    _ => {}
+                }
+                true
+            }
             Tool::Bay => {
                 let Some(pt) = p.plane else { return true };
                 match self.opts.from {
@@ -930,6 +972,18 @@ impl App {
         }
     }
 
+    /// A wall in plan from `a` to `b`, from the base to the top (the tool's levels or the model's).
+    pub(crate) fn add_wall(&mut self, a: [f64; 3], b: [f64; 3]) {
+        let mut w = json!({"from": [a[0], a[1]], "to": [b[0], b[1]], "t": self.opts.wall_t});
+        if let Some(z) = self.opts.wall_z0 {
+            w["z0"] = json!(z);
+        }
+        if let Some(z) = self.opts.wall_z1 {
+            w["z1"] = json!(z);
+        }
+        self.run_command("add_walls", json!({"walls": [w]}));
+    }
+
     /// A bay on a floor from two opposite corners: four edge beams (where none is yet), a slab
     /// in it and, when chosen, columns under its corners down to the level below.
     pub(crate) fn make_bay(&mut self, a: [f64; 3], b: [f64; 3]) {
@@ -1000,6 +1054,10 @@ impl App {
                 let mut pts = vec![a, [b[0], a[1], a[2]], [b[0], b[1], a[2]], [a[0], b[1], a[2]]];
                 pts.dedup_by(|p, q| dist(*p, *q) < 1e-3);
                 self.add_columns(&pts);
+            }
+            Tool::Wall if moved => {
+                self.opts.from = None;
+                self.add_wall(d.from, d.to);
             }
             Tool::Bay if moved => {
                 self.opts.from = None;
@@ -1413,6 +1471,7 @@ pub(crate) const PALETTE: &[(&str, &str, Tool, Option<&'static str>)] = &[
     ("move-diagonal", "Brace (K): drag between nodes", Tool::Brace, None),
     ("slash", "Member (E): any direction", Tool::Member, None),
     ("frame", "Bay (Y): drag a rectangle, or drop for one of the set size", Tool::Bay, None),
+    ("brick-wall", "Shear wall (W): drag its plan line", Tool::Wall, None),
     ("layout-grid", "Slab (B): click or drop in a bay of beams", Tool::Slab, None),
     ("square-stop", "Fixed support: drop on a node", Tool::Support, Some("fixed")),
     ("triangle", "Pinned support: drop on a node", Tool::Support, Some("pinned")),
@@ -1432,7 +1491,7 @@ impl App {
         let t = Tokens::get(ui.ctx());
         ui.add_space(2.0);
         for (k, (icon, tip, tool, sup)) in PALETTE.iter().enumerate() {
-            if matches!(k, 2 | 9 | 12) {
+            if matches!(k, 2 | 10 | 13) {
                 ui.separator();
             }
             let on = self.tool == *tool && (sup.is_none() || self.opts.support == sup.unwrap_or_default());

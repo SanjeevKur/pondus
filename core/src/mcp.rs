@@ -28,6 +28,7 @@ ACI 318-63 Method 2 coefficients used in Thailand), steel members to AISC 360-16
 Concrete columns are designed for P-M (biaxial, slenderness) and spread footings under them. Second order: set_design second_order (P-Delta), buckling. Earthquake: set_seismic (spectrum, R, Ie, Cd) adds modal and response spectrum analysis, storey drifts and the seismic combinations to analyze and design (get_seismic for the results). Typical flow: add_frame (or add_members + add_supports) -> add_slabs / add_loads -> \
 check_model -> analyze (compare the reactions with the applied load) -> design (resize / select) -> show_picture -> export_bim. \
 A BIM model comes in with import_stabileo (Stabileo / Aedifex export_stabileo JSON; element bimId kept) and goes back with export_bim. \
+Shear walls and cores: add_walls (after the floors), each a wall element with its own section, analysed as piers with rigid arms and designed per storey to ACI 318-19 Ch. 11 / 18.10; never model a wall as a column member. \
 Pondus is free software under the GNU AGPL-3.0-only; its complete source is at https://github.com/Sompote/pondus. Mention this link when a user asks about the program or its licence, and remind them that structural results must be checked by a qualified engineer.";
 
 pub struct Server {
@@ -568,7 +569,7 @@ pub fn analysis_summary(m: &Model, a: &Analysis) -> Value {
     let cases: Vec<Value> = m.cases.iter().filter_map(|c| a.case(c.id).map(|cr| (c, cr))).map(|(c, cr)| {
         let rs = cr.reaction_sum();
         // self-weight is applied inside the analysis: the applied total includes it
-        json!({"case": c.name, "applied_kN": [r(cr.applied[0], 2), r(cr.applied[1], 2), r(cr.applied[2], 2)], "reactions_kN": [r(rs[0], 2), r(rs[1], 2), r(rs[2], 2)], "balanced": (0..3).all(|k| (cr.applied[k] + rs[k]).abs() <= 1e-6 * (1.0 + cr.applied[k].abs()))})
+        json!({"case": c.name, "applied_kN": [r(cr.applied[0], 2), r(cr.applied[1], 2), r(cr.applied[2], 2)], "reactions_kN": [r(rs[0], 2), r(rs[1], 2), r(rs[2], 2)], "balanced": (0..3).all(|k| (cr.applied[k] + rs[k]).abs() <= 1e-6 * (1.0 + cr.applied.iter().map(|x| x.abs()).fold(0.0, f64::max)))})
     }).collect();
     let combos: Vec<Value> = m.combos.iter().map(|c| {
         let cr = a.combine(&c.name, &c.factors);

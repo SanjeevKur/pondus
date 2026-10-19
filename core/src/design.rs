@@ -51,6 +51,8 @@ pub struct Report {
     /// Shear tabs at the ends of the steel beams; the beams' floor vibration screen.
     pub connections: Vec<crate::connections::ConnectionDesign>,
     pub vibration: Vec<crate::connections::Vibration>,
+    /// Structural walls, one row per wall and storey (ACI 318-19 Ch. 11, 18.10).
+    pub walls: Vec<crate::walls::WallDesign>,
     /// Members not designed, and why.
     pub skipped: Vec<String>,
     /// Section changes made by resize / select.
@@ -69,6 +71,7 @@ impl Report {
         v.extend(self.others.iter().filter(|b| !b.ok).map(|b| format!("member {} ({}, {:.2})", b.member, b.code, b.ratio)));
         v.extend(self.connections.iter().filter(|b| !b.ok).map(|b| format!("connection of member {} at {} ({:.2})", b.member, b.end, b.ratio)));
         v.extend(self.vibration.iter().filter(|b| !b.ok).map(|b| format!("beam {} vibration {:.1} Hz", b.member, b.frequency)));
+        v.extend(self.walls.iter().filter(|b| !b.ok).map(|b| format!("wall {} at z {:.2}–{:.2} ({:.2}, {})", b.name, b.z0, b.z1, b.ratio, b.governs)));
         v
     }
 
@@ -88,6 +91,13 @@ impl Report {
                 "deflection_mm": {"live": round(b.defl_live, 1), "long_term": round(b.defl_total, 1), "limits": [round(b.limit_live, 1), round(b.limit_total, 1)]},
                 "ratio": round(b.ratio, 3), "governs": b.governs, "ok": b.ok, "notes": b.notes,
                 "ec2": b.ec2.as_ref().map(|e| serde_json::json!({"flexure": round(e.flexure, 3), "shear": round(e.shear, 3), "detail": e.detail})),
+            })).collect::<Vec<_>>(),
+            "walls": self.walls.iter().map(|w| serde_json::json!({
+                "wall": w.wall, "name": w.name, "bim_id": w.bim_id, "storey_z_m": [round(w.z0, 2), round(w.z1, 2)], "t_mm": round(w.t * 1e3, 0), "length_m": round(w.lw, 3),
+                "vertical": w.vertical, "horizontal": w.horizontal, "rho_l": round(w.rho_l, 4), "rho_t": round(w.rho_t, 4),
+                "Pu_kN": round(w.pu, 0), "Mu_inplane_kNm": round(w.mu, 0), "Vu_kN": round(w.vu, 0), "phi_Vn_kN": round(w.phi_vn, 0),
+                "special_wall": w.special, "boundary_elements": w.boundary, "ratio": round(w.ratio, 3), "governs": w.governs, "ok": w.ok,
+                "checks": w.checks.iter().map(|k| format!("{}: {:.2} ({})", k.name, k.ratio, k.detail)).collect::<Vec<_>>(), "notes": w.notes,
             })).collect::<Vec<_>>(),
             "columns": self.columns.iter().map(|c| serde_json::json!({
                 "member": c.member, "bim_id": c.bim_id, "section_mm": format!("{:.0} x {:.0}", c.b * 1e3, c.h * 1e3), "bars": c.bars, "rho_percent": round(c.rho * 100.0, 2), "ties": c.ties,
@@ -277,7 +287,7 @@ pub fn design_pass(model: &Model, a: &Analysis, o: &Options) -> Report {
     }
     let wanted = |id: Id| o.members.is_empty() || o.members.contains(&id);
     let mut skipped_rc: Vec<(Id, &str)> = vec![];
-    for m in model.members.iter().filter(|m| wanted(m.id)) {
+    for m in model.members.iter().filter(|m| wanted(m.id) && m.role.is_frame()) {
         let Some(sec) = model.section(m.section) else { continue };
         let kind = model.kind(m);
         if model.is_concrete(m) {
@@ -346,8 +356,23 @@ pub fn design_pass(model: &Model, a: &Analysis, o: &Options) -> Report {
             rep.skipped.push(format!("{} concrete {kind}(s) analysed but not designed (Pondus designs concrete beams and slabs): members {}", ids.len(), ids.join(", ")));
         }
     }
+    // the walls, pier by pier (one row per wall and storey)
+    let special = model.seismic.enabled;
+    for w in &model.walls {
+        let mut piers: Vec<&Member> = model.members.iter().filter(|m| m.role == Role::WallPier(w.id) && wanted(m.id)).collect();
+        piers.sort_by(|a, b| model.node(a.i).map(|n| n.z).unwrap_or(0.0).total_cmp(&model.node(b.i).map(|n| n.z).unwrap_or(0.0)));
+        let fc = model.material(w.material).map(|x| x.fc).filter(|f| *f > 0.0).unwrap_or(24.0);
+        for m in piers {
+            let uls: crate::walls::Stations = res.uls.iter().filter_map(|(n, r)| r.member(m.id).map(|mr| (n.clone(), mr.stations.iter().map(|s| (s.x, s.n, s.vy, s.vz, s.my, s.mz)).collect()))).collect();
+            let (z0, z1) = (model.node(m.i).map(|n| n.z).unwrap_or(0.0), model.node(m.j).map(|n| n.z).unwrap_or(0.0));
+            rep.walls.push(crate::walls::design_pier(w, m, z0.min(z1), z0.max(z1), fc, model.design.fy, &uls, special, &model.design));
+        }
+    }
     if o.footings && o.beams {
         rep.footings = crate::footing::design(model, a);
+        if model.walls.iter().any(|w| model.supports.iter().any(|s| model.members.iter().any(|m| m.role == Role::WallPier(w.id) && (m.i == s.node || m.j == s.node)))) {
+            rep.skipped.push("wall footings are not designed (a strip footing or a raft under each wall is for the engineer)".into());
+        }
     }
     // the steel beams' end connections
     if o.steel {
@@ -370,7 +395,7 @@ pub fn design_pass(model: &Model, a: &Analysis, o: &Options) -> Report {
     if model.design.vibration_hz > 0.0 {
         let share: Vec<(Id, f64)> = model.cases.iter().map(|c| (c.id, match c.kind { CaseKind::D => 1.0, CaseKind::L => model.seismic.live_mass, _ => 0.0 })).collect();
         let r = a.combine("D + live share", &share);
-        let beams: Vec<(Id, f64, f64)> = model.members.iter().filter(|m| wanted(m.id) && model.kind(m) == MemberKind::Beam && !free_end(model, m, m.i) && !free_end(model, m, m.j)).map(|m| (m.id, model.length(m), own_deflection(model, m, &r, false))).collect();
+        let beams: Vec<(Id, f64, f64)> = model.members.iter().filter(|m| wanted(m.id) && m.role.is_frame() && model.kind(m) == MemberKind::Beam && !free_end(model, m, m.i) && !free_end(model, m, m.j)).map(|m| (m.id, model.length(m), own_deflection(model, m, &r, false))).collect();
         rep.vibration = crate::connections::vibration(&beams, model.design.vibration_hz);
     }
     if o.do_slabs {
@@ -508,6 +533,24 @@ pub fn run(model: &mut Model, o: &Options) -> Result<(Report, Analysis), String>
             }
         }
         if o.resize {
+            // a failing wall is made 50 mm thicker (its bars are already the least that pass)
+            let mut thicker: Vec<Id> = rep.walls.iter().filter(|w| !w.ok).map(|w| w.wall).collect();
+            thicker.sort();
+            thicker.dedup();
+            for id in thicker {
+                if let Some(w) = model.walls.iter_mut().find(|w| w.id == id) {
+                    if w.t >= 0.8 - 1e-9 {
+                        rep.warnings.push(format!("wall {}: still failing at 800 mm, left as it is", w.name));
+                        continue;
+                    }
+                    w.t = ((w.t + 0.05) * 1000.0).round() / 1000.0;
+                    changed = true;
+                    changes.push(format!("wall {}: t {:.0} mm", w.name, w.t * 1000.0));
+                }
+            }
+            if changed {
+                crate::walls::sync(model);
+            }
             for d in rep.slabs.iter().filter(|d| !d.ok) {
                 // up to the minimum thickness, else 10 mm more, in 10 mm steps
                 let h = ((d.h_min / 1000.0).max(d.h + 0.01) * 100.0 - 1e-6).ceil() / 100.0;
@@ -547,7 +590,8 @@ pub fn run(model: &mut Model, o: &Options) -> Result<(Report, Analysis), String>
 pub fn bim_export(model: &Model, rep: &Report) -> serde_json::Value {
     use serde_json::json;
     let mut elems = vec![];
-    for m in &model.members {
+    // a wall's piers and arms are exported as the wall below, not as members
+    for m in model.members.iter().filter(|m| m.role.is_frame()) {
         let Some(sec) = model.section(m.section) else { continue };
         let kind = model.kind(m);
         let (family, params) = match (&sec.shape, kind) {
@@ -604,12 +648,23 @@ pub fn bim_export(model: &Model, rep: &Report) -> serde_json::Value {
         "type_params_m": {"Width": f.b, "Length": f.l, "Thickness": f.h}, "top_z": f.at[2], "reinforcement": {"bottom_x": f.bars_x, "bottom_y": f.bars_y},
         "ratio": round(f.ratio, 3), "ok": f.ok, "code": "ACI 318-19 / allowable bearing",
     })).collect();
+    let walls: Vec<_> = model.walls.iter().map(|w| {
+        let rows: Vec<_> = rep.walls.iter().filter(|d| d.wall == w.id).map(|d| json!({"z": [round(d.z0, 3), round(d.z1, 3)], "vertical": d.vertical, "horizontal": d.horizontal, "boundary_elements": d.boundary, "ratio": round(d.ratio, 3), "ok": d.ok})).collect();
+        let ok = rows.iter().all(|r| r["ok"].as_bool().unwrap_or(true));
+        json!({
+            "wall": w.id, "bim_id": w.bim_id, "name": w.name, "start": [w.a[0], w.a[1], w.z0], "end": [w.b[0], w.b[1], w.z0], "base_z": w.z0, "top_z": w.z1,
+            "family": "Basic Wall", "type": format!("Concrete - {:.0} mm", w.t * 1e3), "thickness_m": w.t, "structural": true,
+            "material": model.material(w.material).map(|x| x.name.clone()), "reinforcement_by_storey": rows, "ok": if rep.walls.iter().any(|d| d.wall == w.id) { json!(ok) } else { serde_json::Value::Null },
+            "code": "ACI 318-19 Ch. 11 / 18.10",
+        })
+    }).collect();
     json!({
         "format": "pondus-bim-1",
+        "walls": walls,
         "footings": footings,
         "units": "m, kN, MPa",
         "model": model.name,
-        "how_to_apply": "In Aedifex: for each member find the element by bim_id (or by start/end), duplicate_type of 'family' with type_params_m to get 'type' if the project lacks it, then change_type; write the reinforcement into the element's comments/marks. Slabs: set the floor type's thickness.",
+        "how_to_apply": "In Aedifex: for each member find the element by bim_id (or by start/end), duplicate_type of 'family' with type_params_m to get 'type' if the project lacks it, then change_type; write the reinforcement into the element's comments/marks. Slabs: set the floor type's thickness. Walls: a 'Basic Wall' of the given type (one concrete layer of thickness_m) from start to end, base_z to top_z, marked structural.",
         "members": elems,
         "slabs": slabs,
     })

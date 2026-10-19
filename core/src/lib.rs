@@ -35,5 +35,6 @@ pub mod stabileo;
 pub mod steel;
 pub mod timehistory;
 pub mod transform;
+pub mod walls;
 
 pub use model::*;

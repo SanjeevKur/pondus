@@ -390,7 +390,7 @@ fn wood_armer_branches() {
 // ===================================================================== timber and masonry
 
 fn member(kind: MemberKind, k: Option<f64>, rebar: Option<f64>) -> Member {
-    Member { id: 1, i: 1, j: 2, section: 1, material: 1, kind, hinge_i: true, hinge_j: true, lb: None, k, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar, bim_id: None, tension: None, group: None }
+    Member { id: 1, i: 1, j: 2, section: 1, material: 1, kind, hinge_i: true, hinge_j: true, lb: None, k, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar, bim_id: None, tension: None, role: Default::default(), group: None }
 }
 
 #[test]

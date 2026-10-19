@@ -125,9 +125,11 @@ pub fn export(model: &Model, a: Option<&Analysis>, rep: Option<&Report>, path: &
     table(&mut wb, "Nodes", &["id", "x", "y", "z"], &rows)?;
     let sec = |id: Id| model.section(id).map(|s| s.name.clone()).unwrap_or_default();
     let mat = |id: Id| model.material(id).map(|s| s.name.clone()).unwrap_or_default();
+    // a wall's piers and arms are not written: the Settings sheet's walls rebuild them
     let rows: Vec<Vec<C>> = model
         .members
         .iter()
+        .filter(|m| m.role.is_frame())
         .map(|m| {
             let w = m.winkler.unwrap_or([0.0; 2]);
             vec![n(m.id as f64), n(m.i as f64), n(m.j as f64), s(kind_name(m.kind)), s(sec(m.section)), s(mat(m.material)), n(m.roll), b(m.truss), s(behaviour_name(m.behaviour)), b(m.hinge_i), b(m.hinge_j), on(m.lb), on(m.k), n(w[0]), n(w[1]), on(m.rebar), os(&m.bim_id), os(&m.group), n(model.length(m))]
@@ -269,6 +271,7 @@ pub fn export(model: &Model, a: Option<&Analysis>, rep: Option<&Report>, path: &
         vec![s("design"), js(serde_json::to_value(&model.design).unwrap_or_default())],
         vec![s("seismic"), js(serde_json::to_value(&model.seismic).unwrap_or_default())],
         vec![s("diaphragms"), js(json!(model.diaphragms))],
+        vec![s("walls"), js(json!(model.walls))],
         vec![s("moving"), js(serde_json::to_value(&model.moving).unwrap_or_default())],
         vec![s("stages"), js(serde_json::to_value(&model.stages).unwrap_or_default())],
     ];
@@ -403,6 +406,7 @@ pub fn import(path: &Path) -> Result<Model, String> {
                 "design" => m.design = serde_json::from_value(v).map_err(bad)?,
                 "seismic" => m.seismic = serde_json::from_value(v).map_err(bad)?,
                 "diaphragms" => m.diaphragms = serde_json::from_value(v).map_err(bad)?,
+                "walls" => m.walls = serde_json::from_value(v).map_err(bad)?,
                 "moving" => m.moving = serde_json::from_value(v).map_err(bad)?,
                 "stages" => m.stages = serde_json::from_value(v).map_err(bad)?,
                 _ => {}
@@ -482,7 +486,7 @@ pub fn import(path: &Path) -> Result<Model, String> {
                 winkler: (w[0] > 0.0 || w[1] > 0.0).then_some(w),
                 rebar: num_of(r, "rebar"),
                 bim_id: str_of(r, "bim_id"),
-                tension: None,
+                tension: None, role: Default::default(),
                 group: str_of(r, "group"),
             });
         }
@@ -540,5 +544,6 @@ pub fn import(path: &Path) -> Result<Model, String> {
             m.slabs.push(Slab { id: id_of(r, "id").unwrap_or(k + 1), name: str_of(r, "name").unwrap_or_default(), x0: g("x0"), y0: g("y0"), x1: g("x1"), y1: g("y1"), z: g("z"), h: g("h"), dead: g("dead"), live: g("live"), bim_id: str_of(r, "bim_id") });
         }
     }
+    crate::walls::sync(&mut m);
     Ok(m)
 }

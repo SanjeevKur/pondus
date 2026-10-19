@@ -7,6 +7,21 @@ use crate::model::*;
 
 pub fn problems(m: &Model) -> Vec<String> {
     let mut out = vec![];
+    // a beam inside a wall doubles the slab load the wall's arms already take
+    for w in &m.walls {
+        let lw = w.length().max(1e-9);
+        let (dx, dy) = (w.b[0] - w.a[0], w.b[1] - w.a[1]);
+        let on = |p: [f64; 3]| {
+            let s = ((p[0] - w.a[0]) * dx + (p[1] - w.a[1]) * dy) / (lw * lw);
+            let off = ((p[0] - w.a[0]) * dy - (p[1] - w.a[1]) * dx).abs() / lw;
+            s > -1e-6 && s < 1.0 + 1e-6 && off < 1e-3 && p[2] > w.z0 - 1e-3 && p[2] < w.z1 + 1e-3
+        };
+        for x in m.members.iter().filter(|x| x.role.is_frame() && m.kind(x) == MemberKind::Beam) {
+            if [x.i, x.j].iter().all(|n| m.node(*n).is_some_and(|n| on(n.p()))) {
+                out.push(format!("beam {} lies inside wall {}: delete it (the wall carries the slab edge)", x.id, w.name));
+            }
+        }
+    }
     for mm in &m.members {
         if m.node(mm.i).is_none() || m.node(mm.j).is_none() {
             out.push(format!("member {} uses a node that does not exist", mm.id));

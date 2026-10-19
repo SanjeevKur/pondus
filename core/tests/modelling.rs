@@ -6,7 +6,7 @@ use pondus_core::model::*;
 fn mem(m: &mut Model, a: [f64; 3], b: [f64; 3], s: Id) -> Id {
     let (i, j) = (m.node_at(a), m.node_at(b));
     let id = m.next_member_id();
-    m.members.push(Member { id, i, j, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, group: None });
+    m.members.push(Member { id, i, j, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, role: Default::default(), group: None });
     id
 }
 

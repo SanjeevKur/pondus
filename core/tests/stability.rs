@@ -12,7 +12,7 @@ fn column(p: f64, h: f64) -> Model {
     let a = m.node_at([0.0, 0.0, 0.0]);
     let b = m.node_at([0.0, 0.0, 6.0]);
     let s = m.rect_section(0.3, 0.3);
-    m.members.push(Member { id: 1, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, group: None });
+    m.members.push(Member { id: 1, i: a, j: b, section: s, material: 1, kind: MemberKind::Auto, hinge_i: false, hinge_j: false, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, role: Default::default(), group: None });
     m.supports.push(Support::of_kind(a, "fixed").unwrap());
     m.loads.push(Load { case: 2, kind: LoadKind::Nodal { node: b, f: [h, 0.0, -p, 0.0, 0.0, 0.0] } });
     m

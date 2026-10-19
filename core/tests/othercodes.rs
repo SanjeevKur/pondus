@@ -11,7 +11,7 @@ fn beam(mat: Material, section: &str, w: f64) -> Model {
     let a = m.node_at([0.0, 0.0, 3.0]);
     let b = m.node_at([4.0, 0.0, 3.0]);
     let s = m.section_named(section).unwrap();
-    m.members.push(Member { id: 1, i: a, j: b, section: s, material: mat.id, kind: MemberKind::Beam, hinge_i: false, hinge_j: false, lb: Some(0.0), k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, group: None });
+    m.members.push(Member { id: 1, i: a, j: b, section: s, material: mat.id, kind: MemberKind::Beam, hinge_i: false, hinge_j: false, lb: Some(0.0), k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, role: Default::default(), group: None });
     let mut s1 = Support::of_kind(a, "pinned").unwrap();
     s1.fix[3] = true;
     let mut s2 = Support::of_kind(b, "roller").unwrap();
@@ -69,7 +69,7 @@ fn masonry_wall_strip() {
     let a = m.node_at([0.0, 0.0, 0.0]);
     let b = m.node_at([0.0, 0.0, 3.0]);
     let s = m.section_named("1000 x 200").unwrap();
-    m.members.push(Member { id: 1, i: a, j: b, section: s, material: 3, kind: MemberKind::Column, hinge_i: false, hinge_j: true, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: Some(2.5 * 113.1), bim_id: None, tension: None, group: None });
+    m.members.push(Member { id: 1, i: a, j: b, section: s, material: 3, kind: MemberKind::Column, hinge_i: false, hinge_j: true, lb: None, k: None, roll: 0.0, truss: false, behaviour: Default::default(), winkler: None, rebar: Some(2.5 * 113.1), bim_id: None, tension: None, role: Default::default(), group: None });
     m.supports.push(Support::of_kind(a, "fixed").unwrap());
     let mut top = Support::of_kind(b, "roller").unwrap();
     top.fix = [true, true, false, true, false, true];

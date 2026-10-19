@@ -1056,7 +1056,8 @@ pub fn export(model: &Model, rep: Option<&Report>) -> String {
     let mut contained: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     let mut by_material: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut profiles: HashMap<Id, usize> = HashMap::new();
-    for m in &model.members {
+    // a wall's piers and arms are its analysis model: the wall itself is written as an IfcWall
+    for m in model.members.iter().filter(|m| m.role.is_frame()) {
         let (Some(a), Some(b), Some((ex, ey, _))) = (model.node(m.i), model.node(m.j), crate::analysis::axes(model, m)) else { continue };
         let Some(sec) = model.section(m.section) else { continue };
         let lo = storey_of(a.z.min(b.z));
@@ -1129,6 +1130,34 @@ pub fn export(model: &Model, rep: Option<&Report>) -> String {
             let p = w.add(format!("IFCPROPERTYSINGLEVALUE('DesignRatio',$,IFCRATIOMEASURE({}),$)", f((d.ratio * 1e4).round() / 1e4)));
             let ps = w.add(format!("IFCPROPERTYSET({},$,'Pondus_Design',$,(#{p}))", g(&format!("pset-slab-{}", s.id))));
             w.add(format!("IFCRELDEFINESBYPROPERTIES({},$,$,$,(#{e}),#{ps})", g(&format!("rel-pset-slab-{}", s.id))));
+        }
+    }
+    for wl in &model.walls {
+        let k = storey_of(wl.z0);
+        let (sz, _, spl) = storeys[k];
+        let lw = wl.length();
+        let dir = [(wl.b[0] - wl.a[0]) / lw, (wl.b[1] - wl.a[1]) / lw, 0.0];
+        let pl = place(&mut w, Some(spl), [wl.a[0], wl.a[1], wl.z0 - sz], Some([0.0, 0.0, 1.0]), Some(dir));
+        let c2 = w.add(format!("IFCCARTESIANPOINT(({},{}))", f(lw / 2.0), f(0.0)));
+        let p2 = w.add(format!("IFCAXIS2PLACEMENT2D(#{c2},$)"));
+        let prof = w.add(format!("IFCRECTANGLEPROFILEDEF(.AREA.,$,#{p2},{},{})", f(lw), f(wl.t)));
+        let o = pt3(&mut w, [0.0; 3]);
+        let pos = w.add(format!("IFCAXIS2PLACEMENT3D(#{o},$,$)"));
+        let up = dir3(&mut w, [0.0, 0.0, 1.0]);
+        let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{prof},#{pos},#{up},{})", f(wl.z1 - wl.z0)));
+        let brep = w.add(format!("IFCSHAPEREPRESENTATION(#{body},'Body','SweptSolid',(#{solid}))"));
+        let shape = w.add(format!("IFCPRODUCTDEFINITIONSHAPE($,$,(#{brep}))"));
+        let gid = wl.bim_id.clone().filter(|x| is_guid(x)).unwrap_or_else(|| guid(seed, &format!("wall-{}", wl.id)));
+        let e = w.add(format!("IFCWALL({},$,{},$,{},#{pl},#{shape},{},.SOLIDWALL.)", st(&gid), st(&wl.name), st(&format!("Concrete wall {:.0} mm", wl.t * 1000.0)), st(&format!("W{}", wl.id))));
+        contained.entry(k).or_default().push(e);
+        by_material.entry(model.material(wl.material).map(|x| x.name.clone()).unwrap_or_else(|| "Concrete".into())).or_default().push(e);
+        if let Some(r) = rep {
+            let ratio = r.walls.iter().filter(|d| d.wall == wl.id).map(|d| d.ratio).fold(0.0, f64::max);
+            if r.walls.iter().any(|d| d.wall == wl.id) {
+                let p = w.add(format!("IFCPROPERTYSINGLEVALUE('DesignRatio',$,IFCRATIOMEASURE({}),$)", f((ratio * 1e4).round() / 1e4)));
+                let ps = w.add(format!("IFCPROPERTYSET({},$,'Pondus_Design',$,(#{p}))", g(&format!("pset-wall-{}", wl.id))));
+                w.add(format!("IFCRELDEFINESBYPROPERTIES({},$,$,$,(#{e}),#{ps})", g(&format!("rel-pset-wall-{}", wl.id))));
+            }
         }
     }
     for (name, els) in &by_material {

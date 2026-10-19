@@ -288,3 +288,31 @@ fn phase4_tools() {
         assert_eq!(t.model.members.len(), before, "{fmt}: {r}");
     }
 }
+
+/// The request that failed: a 30-storey building with shear walls on one side only, under
+/// earthquake, analysed and designed through the agent's tools (run with --ignored: it takes
+/// a while).
+#[test]
+#[ignore]
+fn tower_with_one_sided_shear_walls() {
+    let t0 = std::time::Instant::now();
+    let mut s = Server::new(Model::new("tower"));
+    call(&mut s, "add_frame", json!({"x_spans": [7.0, 7.0, 7.0, 7.0], "y_spans": [7.0, 7.0, 7.0], "storeys": vec![3.5; 30], "column": "700 x 700", "beam": "300 x 700", "slab": {"h": 0.17, "dead": 1.5, "live": 3.0, "roof_live": 1.0}}));
+    // two 7 m walls on the y = 0 edge only (the asymmetry), and one on x = 0
+    let w = call(&mut s, "add_walls", json!({"walls": [{"from": [7.0, 0.0], "to": [14.0, 0.0], "t": 0.35}, {"from": [14.0, 0.0], "to": [21.0, 0.0], "t": 0.35}, {"from": [0.0, 7.0], "to": [0.0, 14.0], "t": 0.35}]}));
+    eprintln!("walls: {w} ({:.1} s)", t0.elapsed().as_secs_f64());
+    let chk = call(&mut s, "check_model", json!({}));
+    eprintln!("check: {chk}");
+    call(&mut s, "set_diaphragms", json!({"all": true}));
+    call(&mut s, "set_seismic", json!({"enabled": true, "spectrum": {"kind": "code", "sds": 0.5, "sd1": 0.3, "tl": 6.0}, "r": 6.0, "cd": 5.0, "ie": 1.0}));
+    let a = call(&mut s, "analyze", json!({}));
+    eprintln!("analysis ({:.1} s): balanced {:?}", t0.elapsed().as_secs_f64(), a["cases"].as_array().unwrap().iter().map(|c| c["balanced"].clone()).collect::<Vec<_>>());
+    let q = call(&mut s, "get_seismic", json!({}));
+    eprintln!("seismic: T1 {} / {}, V ELF {}, V RSA {}; first modes {}", q["directions"][0]["T1_s"], q["directions"][1]["T1_s"], q["directions"][0]["V_ELF_kN"], q["directions"][0]["V_RSA_kN"], json!(q["modes"].as_array().unwrap().iter().take(3).collect::<Vec<_>>()));
+    let d = call(&mut s, "design", json!({"resize": true}));
+    eprintln!("design ({:.1} s): failing {}, walls {}", t0.elapsed().as_secs_f64(), d["failing"], d["walls"].as_array().map(|v| v.len()).unwrap_or(0));
+    for w in d["walls"].as_array().unwrap().iter().take(3) {
+        eprintln!("  {}", w);
+    }
+    assert!(d["walls"].as_array().unwrap().len() == 90);
+}

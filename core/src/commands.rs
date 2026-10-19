@@ -43,9 +43,11 @@ pub fn specs() -> Vec<Spec> {
         s("add_combination", "Adds a load combination: factors by case name, e.g. {\"D\": 1.2, \"L\": 1.6}; kind uls (strength, used to design) or sls (service, used for deflections).", true, json!({"type": "object", "properties": {"name": {"type": "string"}, "kind": {"type": "string", "enum": ["uls", "sls"]}, "factors": {"type": "object", "additionalProperties": {"type": "number"}}}, "required": ["name", "factors"]})),
         s("add_loads", "Adds loads to a case (name or id). Each load: {type: 'nodal', at: [x,y,z] or node, f: [fx,fy,fz,mx,my,mz] kN, kN·m}, {type: 'line', members: [ids] or z (all beams at that height), w: [wx,wy,wz] kN/m global (down is negative z), w_end for a varying load, a/b m from node i for part of the member}, {type: 'point', member, a (m from node i), p: [px,py,pz] kN}, {type: 'settlement', at or node (a support), d: [dx,dy,dz,rx,ry,rz] m, rad (a settlement of 10 mm down: dz -0.01)} or {type: 'thermal', members, dt (uniform °C), dt_y, dt_z (gradients across the section, °C)}. Slab loads come from the slabs; do not add them again.", true, json!({"type": "object", "properties": {"case": {"type": "string", "description": "case name (or id)"}, "loads": {"type": "array", "items": {"type": "object"}}}, "required": ["case", "loads"]})),
         s("add_slabs", "Adds rectangular slab panels on the beams under their edges: {x0, y0, x1, y1, z (top, at the beams' level), h (m), dead (superimposed, kPa), live (kPa), name, bim_id}. Their weight (24 kN/m³ x h + dead) goes to the first D case and live to the first L case, by the 45° lines (one-way past 2:1). Or 'bays': {z, h, dead, live} makes one panel in every closed bay of the beams at height z.", true, json!({"type": "object", "properties": {"panels": {"type": "array", "items": {"type": "object"}}, "bays": {"type": "object", "properties": {"z": {"type": "number"}, "h": {"type": "number"}, "dead": {"type": "number"}, "live": {"type": "number"}}}}})),
-        s("delete", "Deletes members, nodes (with their members), slabs, supports (by node) or all loads of a case.", true, json!({"type": "object", "properties": {"members": ids, "nodes": ids, "slabs": ids, "supports": ids, "loads_of_case": {"type": "string", "description": "case name (or id)"}}})),
+        s("delete", "Deletes members, nodes (with their members), slabs, walls, supports (by node) or all loads of a case.", true, json!({"type": "object", "properties": {"members": ids, "nodes": ids, "slabs": ids, "walls": ids, "supports": ids, "loads_of_case": {"type": "string", "description": "case name (or id)"}}})),
         s("set_design", "Design settings: fy and fyt (MPa, main bars and stirrups, default SD40 390 and SR24 235), cover_beam / cover_slab (m), beam_bars / stirrup_bars / slab_bars (diameters, mm), defl_live / defl_total (span / limit), steel_shapes (names to choose from), target_ratio (largest utilisation accepted when sizing), second_order (true: every ULS combination is solved second order with P-Delta, and column slenderness magnifiers are then not applied), footing ({q_allow kPa, depth m (base below ground), gamma_soil kN/m³, mu, min_h m, bars mm, cover m}: spread footings are designed under the concrete columns), steel_code ('aisc' AISC 360-16 or 'ec3' EN 1993-1-1, for checks and for select), ec2_check (also check concrete beams to EN 1992-1-1 with their bars), steel_min_depth / steel_max_depth (mm, limits for select), connection ({bolt_d mm, fnv MPa, plate_t mm, plate_fy, plate_fu MPa, pitch, edge, e mm, weld mm, fexx MPa}: shear tabs designed at steel beam ends), vibration_hz (floor beams' f = 0.18 √(g/Δ) limit, 0 = off), tension_connection ({kind 'bolted' | 'welded' | 'none', connected 'flanges' | 'web' | 'all', bolt_d mm, holes_flange, holes_web (holes across each flange and the web in one section), bolts_per_line, length m}: the end connection of steel members in tension, from which the net area An and shear lag U of AISC Table D3.1 / the net area of EC3 6.2.3 follow; default bolted flanges, M20, 2 holes per flange, 3 bolts per line), slab_method ('coefficients' or 'plate': slabs as plate elements with the frame) and slab_mesh (plate element size, m, default 0.5).", true, json!({"type": "object", "properties": {"fy": {"type": "number"}, "fyt": {"type": "number"}, "cover_beam": {"type": "number"}, "cover_slab": {"type": "number"}, "beam_bars": {"type": "array", "items": {"type": "number"}}, "stirrup_bars": {"type": "array", "items": {"type": "number"}}, "slab_bars": {"type": "array", "items": {"type": "number"}}, "defl_live": {"type": "number"}, "defl_total": {"type": "number"}, "steel_shapes": {"type": "array", "items": {"type": "string"}}, "target_ratio": {"type": "number"}, "slab_method": {"type": "string", "enum": ["coefficients", "plate"]}, "slab_mesh": {"type": "number"}, "second_order": {"type": "boolean"}, "footing": {"type": "object"}, "steel_code": {"type": "string", "enum": ["aisc", "ec3"]}, "ec2_check": {"type": "boolean"}, "steel_min_depth": {"type": "number"}, "steel_max_depth": {"type": "number"}, "connection": {"type": "object"}, "vibration_hz": {"type": "number"}, "tension_connection": {"type": "object"}}})),
         s("list_sections", "The steel H shapes of the catalogue (JIS G 3192 / TIS 1227), lightest first, with mass, depth and Ix / Zx; and the model's sections.", false, json!({"type": "object", "properties": {}})),
+        s("add_walls", "Adds structural (shear) walls: each a straight wall in plan from 'from' [x, y] to 'to' [x, y] (m), thickness t (m, default 0.25), from z0 to z1 (default the lowest and highest level of the model), concrete by default. A wall is analysed as piers on its centre line with the wall's section (shear deformation included) and rigid arms at every level out to its ends, so beams and slab edges along it connect to it; it is designed per storey to ACI 318-19 Ch. 11 (and 18.10 special walls when set_seismic is on): distributed vertical and horizontal bars, in-plane shear, axial with in-plane and out-of-plane bending, boundary elements. Never model a wall as a column. Add the floors (add_frame) first so the walls meet them; 'levels' [z, ...] or 'storey_h' give the levels of a wall that has no floors yet. base 'fixed' (default) fixes the wall's base, 'none' leaves it to rest on what is below (a transfer).", true, json!({"type": "object", "properties": {"walls": {"type": "array", "items": {"type": "object", "properties": {"from": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}, "to": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}, "t": {"type": "number"}, "z0": {"type": "number"}, "z1": {"type": "number"}, "name": {"type": "string"}, "material": {"type": "string"}, "bim_id": {"type": "string"}}, "required": ["from", "to"]}}, "base": {"type": "string", "enum": ["fixed", "none"]}, "levels": {"type": "array", "items": {"type": "number"}}, "storey_h": {"type": "number"}}, "required": ["walls"]})),
+        s("set_walls", "Changes walls (ids, or all with 'all': true): thickness t (m) or material.", true, json!({"type": "object", "properties": {"walls": ids, "all": {"type": "boolean"}, "t": {"type": "number"}, "material": {"type": "string"}}})),
         s("move_node", "Moves a node to a point (its members follow); landing on another node (within 1 mm) merges the two, and members left with no length are deleted.", true, json!({"type": "object", "properties": {"node": {"type": "integer"}, "to": p3}, "required": ["node", "to"]})),
         s("transform", "Moves, copies, rotates or mirrors members (ids, or all with 'all': true). action 'move' (d [dx,dy,dz] m; copy true with n copies makes an array at d, 2d, ...), 'rotate' (about a vertical axis through centre [x,y,z], angle degrees), or 'mirror' (about the plane through point with normal [nx,ny,nz], e.g. [1,0,0] for the plane x = const). copy keeps the originals. Copies merge with nodes already there, take their member loads (loads), supports and nodal loads at nodes they create (supports), and slabs whose four edges are all copied (slabs); a member that would land on an existing one is skipped. A moved member drags the members attached to it.", true, json!({"type": "object", "properties": {"members": ids, "all": {"type": "boolean"}, "action": {"type": "string", "enum": ["move", "rotate", "mirror"]}, "d": p3, "copy": {"type": "boolean"}, "n": {"type": "integer"}, "centre": p3, "angle": {"type": "number"}, "point": p3, "normal": p3, "loads": {"type": "boolean"}, "supports": {"type": "boolean"}, "slabs": {"type": "boolean"}}, "required": ["action"]})),
         s("split_member", "Splits a member into pieces at fractions 'at' of its length (e.g. [0.25, 0.5]) or into 'parts' equal pieces, keeping section, material, kind and behaviour; its line and point loads go to the pieces with the intensities interpolated, its end hinges stay at the outer ends.", true, json!({"type": "object", "properties": {"member": {"type": "integer"}, "at": {"type": "array", "items": {"type": "number"}}, "parts": {"type": "integer"}}, "required": ["member"]})),
@@ -110,7 +112,7 @@ fn kind_of(s: &str) -> MemberKind {
 
 /// A short description of the model, for the agent's prompt and get_model.
 pub fn summary(m: &Model) -> Value {
-    let count = |k: MemberKind| m.members.iter().filter(|x| m.kind(x) == k).count();
+    let count = |k: MemberKind| m.members.iter().filter(|x| x.role.is_frame() && m.kind(x) == k).count();
     let ext = crate::scene::extent(m);
     let mut levels: Vec<f64> = m.nodes.iter().map(|n| (n.z * 1000.0).round() / 1000.0).collect();
     levels.sort_by(f64::total_cmp);
@@ -127,11 +129,22 @@ pub fn summary(m: &Model) -> Value {
         "cases": m.cases.iter().map(|c| json!({"id": c.id, "name": c.name, "kind": c.kind, "self_weight": c.self_weight, "loads": m.loads.iter().filter(|l| l.case == c.id).count()})).collect::<Vec<_>>(),
         "combinations": m.combos.iter().map(|c| json!({"id": c.id, "name": c.name, "kind": c.kind, "factors": c.factors.iter().map(|(id, f)| (m.case(*id).map(|c| c.name.clone()).unwrap_or(id.to_string()), *f)).collect::<std::collections::BTreeMap<String, f64>>()})).collect::<Vec<_>>(),
         "slabs": m.slabs.len(),
+        "walls": m.walls.iter().map(|w| json!({"id": w.id, "name": w.name, "from": w.a, "to": w.b, "t_mm": (w.t * 1e3).round(), "length_m": (w.length() * 1000.0).round() / 1000.0, "z": [w.z0, w.z1], "piers": m.members.iter().filter(|x| x.role == Role::WallPier(w.id)).count()})).collect::<Vec<_>>(),
         "design": m.design,
     })
 }
 
+/// Runs a command; afterwards the walls are rebuilt where the model's levels changed (a new
+/// floor gives every wall through it a pier joint there).
 pub fn run(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
+    let out = run_inner(m, name, a)?;
+    if !m.walls.is_empty() && !matches!(name, "get_model" | "list_sections" | "check_model") {
+        crate::walls::sync(m);
+    }
+    Ok(out)
+}
+
+fn run_inner(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
     match name {
         "get_model" => {
             if a.get("detail").and_then(Value::as_bool).unwrap_or(false) {
@@ -182,7 +195,7 @@ pub fn run(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
                     winkler: None,
                     rebar: num(e, "rebar"),
                     bim_id: e.get("bim_id").and_then(Value::as_str).map(String::from),
-                    tension: e.get("tension").and_then(|t| serde_json::from_value(t.clone()).ok()),
+                    tension: e.get("tension").and_then(|t| serde_json::from_value(t.clone()).ok()), role: Default::default(),
                     group: e.get("group").and_then(Value::as_str).map(String::from),
                 });
                 made.push(id);
@@ -471,6 +484,92 @@ pub fn run(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
             }
             Ok(json!({"slabs": made}))
         }
+        "add_walls" => {
+            let list = a.get("walls").and_then(Value::as_array).ok_or("give walls [{from, to, t}]")?;
+            let zs: Vec<f64> = m.nodes.iter().map(|n| n.z).collect();
+            let (zmin, zmax) = (zs.iter().copied().fold(f64::MAX, f64::min), zs.iter().copied().fold(f64::MIN, f64::max));
+            let conc = m.materials.iter().find(|x| x.kind == MaterialKind::Concrete).map(|x| x.id);
+            let base_fixed = a.get("base").and_then(Value::as_str).unwrap_or("fixed") == "fixed";
+            let mut made = vec![];
+            for e in list {
+                let xy = |k: &str| -> Result<[f64; 2], String> {
+                    let v = e.get(k).and_then(Value::as_array).ok_or_else(|| format!("each wall needs '{k}' [x, y]"))?;
+                    Ok([v.first().and_then(Value::as_f64).ok_or("x")?, v.get(1).and_then(Value::as_f64).ok_or("y")?])
+                };
+                let (pa, pb) = (xy("from")?, xy("to")?);
+                let z0 = num(e, "z0").unwrap_or(if zmin.is_finite() { zmin } else { 0.0 });
+                let mut z1 = num(e, "z1").unwrap_or(if zmax.is_finite() { zmax } else { 0.0 });
+                let mut levels: Vec<f64> = a.get("levels").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+                if let Some(h) = num(a, "storey_h").filter(|h| *h > 0.1) {
+                    if num(e, "z1").is_none() && z1 <= z0 + 1e-6 {
+                        return Err("storey_h needs z1 (the wall's top) when the model has no levels yet".into());
+                    }
+                    let n = ((z1 - z0) / h).round().max(1.0) as usize;
+                    levels.extend((0..=n).map(|k| z0 + (z1 - z0) * k as f64 / n as f64));
+                }
+                if levels.iter().any(|z| *z > z1) && num(e, "z1").is_none() {
+                    z1 = levels.iter().copied().fold(z1, f64::max);
+                }
+                if z1 <= z0 + 0.1 {
+                    return Err(format!("wall from {pa:?} to {pb:?}: give z1 above z0 = {z0} (or add the floors first)"));
+                }
+                let t = num(e, "t").unwrap_or(0.25);
+                if !(0.1..=1.5).contains(&t) {
+                    return Err(format!("wall thickness {t} m: give t in m, e.g. 0.25"));
+                }
+                let material = match e.get("material") {
+                    Some(v) => material_id(m, Some(v), &Section { id: 0, name: String::new(), shape: Shape::Rect { b: t, h: 1.0 } })?,
+                    None => conc.ok_or("no concrete material")?,
+                };
+                let id = m.walls.iter().map(|w| w.id).max().unwrap_or(0) + 1;
+                let name = e.get("name").and_then(Value::as_str).map(String::from).unwrap_or(format!("W{id}"));
+                m.walls.push(Wall { id, name, a: pa, b: pb, z0, z1, t, material, bim_id: e.get("bim_id").and_then(Value::as_str).map(String::from), levels: levels.into_iter().filter(|z| *z >= z0 - 1e-6 && *z <= z1 + 1e-6).collect() });
+                made.push(id);
+            }
+            crate::walls::sync(m);
+            if base_fixed {
+                for id in &made {
+                    let w = m.walls.iter().find(|w| w.id == *id).cloned().unwrap();
+                    let c = [(w.a[0] + w.b[0]) / 2.0, (w.a[1] + w.b[1]) / 2.0, w.z0];
+                    if let Some(n) = m.find_node(c) {
+                        if !m.supports.iter().any(|s| s.node == n) {
+                            m.supports.push(Support::of_kind(n, "fixed").unwrap());
+                        }
+                    }
+                }
+            }
+            let piers = m.members.iter().filter(|x| matches!(x.role, Role::WallPier(w) if made.contains(&w))).count();
+            Ok(json!({"walls": made, "piers": piers, "next": "analyze, then design: each wall is designed per storey"}))
+        }
+        "set_walls" => {
+            let sel: Vec<Id> = if a.get("all").and_then(Value::as_bool).unwrap_or(false) { m.walls.iter().map(|w| w.id).collect() } else { ids(a, "walls") };
+            if sel.is_empty() {
+                return Err("give walls [ids] or all true".into());
+            }
+            let mat = match a.get("material") {
+                Some(v) => Some(material_id(m, Some(v), &Section { id: 0, name: String::new(), shape: Shape::Rect { b: 0.25, h: 1.0 } })?),
+                None => None,
+            };
+            for w in m.walls.iter_mut().filter(|w| sel.contains(&w.id)) {
+                if let Some(t) = num(a, "t") {
+                    w.t = t;
+                }
+                if let Some(x) = mat {
+                    w.material = x;
+                }
+                w.levels.clear();
+            }
+            // rebuilt with the new section (their levels are found again)
+            for id in &sel {
+                let old: Vec<Id> = m.members.iter().filter(|x| x.role.wall() == Some(*id)).map(|x| x.id).collect();
+                let lv: Vec<f64> = old.iter().filter_map(|x| m.member(*x)).flat_map(|x| [x.i, x.j]).filter_map(|n| m.node(n).map(|n| n.z)).collect();
+                if let Some(w) = m.walls.iter_mut().find(|w| w.id == *id) {
+                    w.levels = lv;
+                }
+            }
+            crate::walls::sync(m);
+            Ok(json!({"changed": sel}))
+        }
         "move_node" => {
             let id = a.get("node").and_then(Value::as_u64).ok_or("node")? as Id;
             let to = p3(a.get("to").ok_or("to")?)?;
@@ -545,6 +644,14 @@ pub fn run(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
         }
         "delete" => {
             let (mem, nodes, slabs, sups) = (ids(a, "members"), ids(a, "nodes"), ids(a, "slabs"), ids(a, "supports"));
+            let walls = ids(a, "walls");
+            if !walls.is_empty() {
+                let base: Vec<Id> = m.members.iter().filter(|x| x.role.wall().is_some_and(|w| walls.contains(&w))).flat_map(|x| [x.i]).collect();
+                m.walls.retain(|w| !walls.contains(&w.id));
+                crate::walls::sync(m);
+                // the base supports of the walls that went
+                m.supports.retain(|s| !base.contains(&s.node) || m.members.iter().any(|x| x.i == s.node || x.j == s.node));
+            }
             m.delete_members(&mem);
             m.delete_nodes(&nodes);
             m.slabs.retain(|s| !slabs.contains(&s.id));
@@ -660,7 +767,7 @@ fn add_frame(m: &mut Model, a: &Value) -> Result<Value, String> {
         }
         let id = m.next_member_id();
         let roll = if kind == MemberKind::Column { col_roll } else { 0.0 };
-        m.members.push(Member { id, i, j, section: s, material: mat, kind, hinge_i: false, hinge_j: false, lb: None, k: None, roll, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, group: steel.then_some(group) });
+        m.members.push(Member { id, i, j, section: s, material: mat, kind, hinge_i: false, hinge_j: false, lb: None, k: None, roll, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: None, tension: None, role: Default::default(), group: steel.then_some(group) });
         made += 1;
     };
     for (lvl, w) in gz.windows(2).enumerate() {

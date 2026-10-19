@@ -121,7 +121,7 @@ pub fn apply(model: &mut Model, r: &ImportResult) -> Result<Applied, String> {
             continue;
         }
         let id = model.next_member_id();
-        model.members.push(Member { id, i, j, section: sid, material, kind: im.kind, hinge_i: false, hinge_j: false, lb: None, k: None, roll: im.roll, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: im.bim_id.clone(), tension: None, group: None });
+        model.members.push(Member { id, i, j, section: sid, material, kind: im.kind, hinge_i: false, hinge_j: false, lb: None, k: None, roll: im.roll, truss: false, behaviour: Default::default(), winkler: None, rebar: None, bim_id: im.bim_id.clone(), tension: None, role: Default::default(), group: None });
         out.members.push(id);
     }
     out.nodes = model.nodes.len() - nodes_before;
@@ -345,7 +345,7 @@ pub fn export(model: &Model, a: Option<&Analysis>, opts: &DxfOptions) -> String 
     d.layer("0", 7);
     let size = crate::scene::extent(model).map(|(lo, hi)| dist(lo, hi)).unwrap_or(10.0).max(1.0);
     let th = if opts.text_height > 0.0 { opts.text_height } else { 0.15 };
-    for m in &model.members {
+    for m in model.members.iter().filter(|m| m.role.is_frame()) {
         let (Some(pi), Some(pj)) = (model.node(m.i), model.node(m.j)) else { continue };
         let (a3, b3) = (pi.p(), pj.p());
         let sec = model.section(m.section).map(|s| s.name.clone()).unwrap_or_default();
@@ -430,6 +430,23 @@ pub fn export(model: &Model, a: Option<&Analysis>, opts: &DxfOptions) -> String 
         if opts.labels {
             let lb = d.layer("LABELS", 8);
             d.text(&lb, v.project([(lo.0 + hi.0) / 2.0, (lo.1 + hi.1) / 2.0, s.z]), th, &format!("{} h {:.0}", s.name, s.h * 1000.0));
+        }
+    }
+    // walls: the outline of the wall's face (3D, elevation) or of its plan (a plan view)
+    for wl in &model.walls {
+        let l = d.layer(&format!("WALL_{:.0}", wl.t * 1000.0), 5);
+        let lw = wl.length().max(1e-9);
+        let n = [-(wl.b[1] - wl.a[1]) / lw * wl.t / 2.0, (wl.b[0] - wl.a[0]) / lw * wl.t / 2.0];
+        let pts: Vec<[f64; 3]> = match opts.view {
+            DxfView::Plan { z } if z > wl.z0 - 1e-6 && z < wl.z1 + 1e-6 => vec![[wl.a[0] + n[0], wl.a[1] + n[1], z], [wl.b[0] + n[0], wl.b[1] + n[1], z], [wl.b[0] - n[0], wl.b[1] - n[1], z], [wl.a[0] - n[0], wl.a[1] - n[1], z]],
+            DxfView::Plan { .. } => continue,
+            _ => vec![[wl.a[0], wl.a[1], wl.z0], [wl.b[0], wl.b[1], wl.z0], [wl.b[0], wl.b[1], wl.z1], [wl.a[0], wl.a[1], wl.z1]],
+        };
+        let pts: Vec<[f64; 3]> = pts.into_iter().map(|p| v.project(p)).collect();
+        d.polyline(&l, &pts, true);
+        if opts.labels {
+            let lb = d.layer("LABELS", 8);
+            d.text(&lb, v.project([(wl.a[0] + wl.b[0]) / 2.0, (wl.a[1] + wl.b[1]) / 2.0, wl.z0]), th, &format!("{} t {:.0}", wl.name, wl.t * 1000.0));
         }
     }
     // the moment diagram of a result, drawn on the members' tension side

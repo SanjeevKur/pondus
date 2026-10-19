@@ -138,7 +138,7 @@ pub fn import(v: &Value) -> Result<(Model, ImportReport), String> {
             winkler: None,
             rebar: None,
             bim_id: bim,
-            tension: None,
+            tension: None, role: Default::default(),
             group: None,
         });
     }

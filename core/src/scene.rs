@@ -151,10 +151,14 @@ pub fn ratio_color(r: f64) -> Rgba {
 
 /// The design ratio of a member or slab from a report.
 pub fn member_ratio(rep: &Report, id: Id) -> Option<f64> {
-    rep.beams.iter().find(|b| b.member == id).map(|b| b.ratio).or_else(|| rep.columns.iter().find(|b| b.member == id).map(|b| b.ratio)).or_else(|| rep.steel.iter().find(|b| b.member == id).map(|b| b.ratio))
+    rep.beams.iter().find(|b| b.member == id).map(|b| b.ratio).or_else(|| rep.columns.iter().find(|b| b.member == id).map(|b| b.ratio)).or_else(|| rep.steel.iter().find(|b| b.member == id).map(|b| b.ratio)).or_else(|| rep.walls.iter().find(|b| b.member == id).map(|b| b.ratio))
 }
 
 fn visible(model: &Model, m: &Member, spec: &Spec) -> bool {
+    // a wall's rigid arms are part of its analysis model, not something to look at
+    if matches!(m.role, Role::WallLink(_)) {
+        return false;
+    }
     let (Some(a), Some(b)) = (model.node(m.i), model.node(m.j)) else { return false };
     if spec.view == "plan" {
         if let Some(z) = spec.z {
@@ -216,7 +220,7 @@ pub fn build(model: &Model, analysis: Option<&Analysis>, report: Option<&Report>
                 let u = shape.get(&id).copied().unwrap_or([0.0; 3]);
                 Some([n.x + k * u[0], n.y + k * u[1], n.z + k * u[2]])
             };
-            for m in &model.members {
+            for m in model.members.iter().filter(|m| !matches!(m.role, Role::WallLink(_))) {
                 if let (Some(a), Some(b), Some(p), Some(q)) = (model.node(m.i), model.node(m.j), at(m.i), at(m.j)) {
                     out.push(Prim::Line { a: a.p(), b: b.p(), color: [120, 120, 126, 90], width: 1.0, member: Some(m.id) });
                     out.push(Prim::Line { a: p, b: q, color: DIAG_POS, width: 2.0, member: None });
@@ -261,6 +265,48 @@ pub fn build(model: &Model, analysis: Option<&Analysis>, report: Option<&Report>
     };
     let vmax = result.as_ref().map(|r| r.members.iter().filter(|mr| model.member(mr.member).is_some_and(|m| visible(model, m, spec))).flat_map(|mr| mr.stations.iter().map(|s| value(s).abs())).fold(0.0, f64::max)).unwrap_or(0.0);
     let dmax = result.as_ref().map(|r| r.displacements.values().map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()).fold(0.0, f64::max)).unwrap_or(0.0);
+    // walls: a panel per storey (its footprint in a plan), coloured by its design ratio
+    for w in &model.walls {
+        let mut piers: Vec<&Member> = model.members.iter().filter(|m| m.role == Role::WallPier(w.id)).collect();
+        piers.sort_by(|a, b| model.node(a.i).map(|n| n.z).unwrap_or(0.0).total_cmp(&model.node(b.i).map(|n| n.z).unwrap_or(0.0)));
+        let colour = |pier: Option<&Member>| -> Rgba {
+            let r = pier.and_then(|p| report.and_then(|rep| rep.walls.iter().find(|d| d.member == p.id))).map(|d| d.ratio);
+            match (spec.diagram == Diagram::Utilisation, r) {
+                (true, Some(r)) => {
+                    let c = ratio_color(r);
+                    [c[0], c[1], c[2], 150]
+                }
+                _ => [168, 160, 150, 120],
+            }
+        };
+        let edge: Rgba = [205, 198, 188, 255];
+        if spec.view == "plan" {
+            let z = spec.z.unwrap_or(w.z1);
+            if z < w.z0 - 0.05 || z > w.z1 + 0.05 {
+                continue;
+            }
+            let lw = w.length().max(1e-9);
+            let n = [-(w.b[1] - w.a[1]) / lw * w.t / 2.0, (w.b[0] - w.a[0]) / lw * w.t / 2.0];
+            let pier = piers.iter().find(|p| model.node(p.i).is_some_and(|a| a.z <= z + 0.05) && model.node(p.j).is_some_and(|b| b.z >= z - 0.05)).copied();
+            let pts = vec![[w.a[0] + n[0], w.a[1] + n[1], z], [w.b[0] + n[0], w.b[1] + n[1], z], [w.b[0] - n[0], w.b[1] - n[1], z], [w.a[0] - n[0], w.a[1] - n[1], z]];
+            out.push(Prim::Poly { pts: pts.clone(), color: colour(pier) });
+            for k in 0..4 {
+                out.push(Prim::Line { a: pts[k], b: pts[(k + 1) % 4], color: edge, width: 1.2, member: pier.map(|p| p.id) });
+            }
+            continue;
+        }
+        if spec.view == "elevation" && spec.y.is_some_and(|y| (w.a[1] - y).abs() > 0.05 || (w.b[1] - y).abs() > 0.05) {
+            continue;
+        }
+        for p in &piers {
+            let (Some(i), Some(j)) = (model.node(p.i), model.node(p.j)) else { continue };
+            let (z0, z1) = (i.z.min(j.z), i.z.max(j.z));
+            out.push(Prim::Poly { pts: vec![[w.a[0], w.a[1], z0], [w.b[0], w.b[1], z0], [w.b[0], w.b[1], z1], [w.a[0], w.a[1], z1]], color: colour(Some(p)) });
+            out.push(Prim::Line { a: [w.a[0], w.a[1], z1], b: [w.b[0], w.b[1], z1], color: edge, width: 1.0, member: None });
+        }
+        out.push(Prim::Line { a: [w.a[0], w.a[1], w.z0], b: [w.a[0], w.a[1], w.z1], color: edge, width: 1.2, member: None });
+        out.push(Prim::Line { a: [w.b[0], w.b[1], w.z0], b: [w.b[0], w.b[1], w.z1], color: edge, width: 1.2, member: None });
+    }
     for m in &model.members {
         if !visible(model, m, spec) {
             continue;

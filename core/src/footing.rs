@@ -83,7 +83,7 @@ pub fn design(model: &Model, a: &Analysis) -> Vec<FootingDesign> {
     let mut out = vec![];
     for s in &model.supports {
         let Some(n) = model.node(s.node) else { continue };
-        let Some(col) = model.members.iter().find(|m| (m.i == s.node || m.j == s.node) && model.kind(m) == MemberKind::Column && model.is_concrete(m)) else { continue };
+        let Some(col) = model.members.iter().find(|m| (m.i == s.node || m.j == s.node) && model.kind(m) == MemberKind::Column && model.is_concrete(m) && m.role.is_frame()) else { continue };
         let (cl, cw) = match model.section(col.section).map(|x| &x.shape) {
             // a column with roll 0 has its depth h along x
             Some(Shape::Rect { b, h }) => {

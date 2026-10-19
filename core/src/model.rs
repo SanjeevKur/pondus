@@ -230,6 +230,9 @@ pub struct Member {
     /// The end connection of a steel member in tension (None: the design settings' one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tension: Option<TensionConnection>,
+    /// A frame member, or a pier or rigid arm generated for a wall.
+    #[serde(default, skip_serializing_if = "Role::is_frame")]
+    pub role: Role,
     /// Members of one group get one section when steel is selected (e.g. "B-L2").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -590,6 +593,58 @@ pub struct Model {
     pub design: DesignSettings,
     /// Earthquake: modal and response spectrum analysis (off unless enabled).
     pub seismic: crate::seismic::Seismic,
+    /// Structural walls (shear walls), each analysed as piers with rigid arms (`walls.rs`).
+    pub walls: Vec<Wall>,
+}
+
+/// A structural wall: a straight line in plan from `a` to `b`, from `z0` to `z1`, of thickness
+/// `t` (m). It is analysed by the wide-column analogy: a pier member at its centre line between
+/// consecutive levels, with the wall's section, and rigid arms at each level out to its ends,
+/// so beams and slabs along the wall connect to it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Wall {
+    pub id: Id,
+    pub name: String,
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    pub z0: f64,
+    pub z1: f64,
+    pub t: f64,
+    pub material: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bim_id: Option<String>,
+    /// The levels its piers were built between (kept so that new floors rebuild them).
+    #[serde(default)]
+    pub levels: Vec<f64>,
+}
+
+impl Wall {
+    pub fn length(&self) -> f64 {
+        ((self.b[0] - self.a[0]).powi(2) + (self.b[1] - self.a[1]).powi(2)).sqrt()
+    }
+}
+
+/// What a member stands for: an ordinary frame member, a pier of a wall, or a rigid arm of a
+/// wall (analysed, never designed).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    #[default]
+    Frame,
+    WallPier(Id),
+    WallLink(Id),
+}
+
+impl Role {
+    pub fn is_frame(&self) -> bool {
+        *self == Role::Frame
+    }
+    pub fn wall(&self) -> Option<Id> {
+        match *self {
+            Role::WallPier(w) | Role::WallLink(w) => Some(w),
+            Role::Frame => None,
+        }
+    }
 }
 
 impl Default for Model {
@@ -624,6 +679,7 @@ impl Model {
             stages: vec![],
             design: DesignSettings::default(),
             seismic: Default::default(),
+            walls: vec![],
         }
     }
 

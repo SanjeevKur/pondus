@@ -222,3 +222,26 @@ fn ui_draw_by_hand() {
     a.view.fit = true;
     shot(&mut h, "20-drawn-by-hand");
 }
+
+/// A shear wall dragged with the wall tool along a frame line: it replaces the beams in it,
+/// analyses, designs per storey and draws as panels.
+#[test]
+fn ui_wall_tool() {
+    use crate::tools::Tool;
+    use crate::view::Drag;
+    let mut h = Harness::builder().with_size(egui::vec2(1500.0, 940.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| App::new(cc, None));
+    h.state_mut().test_frame();
+    let a = h.state_mut();
+    a.set_tool(Tool::Wall);
+    a.opts.wall_t = 0.3;
+    a.tool_drag(&Drag { from: [0.0, 0.0, 0.0], to: [6.0, 0.0, 0.0], node: None, member: None }, false);
+    assert_eq!(a.model.walls.len(), 1, "{}", a.status);
+    assert_eq!(a.model.members.iter().filter(|m| matches!(m.role, pondus_core::model::Role::WallPier(_))).count(), 3);
+    a.test_analyze();
+    a.test_design();
+    let rep = a.report.as_ref().unwrap();
+    assert_eq!(rep.walls.len(), 3, "{}", a.status);
+    a.spec.diagram = pondus_core::scene::Diagram::Utilisation;
+    a.set_tool(Tool::Select);
+    shot(&mut h, "21-shear-wall");
+}
