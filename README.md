@@ -4,7 +4,11 @@
 
 **Licence: [GNU AGPL-3.0-only](LICENSE)** · **Source: https://github.com/Sompote/pondus** · Copyright © 2026 Sompote Youwai · includes the [Stabileo](https://github.com/lambdaclass/stabileo) engine (AGPL-3.0) · see [NOTICE.md](NOTICE.md)
 
-Pondus is a native Rust program for the analysis and design of building structures, in which an agent builds, analyses and designs the structure through a chat while the engineer checks the result in the views and the design table. It links the Stabileo analysis engine directly, so no browser or web server is involved. It designs reinforced concrete beams, slabs, columns and footings to ACI 318-19 and steel members to AISC 360-16 (LRFD) or EN 1993-1-1, writes the calculation report as a PDF, exchanges models as Excel, DXF and IFC, and exposes everything as an MCP server so other agents, such as the agent of the BIM modeller Aedifex, can send a structure in and take the design back to the BIM model.
+**Pondus is an agentic AI program for structural analysis and design, built for agents to use.** Every operation, from building the model to analysing, designing and reporting it, is a tool that a language-model agent can call, either through the chat inside the program or from another agent over the Model Context Protocol (MCP). The engineer watches the same model change in the views and the design tables, checks the numbers and edits by hand where needed. Pondus is a native Rust program that links the Stabileo analysis engine directly, so no browser or web server is involved. It designs reinforced concrete beams, slabs, columns, structural walls and footings to ACI 318-19 and steel members to AISC 360-16 (LRFD) or EN 1993-1-1, writes the calculation report as a PDF and exchanges models as Excel, DXF and IFC. Other agents, such as the agent of the BIM modeller Aedifex, can send a structure in and take the design back to the BIM model.
+
+<p align="center"><img src="docs/screenshot.png" alt="Pondus with a 50-storey tower built by the agent" width="900"></p>
+
+<p align="center"><sub>A 50-storey, 175 m tower on a 5 × 4 bay grid at 6.0 m with an 18 × 12 m shear-wall core, built and analysed by the agent. The agent's answer and its plan and 3D pictures are on the right, and the linear buckling of ULS 1.4D (λ1 = 17.415) is in the table below the view.</sub></p>
 
 ## Build and run
 
