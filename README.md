@@ -10,6 +10,10 @@
 
 <p align="center"><sub>A 50-storey, 175 m tower on a 5 × 4 bay grid at 6.0 m with an 18 × 12 m shear-wall core, built and analysed by the agent. The agent's answer and its plan and 3D pictures are on the right, and the linear buckling of ULS 1.4D (λ1 = 17.415) is in the table below the view.</sub></p>
 
+## Paper
+
+**[Calibrating an agentic structural analysis and design program against published benchmarks](paper/paper.pdf)** (S. Youwai, October 2026) reports how Pondus was checked against reference values from textbooks, software verification manuals and the published worked examples of the design codes. Every comparison goes through Pondus's own model, analysis wrapper and design code. Of 396 comparisons over 219 cases, 367 agree within 0.5 % and 379 within 1 %, and each of the other 17 is explained by mesh convergence, the conservative load contour for biaxial bending or the rounded SI constants of ACI 318. The calibration and the closed-form tests before it found twelve defects, six of them unconservative, and eleven of the twelve lay in the code that prepares the inputs of a kernel or a check rather than in the kernels. The paper's tables and figure are generated from the test output (`calibration/*.csv`), and `paper/build.sh` rebuilds the PDF (pandoc and tectonic).
+
 ## Build and run
 
 The workspace is self-contained, because the Stabileo engine and the TigrimOS agent harness are vendored inside it, so one command builds everything:
