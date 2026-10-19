@@ -60,7 +60,14 @@ fn main() {
     }
     let open = args.get(1).filter(|a| !a.starts_with('-')).map(std::path::PathBuf::from);
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default().with_title("Pondus").with_inner_size([1500.0, 940.0]).with_min_inner_size([960.0, 620.0]),
+        viewport: {
+            let v = eframe::egui::ViewportBuilder::default().with_title("Pondus").with_inner_size([1500.0, 940.0]).with_min_inner_size([960.0, 620.0]);
+            // the window and Dock icon
+            match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+                Ok(icon) => v.with_icon(std::sync::Arc::new(icon)),
+                Err(_) => v,
+            }
+        },
         ..Default::default()
     };
     if let Err(e) = eframe::run_native("Pondus", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, open))))) {
