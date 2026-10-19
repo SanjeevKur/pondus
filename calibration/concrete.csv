@@ -1,0 +1,206 @@
+aspect,case,source,quantity,unit,reference,pondus,error_pct,tol_pct,kind
+"RC column biaxial","Pincheira 10.20.1","StructurePoint Biaxial Rectangular Column (ACI 318-19) after Pincheira Ex. 10.20.1","Mnx by load contour α 1.15 vs exact","kip-ft",321,294.59714713993606,-8.2252,15,independent
+"RC column biaxial","Pincheira 10.20.1","StructurePoint Biaxial Rectangular Column (ACI 318-19) after Pincheira Ex. 10.20.1","Mny by load contour α 1.15 vs exact","kip-ft",201,184.12321696246002,-8.3964,15,independent
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","Aoh","mm²",138870.69,138870.68999999994,-0.0000,0.5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","ph","mm",1574.8,1574.7999999999997,-0.0000,0.5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","Ao = 0.85 Aoh","mm²",118038.4736,118040.08649999995,0.0014,0.5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","φTth (SI 0.083√f'c)","kN·m",7.958652045072,7.9578352911144785,-0.0103,0.5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","φTcr = 4 φTth","kN·m",31.848166360944,31.831341164457914,-0.0528,0.5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","At/s per leg","mm²/mm",0.51816,0.5182847791245406,0.0241,0.5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","Al (22.7.6.1b)","mm²",816.1273999999999,816.1948701653264,0.0083,0.5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","Al,min (9.6.4.3; SI 0.42√f'c for 5√f'c: +1.1 % on a difference)","mm²",326.45096,339.58536688044387,4.0234,5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","φVc (SI 0.17: +2.4 %)","kN",127.04122032,130.027014646382,2.3503,2.5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","(Av + 2At)/s min (SI 0.35 for 50 psi)","mm²/mm",0.29718,0.30085662675759756,1.2372,2,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","s,max = ph/8 (9.7.6.3.3)","mm",196.85,196.84999999999997,-0.0000,0.5,published
+"RC torsion","Wight 7-2","StructurePoint Equilibrium Torsion (ACI 318-14) after Wight Ex. 7-2","cross-section limit 325.55 / 474.34 psi","-",0.6863220474764937,0.6866216967045382,0.0437,1,published
+"RC beam flexure","2.I.6 singly reinforced","INTI-CIRSOC 201 Ej. 2.I.6 (2005), as recorded in Stabileo","φMn (φ = 0.90, Mn = 56.20)","kN·m",50.580000000000005,50.585258541176465,0.0104,0.5,published
+"RC beam flexure","2.I.6 singly reinforced","INTI-CIRSOC 201 Ej. 2.I.6 (2005), as recorded in Stabileo","kc = c/d with β1(25 MPa)","-",0.213,0.21283113052356914,-0.0793,0.5,published
+"masonry TMS 402","out-of-plane flexure, d = t/2","TMS 402-16 9.3.2 (Whitney block 0.80 f'm)","Mu / φMn","-",0.6925867076381691,0.692586707638169,-0.0000,0.5,closed-form
+"two-way slab coefficients","case 1 interior, neg. continuous edge, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.033,0.033,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, neg. continuous edge, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.04,0.04,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, neg. continuous edge, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.048,0.048,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, neg. continuous edge, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.055,0.055,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, neg. continuous edge, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.063,0.063,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, neg. continuous edge, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.083,0.083,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, neg. continuous edge, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.033,0.033,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, neg. continuous edge, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.083,0.083,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, pos. midspan, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.025,0.025,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, pos. midspan, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.03,0.03,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, pos. midspan, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.036,0.036,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, pos. midspan, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.041,0.041,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, pos. midspan, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.047,0.047,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, pos. midspan, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.062,0.062,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, pos. midspan, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.025,0.025,0.0000,0.01,published
+"two-way slab coefficients","case 1 interior, pos. midspan, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.062,0.062,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. continuous edge, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.041,0.041,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. continuous edge, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.048,0.048,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. continuous edge, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.055,0.055,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. continuous edge, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.062,0.062,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. continuous edge, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.069,0.069,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. continuous edge, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.085,0.085,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. continuous edge, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.041,0.041,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. continuous edge, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.085,0.085,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. discontinuous edge, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.021,0.021,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. discontinuous edge, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.024,0.024,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. discontinuous edge, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.027,0.027,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. discontinuous edge, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.031,0.031,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. discontinuous edge, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.035,0.035,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. discontinuous edge, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.042,0.042,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. discontinuous edge, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.021,0.021,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., neg. discontinuous edge, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.042,0.042,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., pos. midspan, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.031,0.031,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., pos. midspan, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.036,0.036,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., pos. midspan, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.041,0.041,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., pos. midspan, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.047,0.047,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., pos. midspan, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.052,0.052,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., pos. midspan, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.064,0.064,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., pos. midspan, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.031,0.031,0.0000,0.01,published
+"two-way slab coefficients","case 2 one edge disc., pos. midspan, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.064,0.064,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. continuous edge, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.049,0.049,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. continuous edge, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.057,0.057,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. continuous edge, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.064,0.064,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. continuous edge, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.071,0.071,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. continuous edge, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.078,0.078,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. continuous edge, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.09,0.09,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. continuous edge, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.049,0.049,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. continuous edge, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.09,0.09,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. discontinuous edge, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.025,0.025,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. discontinuous edge, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.028,0.028,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. discontinuous edge, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.032,0.032,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. discontinuous edge, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.036,0.036,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. discontinuous edge, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.039,0.039,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. discontinuous edge, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.045,0.045,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. discontinuous edge, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.025,0.025,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., neg. discontinuous edge, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.045,0.045,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., pos. midspan, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.037,0.037,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., pos. midspan, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.043,0.043,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., pos. midspan, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.048,0.048,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., pos. midspan, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.054,0.054,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., pos. midspan, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.059,0.059,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., pos. midspan, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.068,0.068,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., pos. midspan, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.037,0.037,0.0000,0.01,published
+"two-way slab coefficients","case 3 two edges disc., pos. midspan, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.068,0.068,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. continuous edge, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.058,0.058,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. continuous edge, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.066,0.066,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. continuous edge, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.074,0.074,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. continuous edge, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.082,0.082,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. continuous edge, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.09,0.09,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. continuous edge, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.098,0.098,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. continuous edge, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.058,0.058,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. continuous edge, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.098,0.098,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. discontinuous edge, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.029,0.029,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. discontinuous edge, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.033,0.033,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. discontinuous edge, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.037,0.037,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. discontinuous edge, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.041,0.041,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. discontinuous edge, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.045,0.045,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. discontinuous edge, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.049,0.049,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. discontinuous edge, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.029,0.029,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., neg. discontinuous edge, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.049,0.049,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., pos. midspan, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.044,0.044,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., pos. midspan, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.05,0.05,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., pos. midspan, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.056,0.056,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., pos. midspan, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.062,0.062,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., pos. midspan, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.068,0.068,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., pos. midspan, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.074,0.074,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., pos. midspan, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.044,0.044,0.0000,0.01,published
+"two-way slab coefficients","case 4 three edges disc., pos. midspan, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.074,0.074,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., neg. discontinuous edge, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.033,0.033,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., neg. discontinuous edge, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.038,0.038,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., neg. discontinuous edge, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.043,0.043,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., neg. discontinuous edge, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.047,0.047,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., neg. discontinuous edge, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.053,0.053,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., neg. discontinuous edge, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.055,0.055,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., neg. discontinuous edge, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.033,0.033,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., neg. discontinuous edge, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.055,0.055,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., pos. midspan, short span, m = 1","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.05,0.05,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., pos. midspan, short span, m = 0.9","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.057,0.057,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., pos. midspan, short span, m = 0.8","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.064,0.064,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., pos. midspan, short span, m = 0.7","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.072,0.072,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., pos. midspan, short span, m = 0.6","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.08,0.08,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., pos. midspan, short span, m = 0.5","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.083,0.083,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., pos. midspan, long span","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.05,0.05,0.0000,0.01,published
+"two-way slab coefficients","case 5 four edges disc., pos. midspan, short span, m = 0.4 (0.5 and less)","ACI 318-63 App. A Method 2 Table I (scan in Hussain, U. Basrah notes)","C","-",0.083,0.083,0.0000,0.01,published
+"two-way slab coefficients","Ex. 1 interior, m = 0.833, short neg.","Hussain, U. Basrah two-way slab notes, Method 2 Example 1 (interior panel 6.0 x 7.2 m)","C","-",0.04536,0.045360000000000004,0.0000,0.1,published
+"two-way slab coefficients","Ex. 1 interior, m = 0.833, short pos.","Hussain, U. Basrah two-way slab notes, Method 2 Example 1 (interior panel 6.0 x 7.2 m)","C","-",0.03402,0.03402,0.0000,0.1,published
+"two-way slab coefficients","Ex. 1 interior, long neg.","Hussain, U. Basrah two-way slab notes, Method 2 Example 1 (interior panel 6.0 x 7.2 m)","C","-",0.033,0.033,0.0000,0.01,published
+"two-way slab design","Ex. 1 interior","Hussain, U. Basrah two-way slab notes, Method 2 Example 1 (interior panel 6.0 x 7.2 m)","wu","kPa",25.36,25.36,0.0000,0.5,published
+"two-way slab design","Ex. 1 interior","Hussain, U. Basrah two-way slab notes, Method 2 Example 1 (interior panel 6.0 x 7.2 m)","short-span negative Mu","kN·m/m",41.41,41.38752000000001,-0.0543,0.5,published
+"two-way slab design","Ex. 1 interior","Hussain, U. Basrah two-way slab notes, Method 2 Example 1 (interior panel 6.0 x 7.2 m)","short-span positive Mu","kN·m/m",31.06,31.040640000000003,-0.0623,0.5,published
+"two-way slab design","Ex. 1 interior","Hussain, U. Basrah two-way slab notes, Method 2 Example 1 (interior panel 6.0 x 7.2 m)","long-span negative Mu","kN·m/m",30.13,30.12768,-0.0077,0.5,published
+"two-way slab design","Ex. 1 interior","Hussain, U. Basrah two-way slab notes, Method 2 Example 1 (interior panel 6.0 x 7.2 m)","long-span positive Mu","kN·m/m",22.82,22.824,0.0175,0.5,published
+"two-way slab design","Ex. 2 corner","Hussain, U. Basrah two-way slab notes, Method 2 Example 2 (corner panel 6.1 x 6.1 m)","wu","kPa",11.72,11.719999999999999,-0.0000,0.5,published
+"two-way slab design","Ex. 2 corner","Hussain, U. Basrah two-way slab notes, Method 2 Example 2 (corner panel 6.1 x 6.1 m)","negative Mu, continuous edge (C 0.049)","kN·m/m",21.37,21.368958799999994,-0.0049,0.5,published
+"two-way slab design","Ex. 2 corner","Hussain, U. Basrah two-way slab notes, Method 2 Example 2 (corner panel 6.1 x 6.1 m)","negative Mu, discontinuous edge (C 0.025)","kN·m/m",10.9,10.902529999999999,0.0232,0.5,published
+"two-way slab design","Ex. 2 corner","Hussain, U. Basrah two-way slab notes, Method 2 Example 2 (corner panel 6.1 x 6.1 m)","positive Mu (C 0.037)","kN·m/m",16.14,16.135744399999997,-0.0264,0.5,published
+"one-way slab","end span","StructurePoint One-Way Slab (ACI 318-14) after Wight Ex. 5-7, Tables 1-2","Mu at the exterior support, wl²/24","kN·m/m",8.14024626,8.149365473432256,0.1120,0.5,published
+"one-way slab","end span","StructurePoint One-Way Slab (ACI 318-14) after Wight Ex. 5-7, Tables 1-2","Vu at the first interior support, 1.15 wl/2","kN/m",28.166235104986875,28.208511806349456,0.1501,0.5,published
+"one-way slab","interior span","StructurePoint One-Way Slab (ACI 318-14) after Wight Ex. 5-7, Tables 1-2","Mu at midspan, wl²/16","kN·m/m",13.656041539999997,13.666078979404853,0.0735,0.5,published
+"one-way slab","interior span","StructurePoint One-Way Slab (ACI 318-14) after Wight Ex. 5-7, Tables 1-2","Mu at the supports, wl²/11","kN·m/m",19.883552339999998,19.877933060952515,-0.0283,0.5,published
+"one-way slab","interior span","StructurePoint One-Way Slab (ACI 318-14) after Wight Ex. 5-7, Tables 1-2","Vu at the supports, wl/2","kN/m",25.977149475065616,25.935628126699445,-0.1598,0.5,published
+"RC beam flexure","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","As required","mm²",1852.89952,1853.2254357077334,0.0176,0.5,published
+"RC beam flexure","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","β1 at 4.35 ksi (SI form of Table 22.2.2.4.3; printed to 2 digits)","-",0.83,0.8357700503571428,0.6952,1,published
+"RC beam flexure","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","As,min (9.6.1.2b governs; SI 1.4/fy for 200/fy)","mm²",452.90232,460.0775180329051,1.5843,2,published
+"RC beam shear","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","φVc (SI 0.17 for 2√f'c psi: +2.4 %)","kN",92.7454287,94.92650390468884,2.3517,2.5,published
+"RC beam shear","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","Vs required (inherits the φVc offset: −6.4 %)","kN",45.50531106,42.58238338041486,-6.4233,7,published
+"RC beam shear","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","(Av/s)min (SI 0.35 bw/fyt for 50 bw/fyt)","mm²/mm",0.254,0.2578771086493693,1.5264,2,published
+"RC beam shear","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","s,max = d/2","mm",223.01199999999997,223.01199999999997,0.0000,0.5,published
+"RC beam deflection","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","kd","mm",161.798,161.77758897635414,-0.0126,0.5,published
+"RC beam deflection","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","Icr","mm⁴",1564613928.8303998,1563926948.684797,-0.0439,0.5,published
+"RC beam deflection","Chaallal SS beam","StructurePoint Simply Supported RC Beam (ACI 318-14) after Chaallal (2018)","Mcr (SI 0.62√f'c for 7.5√f'c)","kN·m",44.714879803488,44.51300738431195,-0.4515,1,published
+"RC beam deflection","Chaallal SS beam, Ie under D","ACI 318-19 Table 24.2.3.5 on the example's Icr, Ig, Mcr, Ma","Ie","in⁴",4009.380483253059,4009.3804832530586,-0.0000,0.01,closed-form
+"RC beam deflection","Chaallal SS beam, Ie under D + L","ACI 318-19 Table 24.2.3.5 on the example's Icr, Ig, Mcr, Ma","Ie","in⁴",3807.258219503478,3807.2582195034774,-0.0000,0.01,closed-form
+"RC column slenderness","Wang 13.17.3","ACI 318-19 6.6.4.4.2 with (EI)eff 6.6.4.4.4(a), βdns 0.4","Pc (option a)","kip",4626.812082897848,4626.812082897848,0.0000,0.01,closed-form
+"RC column slenderness","Wang 13.17.3","StructurePoint Slender Column Non-Sway (ACI 318-19) after Wang Ex. 13.17.3","Mc = δns M2","kip-ft",105,105,0.0000,0.5,published
+"RC column slenderness","Wang 13.17.3","StructurePoint Slender Column Non-Sway (ACI 318-19) after Wang Ex. 13.17.3","δns","-",1,1,0.0000,0.5,published
+"RC column slenderness","Wang 13.17.3","StructurePoint Slender Column Non-Sway (ACI 318-19) after Wang Ex. 13.17.3","M2,min = Pu (15 + 0.03h) (SI 15 mm for 0.6 in)","kip-ft",48.56,48.14911417322834,-0.8461,1,published
+"RC column slenderness","Wang 13.17.3 with 1.8 klu","ACI 318-19 6.6.4.5.2-3, Cm = 0.6 + 0.4 M1/M2","δns","-",1.176900555099849,1.176900555099849,0.0000,0.01,closed-form
+"RC footing","Wight 15-2","StructurePoint Square Spread Footing (ACI 318-14) after Wight Ex. 15-2","Mu at the column face over the width","kip-ft",954,953.7488364297861,-0.0263,0.5,published
+"RC footing","Wight 15-2","StructurePoint Square Spread Footing (ACI 318-14) after Wight Ex. 15-2","As over the width","in²",7.76,7.758104913873379,-0.0244,0.5,published
+"RC footing","Wight 15-2","StructurePoint Square Spread Footing (ACI 318-14) after Wight Ex. 15-2","As,min = 0.0018 b h over the width","in²",7.72,7.720704000000001,0.0091,0.5,published
+"RC column P-M","tied 16x16","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","P0","kip",1534,1533.9998020935286,-0.0000,0.5,published
+"RC column P-M","tied 16x16","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","φPn,max = 0.80 φ P0","kip",797.7,797.6798970886349,-0.0025,0.5,published
+"RC column P-M","tied 16x16, fs = 0","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","Pn","kip",957.4,960.8503429660385,0.3604,1,published
+"RC column P-M","tied 16x16, fs = 0","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","Mn","kip-ft",261.33,260.5158956004923,-0.3115,1,published
+"RC column P-M","tied 16x16, fs = 0.5 fy","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","Pn","kip",649.1,651.7825364313826,0.4133,1,published
+"RC column P-M","tied 16x16, fs = 0.5 fy","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","Mn","kip-ft",338.54,338.5092833049949,-0.0091,1,published
+"RC column P-M","tied 16x16, fs = fy (balanced)","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","Pn","kip",416.8,418.87424556783765,0.4977,1,published
+"RC column P-M","tied 16x16, fs = fy (balanced)","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","Mn","kip-ft",385.81,386.1090584979233,0.0775,1,published
+"RC column P-M","tied 16x16, εt = εy + 0.003","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","Pn","kip",190.7,192.1097379497042,0.7392,1,published
+"RC column P-M","tied 16x16, εt = εy + 0.003","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","Mn","kip-ft",318.61,319.0837724579459,0.1487,1,published
+"RC column P-M","tied 16x16, pure bending","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","Mn at Pn = 0","kip-ft",237.73,237.67610777328755,-0.0227,1,published
+"RC column P-M","tied 16x16, pure bending","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","φ (εt 0.00946 > εy + 0.003)","-",0.9,0.9,0.0000,0.01,published
+"RC column P-M","tied 16x16, fs = 0","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","φMn at the printed φPn","kip-ft",169.86,170.0280530124964,0.0989,1,published
+"RC column P-M","tied 16x16, fs = 0.5 fy","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","φMn at the printed φPn","kip-ft",220.05,220.40726884065532,0.1624,1,published
+"RC column P-M","tied 16x16, fs = fy (balanced)","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","φMn at the printed φPn","kip-ft",250.77,251.70654589446852,0.3735,1,published
+"RC column P-M","tied 16x16, εt = εy + 0.003","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","φMn at the printed φPn","kip-ft",286.75,286.68137130492084,-0.0239,1,published
+"RC column P-M","tied 16x16, pure bending","StructurePoint Interaction Diagram Tied Column (ACI 318-19), points 1-6","φMn at the printed φPn","kip-ft",213.96,213.9084969959588,-0.0241,1,published
+"timber NDS","column CP","Dlubal KB 001674, NDS 2018 timber column","CP (NDS 3.7-1, c = 0.8; FcE 1 342 psi)","-",0.866,0.8666440320311904,0.0744,0.1,published
+"timber NDS","column CP","Dlubal KB 001674, NDS 2018 timber column","η = fc / F'c","-",0.913,0.9138652234639034,0.0948,0.15,published
+"Wood-Armer","normal, both faces","Wood (1968) / Armer (1968), normal and special rules","Mx* bottom","kN·m/m",13,13,0.0000,0.01,closed-form
+"Wood-Armer","normal, both faces","Wood (1968) / Armer (1968), normal and special rules","My* bottom","kN·m/m",8,8,0.0000,0.01,closed-form
+"Wood-Armer","normal, both faces","Wood (1968) / Armer (1968), normal and special rules","Mx* top","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","normal, both faces","Wood (1968) / Armer (1968), normal and special rules","My* top","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","bottom x special","Wood (1968) / Armer (1968), normal and special rules","Mx* bottom","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","bottom x special","Wood (1968) / Armer (1968), normal and special rules","My* bottom","kN·m/m",6.4,6.4,0.0000,0.01,closed-form
+"Wood-Armer","bottom x special","Wood (1968) / Armer (1968), normal and special rules","Mx* top","kN·m/m",10.666666666666666,10.666666666666666,0.0000,0.01,closed-form
+"Wood-Armer","bottom x special","Wood (1968) / Armer (1968), normal and special rules","My* top","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","bottom y special","Wood (1968) / Armer (1968), normal and special rules","Mx* bottom","kN·m/m",6.4,6.4,0.0000,0.01,closed-form
+"Wood-Armer","bottom y special","Wood (1968) / Armer (1968), normal and special rules","My* bottom","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","bottom y special","Wood (1968) / Armer (1968), normal and special rules","Mx* top","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","bottom y special","Wood (1968) / Armer (1968), normal and special rules","My* top","kN·m/m",10.666666666666666,10.666666666666666,0.0000,0.01,closed-form
+"Wood-Armer","top x special","Wood (1968) / Armer (1968), normal and special rules","Mx* bottom","kN·m/m",13,13,0.0000,0.01,closed-form
+"Wood-Armer","top x special","Wood (1968) / Armer (1968), normal and special rules","My* bottom","kN·m/m",1,1,0.0000,0.01,closed-form
+"Wood-Armer","top x special","Wood (1968) / Armer (1968), normal and special rules","Mx* top","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","top x special","Wood (1968) / Armer (1968), normal and special rules","My* top","kN·m/m",2.9,2.9,0.0000,0.01,closed-form
+"Wood-Armer","top y special","Wood (1968) / Armer (1968), normal and special rules","Mx* bottom","kN·m/m",1,1,0.0000,0.01,closed-form
+"Wood-Armer","top y special","Wood (1968) / Armer (1968), normal and special rules","My* bottom","kN·m/m",13,13,0.0000,0.01,closed-form
+"Wood-Armer","top y special","Wood (1968) / Armer (1968), normal and special rules","Mx* top","kN·m/m",2.9,2.9,0.0000,0.01,closed-form
+"Wood-Armer","top y special","Wood (1968) / Armer (1968), normal and special rules","My* top","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","pure twist","Wood (1968) / Armer (1968), normal and special rules","Mx* bottom","kN·m/m",4,4,0.0000,0.01,closed-form
+"Wood-Armer","pure twist","Wood (1968) / Armer (1968), normal and special rules","My* bottom","kN·m/m",4,4,0.0000,0.01,closed-form
+"Wood-Armer","pure twist","Wood (1968) / Armer (1968), normal and special rules","Mx* top","kN·m/m",4,4,0.0000,0.01,closed-form
+"Wood-Armer","pure twist","Wood (1968) / Armer (1968), normal and special rules","My* top","kN·m/m",4,4,0.0000,0.01,closed-form
+"Wood-Armer","hogging both","Wood (1968) / Armer (1968), normal and special rules","Mx* bottom","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","hogging both","Wood (1968) / Armer (1968), normal and special rules","My* bottom","kN·m/m",0,0,0.0000,0.000000001,closed-form
+"Wood-Armer","hogging both","Wood (1968) / Armer (1968), normal and special rules","Mx* top","kN·m/m",14.5,14.5,0.0000,0.01,closed-form
+"Wood-Armer","hogging both","Wood (1968) / Armer (1968), normal and special rules","My* top","kN·m/m",10.5,10.5,0.0000,0.01,closed-form

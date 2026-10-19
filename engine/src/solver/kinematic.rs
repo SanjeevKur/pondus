@@ -1,0 +1,910 @@
+use crate::types::*;
+use crate::linalg::*;
+use super::dof::DofNumbering;
+use super::assembly::*;
+use super::constraints::FreeConstraintSystem;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+// ==================== Result Types ====================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KinematicResult {
+    pub degree: i32,
+    pub classification: String,
+    pub mechanism_modes: usize,
+    pub mechanism_nodes: Vec<usize>,
+    pub unconstrained_dofs: Vec<UnconstrainedDof>,
+    pub diagnosis: String,
+    pub is_solvable: bool,
+    /// Set when the model failed input validation and was not analysed: the
+    /// validator's own message. `mechanism_modes` is then 0 because nothing
+    /// was checked, not because nothing was found, and a reader has to be
+    /// able to tell those apart. Kept out of `diagnosis`, which is a Spanish
+    /// sentence shown as-is; this is the validator's English, for the error
+    /// channel the solve would have used (`Error al resolver: …`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_input: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnconstrainedDof {
+    pub node_id: usize,
+    pub dof: String,
+}
+
+// ==================== 2D Kinematic Analysis ====================
+
+/// Count support restraints for 2D.
+fn count_support_restraints_2d(sup: &SolverSupport) -> (i32, bool) {
+    let mut r = 0i32;
+    let mut has_rot = false;
+
+    match sup.support_type.as_str() {
+        "fixed" => { r = 3; has_rot = true; }
+        "pinned" => { r = 2; }
+        "rollerX" | "rollerY" | "inclinedRoller" => { r = 1; }
+        "guidedX" | "guidedY" => { r = 2; has_rot = true; }
+        "spring" => {
+            if sup.kx.unwrap_or(0.0) > 0.0 { r += 1; }
+            if sup.ky.unwrap_or(0.0) > 0.0 { r += 1; }
+            if sup.kz.unwrap_or(0.0) > 0.0 { r += 1; has_rot = true; }
+        }
+        _ => {}
+    }
+
+    (r, has_rot)
+}
+
+/// Compute the static degree of indeterminacy for a 2D structure.
+/// Frame: GH = 3*m_frame + m_truss + r - 3*n - c
+/// Pure truss: GH = m + r - 2*n
+fn compute_static_degree_2d(input: &SolverInput) -> (i32, HashMap<usize, i32>) {
+    let has_frames = input.elements.values().any(|e| e.elem_type == "frame");
+
+    // Count support restraints
+    let mut r = 0i32;
+    let mut rot_restrained_nodes = std::collections::HashSet::new();
+    for sup in input.supports.values() {
+        let (sr, has_rot) = count_support_restraints_2d(sup);
+        r += sr;
+        if has_rot {
+            rot_restrained_nodes.insert(sup.node_id);
+        }
+    }
+
+    if !has_frames {
+        let m = input.elements.len() as i32;
+        let n = input.nodes.len() as i32;
+        return (m + r - 2 * n, HashMap::new());
+    }
+
+    let mut m_frame = 0i32;
+    let mut m_truss = 0i32;
+    for elem in input.elements.values() {
+        if elem.elem_type == "frame" { m_frame += 1; }
+        else { m_truss += 1; }
+    }
+
+    // Count hinges and frame elements per node
+    let mut node_hinges: HashMap<usize, i32> = HashMap::new();
+    let mut node_frame_elems: HashMap<usize, i32> = HashMap::new();
+    for elem in input.elements.values() {
+        if elem.elem_type != "frame" { continue; }
+        *node_frame_elems.entry(elem.node_i).or_insert(0) += 1;
+        *node_frame_elems.entry(elem.node_j).or_insert(0) += 1;
+        if elem.hinge_start {
+            *node_hinges.entry(elem.node_i).or_insert(0) += 1;
+        }
+        if elem.hinge_end {
+            *node_hinges.entry(elem.node_j).or_insert(0) += 1;
+        }
+    }
+
+    // Compute internal conditions c per node
+    let mut c = 0i32;
+    let mut node_conditions: HashMap<usize, i32> = HashMap::new();
+    for (&node_id, &j) in &node_hinges {
+        let k = *node_frame_elems.get(&node_id).unwrap_or(&0);
+        let ci = if k <= 1 {
+            0 // free end
+        } else if rot_restrained_nodes.contains(&node_id) {
+            j // each hinge is independent
+        } else {
+            j.min(k - 1)
+        };
+        if ci > 0 {
+            node_conditions.insert(node_id, ci);
+        }
+        c += ci;
+    }
+
+    let n = input.nodes.len() as i32;
+    let degree = 3 * m_frame + m_truss + r - 3 * n - c;
+    (degree, node_conditions)
+}
+
+/// Full 2D kinematic analysis.
+pub fn analyze_kinematics_2d(input: &SolverInput) -> KinematicResult {
+    let (degree, _node_conditions) = compute_static_degree_2d(input);
+
+    // This entry point has no error channel, and `assemble_2d` below resolves
+    // ids by direct map indexing — so an element naming a node that does not
+    // exist used to panic here, which in WASM ends the module rather than the
+    // call. The counting degree above only counts and stays valid, but the
+    // model cannot be analysed, and that is exactly what `is_solvable` and
+    // `diagnosis` are for: the JS wrapper already reports an unavailable
+    // analysis in this same shape when the engine has not loaded yet.
+    //
+    // The validator's own message is NOT appended to `diagnosis`. That field
+    // is read straight out of this struct and shown — the JS side only
+    // rewrites axis names inside it, calling it "a localized diagnosis
+    // sentence" — and every sentence this file produces is Spanish, while
+    // `validate_input_2d` answers in English. Concatenating the two produced
+    // half-translated text in front of the user.
+    //
+    // It travels in `invalid_input` instead, and it has to travel: the web
+    // solve runs this analysis first and stops on `!is_solvable`, so the solve
+    // that would have named the problem never runs. `checkModel` covers some
+    // of the validator's cases, not all — a Poisson ratio of 0.5 or a point
+    // load past the element's end reached the user only through here.
+    if let Err(reason) = crate::solver::linear::validate_input_2d(input) {
+        return KinematicResult {
+            degree,
+            classification: if degree > 0 { "hyperstatic" } else if degree == 0 { "isostatic" } else { "hypostatic" }.into(),
+            mechanism_modes: 0,
+            mechanism_nodes: Vec::new(),
+            unconstrained_dofs: Vec::new(),
+            diagnosis: "El modelo no puede analizarse porque tiene datos inválidos.".into(),
+            is_solvable: false,
+            invalid_input: Some(reason),
+        };
+    }
+
+    let dof_num = DofNumbering::build_2d(input);
+    let nf = dof_num.n_free;
+
+    if nf == 0 {
+        return KinematicResult {
+            degree,
+            classification: if degree > 0 { "hyperstatic" } else if degree == 0 { "isostatic" } else { "hypostatic" }.into(),
+            mechanism_modes: 0,
+            mechanism_nodes: Vec::new(),
+            unconstrained_dofs: Vec::new(),
+            diagnosis: "Todos los GDL están restringidos.".into(),
+            is_solvable: true,
+            invalid_input: None,
+        };
+    }
+
+    // Sparse proof of solvability for a large constraint-free model: a
+    // successful sparse Cholesky of K_ff, with no artificial DOF outside the
+    // expected pin-joint rotations, proves full rank without the dense
+    // assembly and the dense LU rank below. Anything unusual — a floating
+    // translation, an unexpected zero, a failed factorization — falls through
+    // to the full path, which names the DOFs.
+    if nf >= KINEMATIC_SPARSE_THRESHOLD && input.constraints.is_empty() {
+        if let Some(result) = fast_solvable_2d(input, &dof_num, nf, degree) {
+            return result;
+        }
+    }
+
+    // Assemble K (no artificial stiffness in Rust assembly)
+    let asm = assemble_2d(input, &dof_num);
+    let n = dof_num.n_total;
+
+    // Extract Kff
+    let free_idx: Vec<usize> = (0..nf).collect();
+    let k_ff = extract_submatrix(&asm.k, n, &free_idx, &free_idx);
+
+    // Topology-agnostic orphan-ROTATION-DOF detection on K_ff (pre-constraint-reduction):
+    // a free *rotation* DOF (local_dof=2 in 2D) whose row AND column in K_ff are
+    // identically zero has no rotational stiffness from anywhere — physically the
+    // rotation is undetermined, not a mechanism. Restricted to rotation DOFs so a
+    // genuinely floating node (translation DOFs orphan) still flags as mechanism.
+    let orphan_phys_dofs: Vec<usize> = {
+        let mut idx_to_local: HashMap<usize, usize> = HashMap::new();
+        for (&(_, ld), &idx) in &dof_num.map {
+            if idx < nf {
+                idx_to_local.insert(idx, ld);
+            }
+        }
+        let max_abs = k_ff.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+        let orphan_tol = (1e-10f64).max(max_abs * 1e-10);
+        let mut orphans = Vec::new();
+        for i in 0..nf {
+            // Only suppress rotation DOFs (local_dof = 2 in 2D)
+            if idx_to_local.get(&i).copied() != Some(2) {
+                continue;
+            }
+            let mut all_zero = true;
+            for j in 0..nf {
+                if k_ff[i * nf + j].abs() > orphan_tol
+                    || k_ff[j * nf + i].abs() > orphan_tol
+                {
+                    all_zero = false;
+                    break;
+                }
+            }
+            if all_zero {
+                orphans.push(i);
+            }
+        }
+        orphans
+    };
+
+    // Apply constraint reduction if constraints present
+    let cs = match FreeConstraintSystem::build_2d(input, &dof_num) {
+        Ok(cs) => cs,
+        Err(reason) => return KinematicResult {
+            degree,
+            classification: if degree > 0 { "hyperstatic" } else if degree == 0 { "isostatic" } else { "hypostatic" }.into(),
+            mechanism_modes: 0,
+            mechanism_nodes: Vec::new(),
+            unconstrained_dofs: Vec::new(),
+            diagnosis: "El modelo no puede analizarse: una restricción no puede imponerse.".into(),
+            is_solvable: false,
+            invalid_input: Some(reason),
+        },
+    };
+    let ns = cs.as_ref().map_or(nf, |c| c.n_free_indep);
+    let k_s = if let Some(ref cs) = cs {
+        cs.reduce_matrix(&k_ff)
+    } else {
+        k_ff
+    };
+
+    // LU rank analysis (on reduced system if constraints present)
+    let tol = {
+        let mut max_diag = 0.0f64;
+        for i in 0..ns {
+            max_diag = max_diag.max(k_s[i * ns + i].abs());
+        }
+        (1e-10f64).max(max_diag * 1e-10)
+    };
+    let (_rank, zero_pivot_dofs_reduced) = lu_rank(&k_s, ns, tol);
+
+    // Map zero-pivot DOFs back to physical free DOFs
+    let zero_pivot_dofs = if let Some(ref cs) = cs {
+        map_reduced_dofs_to_physical(&zero_pivot_dofs_reduced, cs)
+    } else {
+        zero_pivot_dofs_reduced
+    };
+
+    // Filter expected zero-stiffness DOFs at valid pin joints
+    let mut expected_zero = expected_zero_rotations_2d(input, &dof_num, nf);
+
+    for &i in &orphan_phys_dofs {
+        expected_zero.insert(i);
+    }
+
+    // True mechanism DOFs
+    let true_mechanism_dofs: Vec<usize> = zero_pivot_dofs
+        .iter()
+        .filter(|&&d| !expected_zero.contains(&d))
+        .copied()
+        .collect();
+    let mechanism_modes = true_mechanism_dofs.len();
+
+    // Map pivots to nodes
+    let dof_labels = ["ux", "uy", "rz"];
+    let mut reverse_map: HashMap<usize, (usize, usize)> = HashMap::new();
+    for (&(node_id, local_dof), &idx) in &dof_num.map {
+        if idx < nf {
+            reverse_map.insert(idx, (node_id, local_dof));
+        }
+    }
+
+    let mut node_set = std::collections::HashSet::new();
+    let mut unconstrained_dofs = Vec::new();
+    for &dof_idx in &true_mechanism_dofs {
+        if let Some(&(node_id, local_dof)) = reverse_map.get(&dof_idx) {
+            node_set.insert(node_id);
+            unconstrained_dofs.push(UnconstrainedDof {
+                node_id,
+                dof: dof_labels.get(local_dof).unwrap_or(&"ux").to_string(),
+            });
+        }
+    }
+    let mut mechanism_nodes: Vec<usize> = node_set.into_iter().collect();
+    mechanism_nodes.sort();
+
+    let is_solvable = mechanism_modes == 0;
+    let classification = if degree > 0 && is_solvable {
+        "hyperstatic"
+    } else if degree == 0 && is_solvable {
+        "isostatic"
+    } else {
+        "hypostatic"
+    }.to_string();
+
+    let diagnosis = build_diagnosis_2d(degree, mechanism_modes, &mechanism_nodes, &unconstrained_dofs);
+
+    KinematicResult {
+        degree,
+        classification,
+        mechanism_modes,
+        mechanism_nodes,
+        unconstrained_dofs,
+        diagnosis,
+        is_solvable,
+        invalid_input: None,
+    }
+}
+
+/// Above this many free DOFs the 2D kinematic analysis tries the sparse proof
+/// of solvability before the dense one.
+const KINEMATIC_SPARSE_THRESHOLD: usize = 64;
+
+/// Rotation DOFs (local_dof = 2) that are expected to carry no stiffness: an
+/// all-hinged frame node with no rotational restraint.
+fn expected_zero_rotations_2d(
+    input: &SolverInput,
+    dof_num: &DofNumbering,
+    nf: usize,
+) -> std::collections::HashSet<usize> {
+    let mut expected_zero = std::collections::HashSet::new();
+    if dof_num.dofs_per_node < 3 {
+        return expected_zero;
+    }
+    let mut node_hinge_count: HashMap<usize, usize> = HashMap::new();
+    let mut node_frame_count: HashMap<usize, usize> = HashMap::new();
+    for elem in input.elements.values() {
+        if elem.elem_type == "frame" {
+            *node_frame_count.entry(elem.node_i).or_insert(0) += 1;
+            *node_frame_count.entry(elem.node_j).or_insert(0) += 1;
+            if elem.hinge_start {
+                *node_hinge_count.entry(elem.node_i).or_insert(0) += 1;
+            }
+            if elem.hinge_end {
+                *node_hinge_count.entry(elem.node_j).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut rot_restrained = std::collections::HashSet::new();
+    for sup in input.supports.values() {
+        match sup.support_type.as_str() {
+            "fixed" | "guidedX" | "guidedY" => { rot_restrained.insert(sup.node_id); }
+            _ => {
+                if sup.kz.unwrap_or(0.0) > 0.0 {
+                    rot_restrained.insert(sup.node_id);
+                }
+            }
+        }
+    }
+
+    // All-hinged frame nodes
+    for (&node_id, &hinges) in &node_hinge_count {
+        let frames = *node_frame_count.get(&node_id).unwrap_or(&0);
+        if hinges >= frames && frames >= 1 && !rot_restrained.contains(&node_id) {
+            if let Some(&idx) = dof_num.map.get(&(node_id, 2)) {
+                if idx < nf {
+                    expected_zero.insert(idx);
+                }
+            }
+        }
+    }
+    expected_zero
+}
+
+/// The sparse proof of solvability for a large constraint-free model, or None
+/// to take the full dense path. A sparse Cholesky of K_ff proves full rank
+/// when every artificial DOF the assembly added is an expected zero rotation:
+/// the artificial spring is exactly what a mechanism hides behind, so any
+/// other artificial DOF — a floating translation, or a rotation with a nonzero
+/// off-diagonal entry — is left to the dense analysis, which names the DOFs.
+fn fast_solvable_2d(
+    input: &SolverInput,
+    dof_num: &DofNumbering,
+    nf: usize,
+    degree: i32,
+) -> Option<KinematicResult> {
+    // `assemble_sparse_2d` is the linear path's K_ff, the dense free block
+    // entry for entry (rotated springs, inclined-roller frames included).
+    let sasm = assemble_sparse_2d(input, dof_num);
+    // Largest diagonal entry, for both tolerances below.
+    let k = &sasm.k_ff;
+    let mut max_diag = 0.0f64;
+    for col in 0..k.n {
+        for p in k.col_ptr[col]..k.col_ptr[col + 1] {
+            if k.row_idx[p] == col { max_diag = max_diag.max(k.values[p].abs()); }
+        }
+    }
+    if !sasm.artificial_dofs.is_empty() {
+        let expected = expected_zero_rotations_2d(input, dof_num, nf);
+        let mut idx_to_local: HashMap<usize, usize> = HashMap::new();
+        for (&(_, ld), &idx) in &dof_num.map {
+            if idx < nf {
+                idx_to_local.insert(idx, ld);
+            }
+        }
+        // The CSC stores the lower triangle: an off-diagonal touching d shows
+        // either in d's column below the diagonal or as row d of an earlier column.
+        //
+        // Explicit zeros are kept in the CSC — the assembler pushes every
+        // element pair, and a hinge-condensed rotation row is exactly zero — so
+        // "an entry exists" is not "stiffness couples these DOFs". Compare
+        // values, at the orphan-rotation guard's own tolerance.
+        let touch_tol = if max_diag > 0.0 { max_diag * 1e-12 } else { 1e-14 };
+        let mut touched_offdiag = std::collections::HashSet::new();
+        for col in 0..k.n {
+            for p in k.col_ptr[col]..k.col_ptr[col + 1] {
+                let row = k.row_idx[p];
+                if row != col && k.values[p].abs() > touch_tol {
+                    touched_offdiag.insert(row);
+                    touched_offdiag.insert(col);
+                }
+            }
+        }
+        for &d in &sasm.artificial_dofs {
+            if !expected.contains(&d)
+                || idx_to_local.get(&d) != Some(&2)
+                || touched_offdiag.contains(&d)
+            {
+                return None;
+            }
+        }
+    }
+    let mut symbolic = None;
+    let factor = numeric_cholesky(super::sparse_tangent::cached_symbolic(&mut symbolic, &sasm.k_ff), &sasm.k_ff)?;
+
+    // A factorization that succeeds is not yet a proof. `numeric_cholesky` refuses only a
+    // pivot at or below an absolute 1e-15, and a mechanism's zero pivot comes out of the
+    // elimination as rounding, often positive: a rigid frame on one pin, or a beam with an
+    // internal hinge, factored "fine" and was called solvable. Every pivot must clear the
+    // dense rank's own tolerance, relative to the largest diagonal; the artificial springs
+    // on the expected pin rotations, checked above, are the only pivots excused.
+    let tol = (1e-10f64).max(max_diag * 1e-10);
+    let artificial: std::collections::HashSet<usize> = sasm.artificial_dofs.iter().copied().collect();
+    let sym = &factor.symbolic;
+    for j in 0..sym.n {
+        if artificial.contains(&sym.perm[j]) { continue; }
+        let d = factor.l_values[sym.l_col_ptr[j]];
+        if d * d < tol { return None; }
+    }
+
+    Some({
+        let classification = if degree > 0 {
+            "hyperstatic"
+        } else if degree == 0 {
+            "isostatic"
+        } else {
+            "hypostatic"
+        }
+        .to_string();
+        KinematicResult {
+            degree,
+            classification,
+            mechanism_modes: 0,
+            mechanism_nodes: Vec::new(),
+            unconstrained_dofs: Vec::new(),
+            diagnosis: build_diagnosis_2d(degree, 0, &[], &[]),
+            is_solvable: true,
+            invalid_input: None,
+        }
+    })
+}
+
+// ==================== 3D Kinematic Analysis ====================
+
+/// Count support restraints for 3D.
+fn count_support_restraints_3d(sup: &SolverSupport3D) -> (i32, bool) {
+    let mut r = 0i32;
+    let mut has_rot = false;
+
+    if sup.rx { r += 1; }
+    if sup.ry { r += 1; }
+    if sup.rz { r += 1; }
+    if sup.rrx { r += 1; has_rot = true; }
+    if sup.rry { r += 1; has_rot = true; }
+    if sup.rrz { r += 1; has_rot = true; }
+
+    // Springs
+    if sup.kx.unwrap_or(0.0) > 0.0 { r += 1; }
+    if sup.ky.unwrap_or(0.0) > 0.0 { r += 1; }
+    if sup.kz.unwrap_or(0.0) > 0.0 { r += 1; }
+    if sup.krx.unwrap_or(0.0) > 0.0 { r += 1; has_rot = true; }
+    if sup.kry.unwrap_or(0.0) > 0.0 { r += 1; has_rot = true; }
+    if sup.krz.unwrap_or(0.0) > 0.0 { r += 1; has_rot = true; }
+
+    // Inclined support
+    if sup.is_inclined.unwrap_or(false) {
+        if let (Some(nx), Some(ny), Some(nz)) = (sup.normal_x, sup.normal_y, sup.normal_z) {
+            let n_len = (nx * nx + ny * ny + nz * nz).sqrt();
+            if n_len > 1e-12 { r += 1; }
+        }
+    }
+
+    (r, has_rot)
+}
+
+/// Compute static degree for 3D.
+fn compute_static_degree_3d(input: &SolverInput3D) -> (i32, HashMap<usize, i32>) {
+    let has_frames = input.elements.values().any(|e| e.elem_type == "frame");
+
+    let mut r = 0i32;
+    let mut rot_restrained_nodes = std::collections::HashSet::new();
+    for sup in input.supports.values() {
+        let (sr, has_rot) = count_support_restraints_3d(sup);
+        r += sr;
+        if has_rot {
+            rot_restrained_nodes.insert(sup.node_id);
+        }
+    }
+
+    if !has_frames {
+        let m = input.elements.len() as i32;
+        let n = input.nodes.len() as i32;
+        return (m + r - 3 * n, HashMap::new());
+    }
+
+    let mut m_frame = 0i32;
+    let mut m_truss = 0i32;
+    for elem in input.elements.values() {
+        if elem.elem_type == "frame" { m_frame += 1; }
+        else { m_truss += 1; }
+    }
+
+    let mut node_hinges: HashMap<usize, i32> = HashMap::new();
+    let mut node_frame_elems: HashMap<usize, i32> = HashMap::new();
+    for elem in input.elements.values() {
+        if elem.elem_type != "frame" { continue; }
+        *node_frame_elems.entry(elem.node_i).or_insert(0) += 1;
+        *node_frame_elems.entry(elem.node_j).or_insert(0) += 1;
+        // Count a node-end as fully hinged (rotation continuity broken on every
+        // bending axis) only when BOTH bending rotations are released. A single-
+        // axis pin hinge still preserves rotational stiffness on the other axis,
+        // so it must NOT collapse the node's rotational continuity in this count.
+        // Torsion is treated as a separate axis but does not affect the hinge
+        // count for the static degree formula, which is bending-only.
+        if elem.release_my_start && elem.release_mz_start {
+            *node_hinges.entry(elem.node_i).or_insert(0) += 1;
+        }
+        if elem.release_my_end && elem.release_mz_end {
+            *node_hinges.entry(elem.node_j).or_insert(0) += 1;
+        }
+    }
+
+    // In 3D, each hinge releases 3 rotation DOFs
+    let mut c = 0i32;
+    let mut node_conditions: HashMap<usize, i32> = HashMap::new();
+    for (&node_id, &j) in &node_hinges {
+        let k = *node_frame_elems.get(&node_id).unwrap_or(&0);
+        let ci = if k <= 1 {
+            0
+        } else if rot_restrained_nodes.contains(&node_id) {
+            3 * j
+        } else {
+            3 * j.min(k - 1)
+        };
+        if ci > 0 {
+            node_conditions.insert(node_id, ci);
+        }
+        c += ci;
+    }
+
+    let n = input.nodes.len() as i32;
+    let degree = 6 * m_frame + 3 * m_truss + r - 6 * n - c;
+    (degree, node_conditions)
+}
+
+/// Full 3D kinematic analysis.
+pub fn analyze_kinematics_3d(input: &SolverInput3D) -> KinematicResult {
+    // Expand curved beams before DOF numbering and assembly.
+    let input = &super::linear::expand_curved_beams_3d(input);
+    let (degree, _) = compute_static_degree_3d(input);
+
+    // As in the 2D analyzer: no error channel, and `assemble_3d` below
+    // dereferences ids directly. Validated on the expanded model, which is the
+    // one assembly actually sees.
+    // Same Spanish-only sentence as the 2D analyzer, for the same reason.
+    if let Err(reason) = super::linear::validate_input_3d(input) {
+        return KinematicResult {
+            degree,
+            classification: if degree > 0 { "hyperstatic" } else if degree == 0 { "isostatic" } else { "hypostatic" }.into(),
+            mechanism_modes: 0,
+            mechanism_nodes: Vec::new(),
+            unconstrained_dofs: Vec::new(),
+            diagnosis: "El modelo no puede analizarse porque tiene datos inválidos.".into(),
+            is_solvable: false,
+            invalid_input: Some(reason),
+        };
+    }
+
+    let dof_num = DofNumbering::build_3d(input);
+    let nf = dof_num.n_free;
+
+    if nf == 0 {
+        return KinematicResult {
+            degree,
+            classification: if degree > 0 { "hyperstatic" } else if degree == 0 { "isostatic" } else { "hypostatic" }.into(),
+            mechanism_modes: 0,
+            mechanism_nodes: Vec::new(),
+            unconstrained_dofs: Vec::new(),
+            diagnosis: "Todos los GDL están restringidos.".into(),
+            is_solvable: true,
+            invalid_input: None,
+        };
+    }
+
+    let asm = assemble_3d(input, &dof_num);
+    let n = dof_num.n_total;
+
+    let free_idx: Vec<usize> = (0..nf).collect();
+    let k_ff = extract_submatrix(&asm.k, n, &free_idx, &free_idx);
+
+    // Topology-agnostic orphan-ROTATION-DOF detection (see 2D analyzer rationale).
+    // Restricted to rotation DOFs (local_dof in 3..=5 for 3D) so genuinely
+    // floating nodes still flag as mechanisms.
+    let orphan_phys_dofs: Vec<usize> = {
+        let mut idx_to_local: HashMap<usize, usize> = HashMap::new();
+        for (&(_, ld), &idx) in &dof_num.map {
+            if idx < nf {
+                idx_to_local.insert(idx, ld);
+            }
+        }
+        let max_abs = k_ff.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+        let orphan_tol = (1e-10f64).max(max_abs * 1e-10);
+        let mut orphans = Vec::new();
+        for i in 0..nf {
+            match idx_to_local.get(&i).copied() {
+                Some(3) | Some(4) | Some(5) => {}
+                _ => continue,
+            }
+            let mut all_zero = true;
+            for j in 0..nf {
+                if k_ff[i * nf + j].abs() > orphan_tol
+                    || k_ff[j * nf + i].abs() > orphan_tol
+                {
+                    all_zero = false;
+                    break;
+                }
+            }
+            if all_zero {
+                orphans.push(i);
+            }
+        }
+        orphans
+    };
+
+    // Apply constraint reduction if constraints present
+    let cs = match FreeConstraintSystem::build_3d(input, &dof_num) {
+        Ok(cs) => cs,
+        Err(reason) => return KinematicResult {
+            degree,
+            classification: if degree > 0 { "hyperstatic" } else if degree == 0 { "isostatic" } else { "hypostatic" }.into(),
+            mechanism_modes: 0,
+            mechanism_nodes: Vec::new(),
+            unconstrained_dofs: Vec::new(),
+            diagnosis: "El modelo no puede analizarse: una restricción no puede imponerse.".into(),
+            is_solvable: false,
+            invalid_input: Some(reason),
+        },
+    };
+    let ns = cs.as_ref().map_or(nf, |c| c.n_free_indep);
+    let k_s = if let Some(ref cs) = cs {
+        cs.reduce_matrix(&k_ff)
+    } else {
+        k_ff
+    };
+
+    let tol = {
+        let mut max_diag = 0.0f64;
+        for i in 0..ns {
+            max_diag = max_diag.max(k_s[i * ns + i].abs());
+        }
+        (1e-10f64).max(max_diag * 1e-10)
+    };
+    let (_rank, zero_pivot_dofs_reduced) = lu_rank(&k_s, ns, tol);
+
+    // Map zero-pivot DOFs back to physical free DOFs
+    let zero_pivot_dofs = if let Some(ref cs) = cs {
+        map_reduced_dofs_to_physical(&zero_pivot_dofs_reduced, cs)
+    } else {
+        zero_pivot_dofs_reduced
+    };
+
+    // Filter expected zero-stiffness DOFs
+    let mut expected_zero = std::collections::HashSet::new();
+    if dof_num.dofs_per_node >= 6 {
+        let mut node_hinge_count: HashMap<usize, usize> = HashMap::new();
+        let mut node_frame_count: HashMap<usize, usize> = HashMap::new();
+        let mut node_truss_count: HashMap<usize, usize> = HashMap::new();
+        for elem in input.elements.values() {
+            if elem.elem_type == "frame" {
+                *node_frame_count.entry(elem.node_i).or_insert(0) += 1;
+                *node_frame_count.entry(elem.node_j).or_insert(0) += 1;
+                // Per-axis-aware count: an end fully releases rotational
+                // continuity only when BOTH bending rotations are released.
+                // A single-axis pin hinge preserves stiffness on the other
+                // bending axis and must not be counted as fully hinged here.
+                if elem.release_my_start && elem.release_mz_start {
+                    *node_hinge_count.entry(elem.node_i).or_insert(0) += 1;
+                }
+                if elem.release_my_end && elem.release_mz_end {
+                    *node_hinge_count.entry(elem.node_j).or_insert(0) += 1;
+                }
+            } else {
+                *node_truss_count.entry(elem.node_i).or_insert(0) += 1;
+                *node_truss_count.entry(elem.node_j).or_insert(0) += 1;
+            }
+        }
+
+        let mut rot_restrained = std::collections::HashSet::new();
+        for sup in input.supports.values() {
+            if sup.rrx { rot_restrained.insert(sup.node_id); }
+            if sup.rry { rot_restrained.insert(sup.node_id); }
+            if sup.rrz { rot_restrained.insert(sup.node_id); }
+            if sup.krx.unwrap_or(0.0) > 0.0 { rot_restrained.insert(sup.node_id); }
+            if sup.kry.unwrap_or(0.0) > 0.0 { rot_restrained.insert(sup.node_id); }
+            if sup.krz.unwrap_or(0.0) > 0.0 { rot_restrained.insert(sup.node_id); }
+        }
+
+        // All-hinged frame nodes
+        for (&node_id, &hinges) in &node_hinge_count {
+            let frames = *node_frame_count.get(&node_id).unwrap_or(&0);
+            if hinges >= frames && frames >= 1 && !rot_restrained.contains(&node_id) {
+                for rd in 3..=5 {
+                    if let Some(&idx) = dof_num.map.get(&(node_id, rd)) {
+                        if idx < nf {
+                            expected_zero.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Truss-only nodes in mixed systems
+        for &node_id in &dof_num.node_order {
+            let frames = *node_frame_count.get(&node_id).unwrap_or(&0);
+            let trusses = *node_truss_count.get(&node_id).unwrap_or(&0);
+            if frames == 0 && trusses > 0 && !rot_restrained.contains(&node_id) {
+                for rd in 3..=5 {
+                    if let Some(&idx) = dof_num.map.get(&(node_id, rd)) {
+                        if idx < nf {
+                            expected_zero.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for &i in &orphan_phys_dofs {
+        expected_zero.insert(i);
+    }
+
+    let true_mechanism_dofs: Vec<usize> = zero_pivot_dofs
+        .iter()
+        .filter(|&&d| !expected_zero.contains(&d))
+        .copied()
+        .collect();
+    let mechanism_modes = true_mechanism_dofs.len();
+
+    let dof_labels_6 = ["ux", "uy", "uz", "rx", "ry", "rz"];
+    let dof_labels_3 = ["ux", "uy", "uz"];
+    let labels = if dof_num.dofs_per_node == 6 { &dof_labels_6[..] } else { &dof_labels_3[..] };
+
+    let mut reverse_map: HashMap<usize, (usize, usize)> = HashMap::new();
+    for (&(node_id, local_dof), &idx) in &dof_num.map {
+        if idx < nf {
+            reverse_map.insert(idx, (node_id, local_dof));
+        }
+    }
+
+    let mut node_set = std::collections::HashSet::new();
+    let mut unconstrained_dofs = Vec::new();
+    for &dof_idx in &true_mechanism_dofs {
+        if let Some(&(node_id, local_dof)) = reverse_map.get(&dof_idx) {
+            node_set.insert(node_id);
+            unconstrained_dofs.push(UnconstrainedDof {
+                node_id,
+                dof: labels.get(local_dof).unwrap_or(&"ux").to_string(),
+            });
+        }
+    }
+    let mut mechanism_nodes: Vec<usize> = node_set.into_iter().collect();
+    mechanism_nodes.sort();
+
+    let is_solvable = mechanism_modes == 0;
+    let classification = if degree > 0 && is_solvable {
+        "hyperstatic"
+    } else if degree == 0 && is_solvable {
+        "isostatic"
+    } else {
+        "hypostatic"
+    }.to_string();
+
+    let diagnosis = build_diagnosis_2d(degree, mechanism_modes, &mechanism_nodes, &unconstrained_dofs);
+
+    KinematicResult {
+        degree,
+        classification,
+        mechanism_modes,
+        mechanism_nodes,
+        unconstrained_dofs,
+        diagnosis,
+        is_solvable,
+        invalid_input: None,
+    }
+}
+
+// ==================== Helpers ====================
+
+/// Map reduced-space zero-pivot DOF indices back to physical free DOF indices.
+fn map_reduced_dofs_to_physical(reduced_dofs: &[usize], cs: &FreeConstraintSystem) -> Vec<usize> {
+    let rmap = cs.map_reduced_to_physical();
+    reduced_dofs.iter()
+        .filter_map(|&rd| rmap.get(rd).copied())
+        .collect()
+}
+
+// ==================== Diagnosis Builder ====================
+
+fn build_diagnosis_2d(
+    degree: i32,
+    mechanism_modes: usize,
+    mechanism_nodes: &[usize],
+    unconstrained_dofs: &[UnconstrainedDof],
+) -> String {
+    if mechanism_modes == 0 {
+        if degree > 0 {
+            return format!("Estructura hiperestática de grado {}.", degree);
+        }
+        if degree == 0 {
+            return "Estructura isostática.".to_string();
+        }
+        return format!("Estructura con grado {} pero numéricamente estable.", degree);
+    }
+
+    let dof_names: HashMap<&str, &str> = [
+        ("ux", "desplazamiento en X"),
+        ("uy", "desplazamiento en Y"),
+        ("uz", "desplazamiento en Z"),
+        ("rz", "rotación en Z"),
+        ("rx", "rotación en X (torsión)"),
+        ("ry", "rotación en Y"),
+    ].into_iter().collect();
+
+    let node_list: String = mechanism_nodes.iter()
+        .take(8)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let dof_list: String = unconstrained_dofs.iter()
+        .take(8)
+        .map(|d| {
+            let dof_str = d.dof.as_str();
+            let name = dof_names.get(dof_str).unwrap_or(&dof_str);
+            format!("nodo {} ({})", d.node_id, name)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if mechanism_nodes.len() <= 3 {
+        format!(
+            "Mecanismo en nodo{} {} ({} modo{} de mecanismo). GDL sin restringir: {}. Revisá las articulaciones y apoyos en esa zona.",
+            if mechanism_nodes.len() > 1 { "s" } else { "" },
+            node_list,
+            mechanism_modes,
+            if mechanism_modes > 1 { "s" } else { "" },
+            dof_list,
+        )
+    } else {
+        format!(
+            "Estructura hipostática (grado {}, {} modo{} de mecanismo). {} nodos participan: {}{}. GDL sin restringir: {}{}.",
+            degree,
+            mechanism_modes,
+            if mechanism_modes > 1 { "s" } else { "" },
+            mechanism_nodes.len(),
+            node_list,
+            if mechanism_nodes.len() > 8 { "..." } else { "" },
+            dof_list,
+            if unconstrained_dofs.len() > 8 { "..." } else { "" },
+        )
+    }
+}

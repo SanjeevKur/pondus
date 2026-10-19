@@ -1,0 +1,30 @@
+[package]
+name = "pondus"
+version = "0.1.0"
+edition = "2021"
+description = "Pondus: agentic structural analysis and design. An agent builds, analyses and designs the structure; the engineer checks it."
+license = "AGPL-3.0-only"
+authors = ["Sompote Youwai"]
+repository = "https://github.com/Sompote/pondus"
+
+[[bin]]
+name = "pondus"
+path = "src/main.rs"
+
+[dependencies]
+pondus-core = { path = "../core" }
+eframe = "0.36"
+egui_extras = { version = "0.36", features = ["svg"] }
+# PhotoCraft's shared egui components (MIT OR Apache-2.0), the revision PhotoCraft builds with
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "5c874d51eeb3de70e735c8ce87a59a7dedd47675" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.17"
+ureq = { version = "2", features = ["json"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+pdf-extract = "0.10"
+calamine = "0.26"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }

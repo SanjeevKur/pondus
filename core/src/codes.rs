@@ -1,0 +1,278 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sompote Youwai. Part of Pondus, https://github.com/Sompote/pondus
+
+//! Other design codes through the Stabileo engine's checks: Eurocode 3 (EN 1993-1-1) for steel
+//! H members as an alternative to AISC 360 (classification, buckling curves of Table 6.2,
+//! lateral-torsional buckling with the load on the top flange, Annex B interaction), and a
+//! Eurocode 2 (EN 1992-1-1) check of the concrete beams with the bars Pondus chose by ACI 318.
+//! Units into the engine: N, m, Pa.
+
+use dedaliano_engine::postprocess::ec2_check::*;
+use dedaliano_engine::postprocess::ec3_check::*;
+use serde::{Deserialize, Serialize};
+
+use crate::model::{DesignSettings, Props};
+use crate::rc::BeamDesign;
+use crate::sections::bar_area;
+use crate::steel::{HDims, SteelCheck, SteelDemand, SteelDesign};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SteelCode {
+    #[default]
+    Aisc,
+    Ec3,
+}
+
+/// EN 1993-1-1 Table 5.2: the class of a rolled I in compression and bending.
+pub fn ec3_class(h: HDims, fy: f64, compression: bool) -> (u8, SectionClass) {
+    let eps = (235.0 / fy).sqrt();
+    let cf = (h.bf / 2.0 - h.tw / 2.0 - h.r) / h.tf;
+    let cw = (h.d - 2.0 * h.tf - 2.0 * h.r) / h.tw;
+    let flange = if cf <= 9.0 * eps { 1 } else if cf <= 10.0 * eps { 2 } else if cf <= 14.0 * eps { 3 } else { 4 };
+    let (l1, l2, l3) = if compression { (33.0, 38.0, 42.0) } else { (72.0, 83.0, 124.0) };
+    let web = if cw <= l1 * eps { 1 } else if cw <= l2 * eps { 2 } else if cw <= l3 * eps { 3 } else { 4 };
+    let c = flange.max(web);
+    (c, match c {
+        1 => SectionClass::Class1,
+        2 => SectionClass::Class2,
+        3 => SectionClass::Class3,
+        _ => SectionClass::Class4,
+    })
+}
+
+/// EN 1993-1-1 Table 5.2 for a rolled I under compression N (N, compression +) and major-axis
+/// bending M (N·mm) together: the web by α (plastic neutral axis, Classes 1 and 2) and ψ
+/// (elastic stress ratio, Class 3), the flange as uniformly compressed outstands.
+pub fn ec3_class_nm(h: HDims, p: &Props, fy: f64, n: f64, m: f64) -> (u8, SectionClass) {
+    let eps = (235.0 / fy).sqrt();
+    let cf = (h.bf / 2.0 - h.tw / 2.0 - h.r) / h.tf;
+    let c = h.d - 2.0 * h.tf - 2.0 * h.r;
+    let cw = c / h.tw;
+    let flange = if cf <= 9.0 * eps { 1 } else if cf <= 10.0 * eps { 2 } else if cf <= 14.0 * eps { 3 } else { 4 };
+    let n = n.max(0.0);
+    let m = m.abs();
+    let alpha = ((c / 2.0 + n / (2.0 * h.tw * fy)) / c).clamp(0.0, 1.0);
+    let (l1, l2) = if alpha > 0.5 { (396.0 * eps / (13.0 * alpha - 1.0), 456.0 * eps / (13.0 * alpha - 1.0)) } else { (36.0 * eps / alpha.max(1e-9), 41.5 * eps / alpha.max(1e-9)) };
+    // ψ from the elastic stresses at the web's ends (compression +)
+    let (a, iy) = (p.a * 1e6, p.iy * 1e12);
+    let s1 = n / a + m * (c / 2.0) / iy;
+    let s2 = n / a - m * (c / 2.0) / iy;
+    let psi = if s1.abs() > 1e-12 { s2 / s1 } else { 1.0 };
+    let l3 = if psi > -1.0 { 42.0 * eps / (0.67 + 0.33 * psi) } else { 62.0 * eps * (1.0 - psi) * (-psi).sqrt() };
+    let web = if cw <= l1 { 1 } else if cw <= l2 { 2 } else if cw <= l3 { 3 } else { 4 };
+    let k = flange.max(web);
+    (k, match k {
+        1 => SectionClass::Class1,
+        2 => SectionClass::Class2,
+        3 => SectionClass::Class3,
+        _ => SectionClass::Class4,
+    })
+}
+
+/// Table 6.2 (rolled I, tf ≤ 40 mm, S235–S420) and Table 6.4 (LTB, general case).
+pub fn curves(h: HDims) -> (BucklingCurve, BucklingCurve, BucklingCurve) {
+    let deep = h.d / h.bf > 1.2;
+    let (y, z) = if deep { (BucklingCurve::A, BucklingCurve::B) } else { (BucklingCurve::B, BucklingCurve::C) };
+    let lt = if h.d / h.bf <= 2.0 { BucklingCurve::A } else { BucklingCurve::B };
+    (y, z, lt)
+}
+
+/// The engine's member data of an H shape as Pondus sets it up for EC3: Table 5.2 class (in
+/// compression when the member ever is), Table 6.2 / 6.4 curves, Av of 6.2.6(3) with η = 1,
+/// Lcr = k·L about y and k·Lb about z (the bracing that holds the compression flange holds
+/// the weak axis too), LTB over Lb with C1 from the moment diagram (the AISC Cb
+/// formula) and the load on the top flange for beams. Units N, m, Pa.
+pub fn ec3_member(id: usize, p: &Props, h: HDims, fy: f64, dem: &SteelDemand, c1: f64, compression: bool) -> Ec3MemberData {
+    let (_, class) = ec3_class(h, fy, compression);
+    let (cy, cz, clt) = curves(h);
+    let av = (p.a * 1e6 - 2.0 * h.bf * h.tf + (h.tw + 2.0 * h.r) * h.tf).max((h.d - 2.0 * h.tf) * h.tw) / 1e6;
+    Ec3MemberData {
+        element_id: id,
+        fy: fy * 1e6,
+        e: Some(210e9),
+        a: p.a,
+        a_eff: None,
+        wpl_y: p.zy,
+        wel_y: p.sy,
+        weff_y: None,
+        wpl_z: p.zz,
+        wel_z: p.sz,
+        weff_z: None,
+        e_n_y: None,
+        e_n_z: None,
+        iy: p.iy,
+        iz: p.iz,
+        it: p.j,
+        iw: p.cw,
+        lcr_y: dem.k * dem.length,
+        lcr_z: dem.k * dem.lb.min(dem.length),
+        lb: dem.lb,
+        section_class: class,
+        buckling_curve_y: cy,
+        buckling_curve_z: cz,
+        buckling_curve_lt: clt,
+        gamma_m0: Some(1.0),
+        gamma_m1: Some(1.0),
+        c1: Some(c1),
+        av: Some(av),
+        interaction: None,
+        geometry: Some(Ec3Geometry::I { h: h.d / 1e3, b: h.bf / 1e3, tw: h.tw / 1e3, tf: h.tf / 1e3, r: h.r / 1e3 }),
+        ltb: Some(Ec3LtbData { c2: None, load_position: Some(if dem.top_flange_load { Ec3LoadPosition::TopFlange } else { Ec3LoadPosition::ShearCentre }), zg: None }),
+    }
+}
+
+/// C1 of a combination's stations: the AISC Cb formula over the member (1 for a cantilever).
+pub fn ec3_c1(dem: &SteelDemand, st: &[(f64, f64, f64, f64, f64, f64)]) -> f64 {
+    if dem.cantilever {
+        return 1.0;
+    }
+    diagram(dem, st).0.unwrap_or_else(|| crate::steel::cb(&st.iter().map(|s| (s.0, s.4)).collect::<Vec<_>>(), dem.length).min(2.6))
+}
+
+/// The LTB data of a combination (SN003b): the load on the top flange for beams, at the
+/// shear centre otherwise. C2 from the moment diagram where SN003 tabulates it: 0 for end
+/// moments only (a linear diagram: no transverse load, so the load height does not enter),
+/// 0.454 with C1 = 1.127 for a simply supported span under a uniform load (a parabola with no
+/// end moments, SN003 Table 3.2); otherwise left to the engine, which takes C2 = C1 for a load
+/// on the top flange, a lower bound of Mcr over the transverse-load cases of Table 3.2.
+pub fn ec3_ltb(dem: &SteelDemand, st: &[(f64, f64, f64, f64, f64, f64)]) -> Option<Ec3LtbData> {
+    let pos = Some(if dem.top_flange_load { Ec3LoadPosition::TopFlange } else { Ec3LoadPosition::ShearCentre });
+    Some(Ec3LtbData { c2: diagram(dem, st).1, load_position: pos, zg: None })
+}
+
+/// (C1 override, C2) of a moment diagram that SN003 tabulates; (None, None) otherwise.
+fn diagram(dem: &SteelDemand, st: &[(f64, f64, f64, f64, f64, f64)]) -> (Option<f64>, Option<f64>) {
+    if st.len() < 3 || dem.cantilever || dem.length <= 0.0 {
+        return (None, None);
+    }
+    let l = dem.length;
+    let mmax = st.iter().map(|s| s.4.abs()).fold(0.0, f64::max);
+    if mmax <= 0.0 {
+        return (None, None);
+    }
+    let (m0, m1) = (st[0].4, st[st.len() - 1].4);
+    let tol = 0.01 * mmax;
+    // linear: every station on the line between the end moments
+    if st.iter().all(|s| (s.4 - (m0 + (m1 - m0) * s.0 / l)).abs() <= tol) {
+        return (None, Some(0.0));
+    }
+    // a parabola with zero end moments (a uniformly loaded simply supported span)
+    let mid = st.iter().min_by(|a, b| (a.0 - l / 2.0).abs().total_cmp(&(b.0 - l / 2.0).abs())).map(|s| s.4).unwrap_or(0.0);
+    if m0.abs() <= tol && m1.abs() <= tol && st.iter().all(|s| (s.4 - 4.0 * mid * s.0 * (l - s.0) / (l * l)).abs() <= tol) {
+        return (Some(1.127), Some(0.454));
+    }
+    (None, None)
+}
+
+/// Checks an H member to EC3 (γM0 = γM1 = 1.0, the recommended values) under every station of
+/// every ULS combination; the result has the shape of the AISC one.
+#[allow(clippy::too_many_arguments)]
+pub fn check_ec3(member: crate::model::Id, bim_id: Option<String>, name: &str, mass: f64, p: &Props, h: HDims, fy: f64, fu: f64, dem: &SteelDemand, set: &DesignSettings) -> SteelDesign {
+    let compression = dem.uls.iter().flat_map(|(_, s)| s.iter()).any(|s| s.1 < 0.0);
+    let cls = dem.uls.iter().flat_map(|(_, st)| st.iter()).map(|s| ec3_class_nm(h, p, fy, -s.1 * 1e3, s.4 * 1e6).0).max().unwrap_or_else(|| ec3_class(h, fy, compression).0);
+    let (cy, cz, clt) = curves(h);
+    let mk = |id: usize, c1: f64| ec3_member(id, p, h, fy, dem, c1, compression);
+    let mut checks: Vec<SteelCheck> = vec![];
+    let mut worst = |nm: &str, r: f64, detail: String| match checks.iter_mut().find(|c| c.name == nm) {
+        Some(c) if c.ratio >= r => {}
+        Some(c) => {
+            c.ratio = r;
+            c.detail = detail;
+        }
+        None => checks.push(SteelCheck { name: nm.into(), ratio: r, detail }),
+    };
+    for (combo, st) in &dem.uls {
+        let c1 = ec3_c1(dem, st);
+        let ltb = ec3_ltb(dem, st);
+        let members: Vec<Ec3MemberData> = st
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                let mut m = mk(k + 1, c1);
+                m.section_class = ec3_class_nm(h, p, fy, -s.1 * 1e3, s.4 * 1e6).1;
+                m.ltb = ltb.clone();
+                m
+            })
+            .collect();
+        let forces: Vec<Ec3DesignForces> = st.iter().enumerate().map(|(k, s)| Ec3DesignForces { element_id: k + 1, n_ed: Some(s.1 * 1e3), my_ed: Some(s.4 * 1e3), mz_ed: Some(s.5 * 1e3), v_ed: Some(s.3.abs().max(s.2.abs()) * 1e3) }).collect();
+        for (r, s) in check_ec3_members(&Ec3CheckInput { members, forces }).iter().zip(st) {
+            let at = format!("{combo}, x = {:.2} m", s.0);
+            worst("axial (6.2.3 / 6.3.1)", r.compression_ratio.max(r.tension_ratio), format!("{at}: NEd {:.0} kN, Nb,Rd {:.0} kN (χy {:.2}, χz {:.2})", s.1, r.nb_rd / 1e3, r.chi_y, r.chi_z));
+            // the net section in tension, 6.2.3(2)b: Nu,Rd = 0.9 Anet fu / γM2 (γM2 = 1.25)
+            if let (Some(t), true) = (&dem.tension, s.1 > 0.0) {
+                let (an, _, how) = t.net(p.a * 1e6, h, true);
+                let nu = 0.9 * an * fu / 1.25 / 1e3;
+                worst("tension net section (6.2.3(2)b)", s.1 / nu, format!("{at}: NEd {:.0} kN, Nu,Rd = 0.9 Anet fu/γM2 = {nu:.0} kN; {how}", s.1));
+            }
+            worst("flexure y with LTB (6.3.2)", r.flexure_ratio_y, format!("{at}: My,Ed {:.1} kN·m, Mb,Rd {:.1} kN·m (χLT {:.2}, C1 {c1:.2})", s.4.abs(), r.mb_rd / 1e3, r.chi_lt));
+            worst("flexure z (6.2.5)", r.flexure_ratio_z, format!("{at}: Mz,Ed {:.1} kN·m", s.5.abs()));
+            worst("shear (6.2.6)", r.shear_ratio, format!("{at}: VEd {:.1} kN", s.3.abs().max(s.2.abs())));
+            worst("interaction (6.3.3, Annex B)", r.interaction_ratio, format!("{at}: (6.61) {:.2}, (6.62) {:.2}", r.interaction_ratio_y, r.interaction_ratio_z));
+        }
+    }
+    let l = dem.length * 1000.0;
+    let mult = if dem.cantilever { 2.0 } else { 1.0 };
+    let (lim_l, lim_t) = (mult * l / set.defl_live, mult * l / set.defl_total);
+    worst("deflection (service)", (dem.defl_live * 1000.0 / lim_l).max(dem.defl_total * 1000.0 / lim_t), format!("live {:.1} mm (limit {lim_l:.1}), total {:.1} mm (limit {lim_t:.1})", dem.defl_live * 1000.0, dem.defl_total * 1000.0));
+    let (ratio, governs) = checks.iter().map(|c| (c.ratio, c.name.clone())).fold((0.0, String::new()), |a, b| if b.0 > a.0 { b } else { a });
+    SteelDesign { member, bim_id, section: name.into(), mass, length: dem.length, ratio, governs, ok: ratio <= set.target_ratio + 1e-9, checks, notes: vec![format!("EN 1993-1-1, Class {cls}, γM0 = γM1 = 1.0, curves y {cy:?} z {cz:?} LT {clt:?}")] }
+}
+
+/// The EC2 flexure and shear ratios of a beam ACI 318 designed (fck from f'c, fyk = fy, the
+/// beam's bars per zone and its stirrups), under the ULS stations it was designed for.
+#[derive(Clone, Debug, Serialize)]
+pub struct Ec2Check {
+    pub flexure: f64,
+    pub shear: f64,
+    pub detail: String,
+}
+
+pub fn check_ec2_beam(b: &BeamDesign, dem: &crate::rc::BeamDemand, fc: f64, fy: f64, fyt: f64, cover: f64) -> Ec2Check {
+    let (bw, h) = (b.b, b.h);
+    let mut flex: f64 = 0.0;
+    let mut shear: f64 = 0.0;
+    let mut detail = String::new();
+    let l = b.span;
+    let zone = |x: f64| if x < l / 3.0 { "left" } else if x <= 2.0 * l / 3.0 { "middle" } else { "right" };
+    let stir = b.shear.iter().find(|s| s.s > 0.0);
+    for st in &dem.uls {
+        let members: Vec<Ec2MemberData> = st
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                let face = if s.1 >= 0.0 { "bottom" } else { "top" };
+                let as_t = b.flexure.iter().find(|f| f.face == face && f.zone == zone(s.0)).map(|f| f.as_prov).unwrap_or(0.0) / 1e6;
+                let d = h - cover - 0.009 - 0.010;
+                // the engine takes one steel grade: the stirrup area is scaled by fyt/fy so that
+                // Asw·fyk carries the stirrups' own yield force in (6.8)
+                let sh = stir.map(|s| (2.0 * bar_area(9.0) * fyt / fy, s.s / 1000.0));
+                Ec2MemberData { element_id: k + 1, fck: fc * 1e6, fyk: fy * 1e6, b: bw, h, d, as_tension: as_t, as_compression: None, d_prime: None, es: None, gamma_c: None, gamma_s: None, alpha_cc: Some(1.0), asw: sh.map(|x| x.0), s_stirrup: sh.map(|x| x.1), theta_shear: None, bw: None, z: None }
+            })
+            .collect();
+        let forces: Vec<Ec2DesignForces> = st.iter().enumerate().map(|(k, s)| Ec2DesignForces { element_id: k + 1, m_ed: Some(s.1.abs() * 1e3), v_ed: Some(s.2.abs() * 1e3), n_ed: Some(s.4 * 1e3) }).collect();
+        for (r, s) in check_ec2_members(&Ec2CheckInput { members, forces }).iter().zip(st) {
+            if r.flexure_ratio > flex {
+                flex = r.flexure_ratio;
+                detail = format!("x = {:.2} m: MEd {:.1} kN·m, MRd {:.1} kN·m", s.0, s.1.abs(), r.m_rd / 1e3);
+            }
+            shear = shear.max(r.shear_ratio);
+        }
+    }
+    Ec2Check { flexure: flex, shear, detail }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn class_of_rolled_shapes() {
+        // H 300x150x6.5x9 in S275 (fy 275): ε = 0.924; flange c/t = (75 − 3.25 − 13)/9 = 6.53
+        // ≤ 9ε = 8.32: class 1; web in bending c/t = (300 − 18 − 26)/6.5 = 39.4 ≤ 72ε: class 1
+        let h = HDims { d: 300.0, bf: 150.0, tw: 6.5, tf: 9.0, r: 13.0 };
+        assert_eq!(ec3_class(h, 275.0, false).0, 1);
+        // in compression the web limit 33ε = 30.5 < 39.4 ≤ 38ε = 35.1? no: 39.4 > 42ε = 38.8 → class 4
+        assert_eq!(ec3_class(h, 275.0, true).0, 4);
+    }
+}

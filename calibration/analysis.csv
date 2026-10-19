@@ -1,0 +1,120 @@
+aspect,case,source,quantity,unit,reference,pondus,error_pct,tol_pct,kind
+"cables","horizontal stay 50 m, H = 100 kN","Ernst (1965), Der E-Modul von Seilen; Irvine, Cable Structures (1981)","elongation","mm",31.176041666666666,31.171824295223974,-0.0135,0.1,closed-form
+"cables","horizontal stay 50 m, H = 100 kN","statics","tension","kN",100,99.99999999999054,-0.0000,0.01,closed-form
+"seismic","3-storey RC frame","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","T used (min(T1, Cu·Ta))","s",0.47890694172144144,0.47890694172144144,0.0000,0.000001,closed-form
+"seismic","3-storey RC frame","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","Cs","–",0.125,0.125,0.0000,0.000001,closed-form
+"seismic","3-storey RC frame","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","V_ELF = Cs·W","kN",64.80000000000003,64.80000000000003,0.0000,0.000001,closed-form
+"seismic","stiff 1-storey frame (T < T0)","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","T used (min(T1, Cu·Ta))","s",0.03807858833227435,0.03807858833227435,0.0000,0.000001,closed-form
+"seismic","stiff 1-storey frame (T < T0)","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","Cs","–",0.125,0.125,0.0000,0.000001,closed-form
+"seismic","stiff 1-storey frame (T < T0)","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","V_ELF = Cs·W","kN",48.48000000000001,48.48000000000001,0.0000,0.000001,closed-form
+"linear statics","propped cantilever, UDL","Hibbeler, Structural Analysis 10e, Ch. 10 (force method); Roark 9e Table 8.1 case 1c","R_B","kN",22.5,22.499999999999886,-0.0000,0.0001,closed-form
+"linear statics","propped cantilever, UDL","Hibbeler, Structural Analysis 10e, Ch. 10 (force method); Roark 9e Table 8.1 case 1c","M_A","kN·m",-45,-45.00000000000063,-0.0000,0.0001,closed-form
+"linear statics","fixed-fixed, centre load","Roark 9e Table 8.1 case 3a (fixed ends, centre load)","M_end","kN·m",-37.5,-37.50000000000048,-0.0000,0.0001,closed-form
+"linear statics","fixed-fixed, centre load","Roark 9e Table 8.1 case 3a (fixed ends, centre load)","M_mid","kN·m",37.5,37.50000000000022,0.0000,0.0001,closed-form
+"linear statics","fixed-fixed, centre load","Roark 9e Table 8.1 case 3a (fixed ends, centre load)","δ_mid","mm",0.45240680419833523,0.45240680419833934,0.0000,0.1,closed-form
+"linear statics","two-span continuous beam, UDL","Ghali & Neville, Structural Analysis 7e, Ch. 4 (three-moment equation)","M_B","kN·m",-45,-45.00000000000006,-0.0000,0.0001,closed-form
+"linear statics","two-span continuous beam, UDL","Ghali & Neville, Structural Analysis 7e, Ch. 4 (three-moment equation)","R_B","kN",75,75.00000000000037,0.0000,0.0001,closed-form
+"linear statics","Gerber beam with hinge","STAAD.Pro Verification V7 type (Gerber beam), statics","R_C","kN",30,30.000000000004547,0.0000,0.0001,closed-form
+"linear statics","Gerber beam with hinge","STAAD.Pro Verification V7 type (Gerber beam), statics","M_A","kN·m",-200,-200.00000000004573,-0.0000,0.0001,closed-form
+"linear statics","Gerber beam with hinge","STAAD.Pro Verification V7 type (Gerber beam), statics","M at hinge","kN·m",0,0,0.0000,0.000001,closed-form
+"modal","uniform cantilever, 32 elements","Clough & Penzien 3e, Table 18-1 (βnL of a cantilever)","f1 (lateral)","Hz",8.259539379705371,8.259575291564234,0.0004,0.3,published
+"modal","uniform cantilever, 32 elements","Clough & Penzien 3e, Table 18-1 (βnL of a cantilever)","f2 (lateral)","Hz",51.762069920545585,51.76189098050575,-0.0003,0.3,published
+"modal","uniform cantilever, 32 elements","Clough & Penzien 3e, Table 18-1 (βnL of a cantilever)","f3 (lateral)","Hz",144.9363177371937,144.93511110370622,-0.0008,0.3,published
+"modal","two-storey shear building","Chopra, Dynamics of Structures 5e, Ch. 10 (two-storey shear frame)","f1","Hz",3.3539771704408263,3.3519186950819324,-0.0614,0.2,closed-form
+"modal","two-storey shear building","Chopra, Dynamics of Structures 5e, Ch. 10 (two-storey shear frame)","f2","Hz",8.780826229705283,8.776071753171257,-0.0541,0.2,closed-form
+"modal","two-storey shear building","Chopra, Dynamics of Structures 5e, Ch. 10 (two-storey shear frame)","first-mode effective mass ratio","–",0.947213595499958,0.9468266757577911,-0.0408,0.1,closed-form
+"seismic","two-storey shear building, flat spectrum","Chopra 5e Ch. 13 (RSA); Der Kiureghian (1981) CQC","base shear V_RSA","kN",284.74497613278686,285.1871695641422,0.1553,0.2,closed-form
+"seismic","two-storey shear building, flat spectrum","seismic weight = D","W","kN",600,600,0.0000,0.000001,closed-form
+"moving loads","two 100 kN axles 2 m apart, 10 m span","Hibbeler, Structural Analysis 10e, Ch. 6 (influence lines, absolute maximum moment)","absolute max moment","kN·m",405,404.9999999902966,-0.0000,0.1,closed-form
+"moving loads","influence line of M at L/4","Hibbeler, Structural Analysis 10e, Ch. 6 (influence lines, absolute maximum moment)","peak ordinate","m",1.875,1.8749999999999991,-0.0000,0.1,closed-form
+"moving loads","influence line of R_A","Hibbeler, Structural Analysis 10e, Ch. 6 (influence lines, absolute maximum moment)","ordinate at mid-span","–",0.5,0.4999999999999982,-0.0000,0.1,closed-form
+"nonlinear members","tension-only X brace","statics of a tension-only brace (compression diagonal buckled out)","tension diagonal","kN",37.5,37.50000000000056,0.0000,0.1,closed-form
+"nonlinear members","tension-only X brace","statics of a tension-only brace (compression diagonal buckled out)","compression diagonal","kN",0,0,0.0000,0.001,closed-form
+"nonlinear members","two-span beam, lift-off support","statics: the lifted support carries nothing, span 1 acts as a simple beam","R at the lifted support","kN",0,0,0.0000,0.001,closed-form
+"nonlinear members","two-span beam, lift-off support","statics: the lifted support carries nothing, span 1 acts as a simple beam","R at the middle support","kN",50,49.99999999998431,-0.0000,0.1,closed-form
+"plastic collapse","simple beam, central load","Neal, The Plastic Methods of Structural Analysis 3e, Chs. 2–3","Pc","kN",88.54466174020111,88.54466174020105,-0.0000,0.1,closed-form
+"plastic collapse","propped cantilever, central load","Neal, The Plastic Methods of Structural Analysis 3e, Chs. 2–3","Pc","kN",132.81699261030167,132.81699261030164,-0.0000,0.1,closed-form
+"plastic collapse","fixed-ended beam, UDL","Neal, The Plastic Methods of Structural Analysis 3e, Chs. 2–3","wc","kN/m",59.02977449346741,59.0297744934674,-0.0000,0.1,closed-form
+"plastic collapse","two equal spans, UDL","Neal, The Plastic Methods of Structural Analysis 3e, Chs. 2–3","wc","kN/m",43.00634235317202,43.00634235317199,-0.0000,0.5,published
+"plastic collapse","fixed-base portal, V = 1.5H (combined mechanism)","Horne, Plastic Theory of Structures, Ch. 3; Neal 3e Ch. 3","λc","–",79.690195566181,79.69019556618095,-0.0000,0.5,closed-form
+"plates","SS square plate, n = 5","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","w_max","mm",70.93632,63.6399949344478,-10.2857,12,published
+"plates","SS square plate, n = 5","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","Mx centre","kN·m/m",7.664,7.469694761666798,-2.5353,12,published
+"plates","clamped square plate, n = 5","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","w_max","mm",22.014719999999997,18.260418413389786,-17.0536,18,published
+"plates","clamped square plate, n = 5","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","Mx centre","kN·m/m",3.6959999999999997,3.810248704597018,3.0911,18,published
+"plates","SS square plate, n = 9","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","w_max","mm",70.93632,68.74495498149197,-3.0892,5,published
+"plates","SS square plate, n = 9","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","Mx centre","kN·m/m",7.664,7.600702315901456,-0.8259,5,published
+"plates","clamped square plate, n = 9","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","w_max","mm",22.014719999999997,20.9849497615055,-4.6776,7.5,published
+"plates","clamped square plate, n = 9","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","Mx centre","kN·m/m",3.6959999999999997,3.708962493535373,0.3507,7.5,published
+"plates","clamped square plate, n = 9","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","Mx mid-edge (extrapolated)","kN·m/m",-8.208,-7.422074310751906,9.5751,12,published
+"plates","SS square plate, n = 17","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","w_max","mm",70.93632,70.3762161800389,-0.7896,2,published
+"plates","SS square plate, n = 17","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","Mx centre","kN·m/m",7.664,7.644394712643878,-0.2558,2,published
+"plates","clamped square plate, n = 17","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","w_max","mm",22.014719999999997,21.826956466146786,-0.8529,3,published
+"plates","clamped square plate, n = 17","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","Mx centre","kN·m/m",3.6959999999999997,3.6773352224396256,-0.5050,3,published
+"plates","clamped square plate, n = 17","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","Mx mid-edge (extrapolated)","kN·m/m",-8.208,-7.9530347185773955,3.1063,6,published
+"plates","SS square plate, n = 33","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","w_max","mm",70.93632,70.84320766803549,-0.1313,1,published
+"plates","SS square plate, n = 33","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","Mx centre","kN·m/m",7.664,7.657050455246129,-0.0907,1,published
+"plates","clamped square plate, n = 33","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","w_max","mm",22.014719999999997,22.06577101938618,0.2319,1.5,published
+"plates","clamped square plate, n = 33","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","Mx centre","kN·m/m",3.6959999999999997,3.6686086322785516,-0.7411,1.5,published
+"plates","clamped square plate, n = 33","Timoshenko & Woinowsky-Krieger 2e, Table 35 (ν = 0.3)","Mx mid-edge (extrapolated)","kN·m/m",-8.208,-8.135907141194007,0.8783,3,published
+"plates","SS plate b/a = 2, n = 17","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","w_max","mm",176.99136,175.4834057340838,-0.8520,2,published
+"plates","SS plate b/a = 2, n = 17","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","Mx centre (short span)","kN·m/m",16.272,16.22753234687655,-0.2733,2,published
+"plates","SS plate b/a = 2, n = 17","Timoshenko & Woinowsky-Krieger 2e, Table 8 (ν = 0.3)","My centre (long span)","kN·m/m",7.4239999999999995,7.384985046471746,-0.5255,3,published
+"plates","SS plate b/a = 2, n = 17","equilibrium","Σ reactions","kN",320,320.00000000995215,0.0000,0.000001,closed-form
+"linear statics","fixed-base portal, lateral load","Hibbeler 10e Ch. 11 (slope-deflection); Ghali & Neville 7e §3","sway","mm",0.08888888888888889,0.08889990001665399,0.0124,0.05,closed-form
+"linear statics","3D L-frame, out-of-plane tip load","McGuire, Gallagher & Ziemian 2e, Ch. 13 (bending + torsion)","tip δy","mm",28.38333333333333,28.383333333292324,-0.0000,0.05,closed-form
+"linear statics","Pratt truss, 4 panels","Kassimali, Structural Analysis 6e, Ch. 4 (method of sections)","bottom chord, panel 2","kN",15,14.999999999999925,-0.0000,0.0001,closed-form
+"linear statics","Pratt truss, 4 panels","Kassimali, Structural Analysis 6e, Ch. 4 (method of sections)","top chord, panel 2","kN",-20,-19.99999999999994,0.0000,0.0001,closed-form
+"linear statics","Pratt truss, 4 panels","Kassimali, Structural Analysis 6e, Ch. 4 (method of sections)","diagonal T4–B8","kN",7.0710678118654755,7.071067811865459,-0.0000,0.0001,closed-form
+"section properties","rectangle b/t = 1","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1 = J/(b t³), section FE","–",0.141,0.14045513540113533,-0.3864,0.5,published
+"section properties","rectangle b/t = 1","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1, Pondus frame formula","–",0.141,0.14083333333333334,-0.1182,1,published
+"section properties","rectangle b/t = 1.5","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1 = J/(b t³), section FE","–",0.196,0.19558172509723462,-0.2134,0.5,published
+"section properties","rectangle b/t = 1.5","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1, Pondus frame formula","–",0.196,0.19563786008230452,-0.1848,1,published
+"section properties","rectangle b/t = 2","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1 = J/(b t³), section FE","–",0.229,0.22844750770921773,-0.2413,0.5,published
+"section properties","rectangle b/t = 2","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1, Pondus frame formula","–",0.229,0.22888020833333333,-0.0523,1,published
+"section properties","rectangle b/t = 3","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1 = J/(b t³), section FE","–",0.263,0.2629696229584046,-0.0116,0.5,published
+"section properties","rectangle b/t = 3","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1, Pondus frame formula","–",0.263,0.2634053497942387,0.1541,1,published
+"section properties","rectangle b/t = 5","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1 = J/(b t³), section FE","–",0.291,0.29071482656645026,-0.0980,0.5,published
+"section properties","rectangle b/t = 5","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1, Pondus frame formula","–",0.291,0.2913389333333333,0.1165,1,published
+"section properties","rectangle b/t = 10","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1 = J/(b t³), section FE","–",0.312,0.3111369935346636,-0.2766,0.5,published
+"section properties","rectangle b/t = 10","Timoshenko & Goodier, Theory of Elasticity 3e, §109 (torsion of rectangles)","k1, Pondus frame formula","–",0.312,0.3123335083333333,0.1069,1,published
+"section properties","I 300 x 150 x 6.5 x 9 (no fillets)","Timoshenko & Gere 2e §5.10: Cw = tf bf³ h0²/24","Cw","m⁶ x 1e9",107.17439062499996,107.09660584472552,-0.0726,2,closed-form
+"section properties","thin channel 200 x 80 x 2","Timoshenko & Gere 2e §5.4; Roark 9e Table 9.? (thin-walled shear centre)","shear centre from web","mm",28.235294117647058,28.220151352868815,-0.0536,2,closed-form
+"section properties","H 300x150x6.5x9","JIS G 3192 (dimensions, mass and properties of H sections)","A","cm²",46.78,46.780708415433246,0.0015,0.3,published
+"section properties","H 300x150x6.5x9","JIS G 3192","Ix","cm⁴",7210,7209.17572268661,-0.0114,1,published
+"section properties","H 200x100x5.5x8","JIS G 3192 (dimensions, mass and properties of H sections)","A","cm²",26.67,26.66938070170253,-0.0023,0.3,published
+"section properties","H 200x100x5.5x8","JIS G 3192","Ix","cm⁴",1810,1805.6427870692298,-0.2407,1,published
+"section properties","H 400x200x8x13","JIS G 3192 (dimensions, mass and properties of H sections)","A","cm²",83.37,83.37070841543324,0.0008,0.3,published
+"section properties","H 400x200x8x13","JIS G 3192","Ix","cm⁴",23500,23456.531679484156,-0.1850,1,published
+"section properties","H 400x400x13x21","JIS G 3192 (dimensions, mass and properties of H sections)","A","cm²",218.7,218.6946915566254,-0.0024,0.3,published
+"section properties","H 400x400x13x21","JIS G 3192","Ix","cm⁴",66600,66620.69370003576,0.0311,1,published
+"section properties","H 700x300x13x24","JIS G 3192 (dimensions, mass and properties of H sections)","A","cm²",231.5,231.54123980236906,0.0178,0.3,published
+"section properties","H 700x300x13x24","JIS G 3192","Ix","cm⁴",197000,197490.31350541388,0.2489,1,published
+"slab load transfer","3 x 8 m panel, one way","one-way slab (ly/lx > 2): load to the long edges, e.g. Hibbeler 10e §2.1","long beam load","kN",120,119.99999999999625,-0.0000,0.0001,closed-form
+"slab load transfer","3 x 8 m panel, one way","one-way slab (ly/lx > 2): load to the long edges, e.g. Hibbeler 10e §2.1","short beam load","kN",0,0,0.0000,0.000001,closed-form
+"slab load transfer","4 x 6 m panel, 10 kPa","tributary areas by 45° lines (two-way slab on beams), e.g. Hibbeler 10e §2.1","long beam load","kN",80,80.00000000000361,0.0000,0.0001,closed-form
+"slab load transfer","4 x 6 m panel, 10 kPa","tributary areas by 45° lines (two-way slab on beams), e.g. Hibbeler 10e §2.1","short beam load","kN",40,40.000000000000284,0.0000,0.0001,closed-form
+"slab load transfer","4 x 6 m panel, 10 kPa","tributary areas by 45° lines (two-way slab on beams), e.g. Hibbeler 10e §2.1","long beam M_max (trapezoid)","kN·m",76.66666666666667,76.66666666666976,0.0000,0.05,closed-form
+"slab load transfer","4 x 6 m panel, 10 kPa","tributary areas by 45° lines (two-way slab on beams), e.g. Hibbeler 10e §2.1","short beam M_max (triangle)","kN·m",26.666666666666668,26.66666666666632,-0.0000,0.05,closed-form
+"slab load transfer","4 x 6 m panel, 10 kPa","equilibrium","Σ reactions","kN",240,240.00000000000722,0.0000,0.000001,closed-form
+"stability","pinned-pinned column, 8 elements","Timoshenko & Gere, Theory of Elastic Stability 2e, Ch. 2","Pcr","kN",7895.683520871486,7895.942231513486,0.0033,0.1,closed-form
+"stability","fixed-free column, 8 elements","Timoshenko & Gere, Theory of Elastic Stability 2e, Ch. 2","Pcr","kN",1973.9208802178714,1973.9249469114998,0.0002,0.1,closed-form
+"stability","fixed-pinned column, 8 elements","Timoshenko & Gere, Theory of Elastic Stability 2e, Ch. 2","Pcr","kN",16152,16154.7741840477,0.0172,0.1,published
+"stability","fixed-fixed column, 8 elements","Timoshenko & Gere, Theory of Elastic Stability 2e, Ch. 2","Pcr","kN",31582.734083485942,31598.908882051757,0.0512,0.1,closed-form
+"stability","fixed-base portal, sway buckling","Timoshenko & Gere 2e §2.5; AISC 360-16 Commentary Eq. C-A-7-2 (G_A = 0, G_B = 1)","Pcr per column","kN",9223.941950998726,9224.066362365598,0.0013,0.2,closed-form
+"stability","cantilever P-Delta at 0.4 Pcr","Timoshenko & Gere 2e §1.11: 3(tan u − u)/u³","sway amplification","–",1.6576189159031367,1.6576180090569523,-0.0001,0.2,closed-form
+"staged construction","cantilever propped after its dead load","staged construction, superposition of the stages (closed form)","root moment","kN·m",-202.5,-202.50174841562696,-0.0009,0.1,closed-form
+"staged construction","cantilever propped after its dead load","staged construction, superposition of the stages (closed form)","prop force","kN",-11.25,-11.249708597391937,0.0026,0.2,closed-form
+"supports and loads","cantilever on an elastic spring","STAAD.Pro Verification V8 type; compatibility","spring force","kN",8.957573990377607,8.957573990379712,0.0000,0.001,closed-form
+"supports and loads","fixed-fixed beam, support settlement","Ghali & Neville 7e, Ch. 4; 6EIΔ/L²","end moment |M|","kN·m",207.22499999999997,207.22500000000366,0.0000,0.001,closed-form
+"supports and loads","fixed-fixed beam, temperature gradient","Ghali & Neville 7e, Ch. 6; EIαΔT/h","|M| at the ends","kN·m",41.445,41.445,0.0000,0.001,closed-form
+"supports and loads","fixed-fixed beam, temperature gradient","Ghali & Neville 7e, Ch. 6; EIαΔT/h","|M| at mid-span","kN·m",41.445,41.445,0.0000,0.001,closed-form
+"supports and loads","restrained bar, uniform temperature","Timoshenko, Strength of Materials; EAαΔT","N","kN",-1243.35,-1243.3500000000001,-0.0000,0.001,closed-form
+"supports and loads","rigid diaphragm, two columns","stiffness distribution of storey shear","shear in column 1","kN",25,25.000000000000142,0.0000,0.1,closed-form
+"time history","undamped SDOF, step ground acceleration","Chopra, Dynamics of Structures 5e, §4.3 (DAF = 2)","peak relative displacement","mm",42.666666666666664,42.67294655561834,0.0147,0.5,closed-form
+"time history","undamped SDOF, step ground acceleration","ω = √(k/m), k = 3EI/h³","natural frequency","Hz",1.0792579978917376,1.0791449042680727,-0.0105,0.1,closed-form
+"linear statics","VM2 overhanging beam","ANSYS MAPDL Verification Manual VM2","bending stress","psi",11400,11403.953370515837,0.0347,0.5,published
+"linear statics","VM2 overhanging beam","ANSYS MAPDL Verification Manual VM2","mid-span deflection (up)","in",0.182,0.18246326106064503,0.2545,0.5,published
+"linear statics","VM4 hinged bars","ANSYS MAPDL Verification Manual VM4","bar stress","psi",10000,10000.000000000005,0.0000,0.5,published
+"linear statics","VM4 hinged bars","ANSYS MAPDL Verification Manual VM4","apex deflection","in",-0.12,-0.12000000469077378,-0.0000,0.5,published
+"foundations","beam on Winkler foundation, βL = 10","Hetényi, Beams on Elastic Foundation (1946), infinite beam under a point load","w under the load","mm",1.1296864176511063,1.1298611414149338,0.0155,0.5,closed-form
+"foundations","beam on Winkler foundation, βL = 10","Hetényi, Beams on Elastic Foundation (1946), infinite beam under a point load","M under the load","kN·m",55.325087584882844,55.27581165564877,-0.0891,0.5,closed-form

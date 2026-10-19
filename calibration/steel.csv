@@ -1,0 +1,73 @@
+aspect,case,source,quantity,unit,reference,pondus,error_pct,tol_pct,kind
+"AISC 360 tension","AISC D.1 W8x21","AISC Design Examples v16, D.1, p. D-3","φtPn, D2-1 yielding","kip",277,277.1999642375008,0.0722,0.5,published
+"AISC 360 tension","AISC D.1 W8x21","AISC Design Examples v16, D.1, p. D-3","An (B4.3b, holes d + 1/8 in)","in²",4.76,4.760000000000001,0.0000,0.5,published
+"AISC 360 tension","AISC D.1 W8x21","AISC Design Examples v16, D.1, p. D-3","U (Table D3.1 case 2, x̄ without fillets)","-",0.908,0.9071073867163253,-0.0983,0.5,published
+"AISC 360 tension","AISC D.1 W8x21","AISC Design Examples v16, D.1, p. D-3","φtPn, D2-2 rupture (steel::check)","kip",211,210.49424193095356,-0.2397,0.5,published
+"AISC 360 compression","AISC E.1C W14x132","AISC Design Examples v16, E.1C, p. E-9","φcPn (E3-2)","kip",892,893.3583690742429,0.1523,0.5,published
+"AISC 360 compression","AISC E.1C W14x132","AISC Design Examples v16, E.1C, p. E-9","φcFn","ksi",23,23.02470023387224,0.1074,0.5,published
+"AISC 360 compression","AISC E.1D W14x90","AISC Design Examples v16, E.1D, p. E-11","φcPn (Lcx governs)","kip",927,927.522544482088,0.0564,0.5,published
+"AISC 360 compression","AISC E.1D W14x90","AISC Design Examples v16, E.1D, p. E-11","Fn (E3-2)","ksi",38.9,38.88983415019237,-0.0261,0.5,published
+"AISC 360 compression","INTI301 Ej.10(a) IPE300","Troglia et al. (2018), Ej. 10-2","Fcr = 0.877 Fe (E3-3)","MPa",46,45.9824635446649,-0.0381,0.5,published
+"AISC 360 compression","INTI301 Ej.10(a) IPE300","Troglia et al. (2018), Ej. 10-2","Pn","kN",247.4,247.38565387029718,-0.0058,0.5,published
+"AISC 360 flexure","AISC F.1-1B W18x50","AISC Design Examples v16, F.1-1B, p. F-8","Mp (F2-1)","kip-in",5050,5049.999348482607,-0.0000,0.5,published
+"AISC 360 flexure","AISC F.1-1B W18x50","AISC Design Examples v16, F.1-1B, p. F-8","φbMn","kip-ft",379,378.74995113619553,-0.0660,0.5,published
+"AISC 360 flexure","AISC F.1-2B W18x50","AISC Design Examples v16, F.1-2B, p. F-10","Cb (F1-1), centre third","-",1.01,1.0135135135135136,0.3479,0.5,published
+"AISC 360 flexure","AISC F.1-2B W18x50","AISC Design Examples v16, F.1-2B, p. F-11","Mn (F2-2)","kip-in",4060,4066.7299278808123,0.1658,0.5,published
+"AISC 360 flexure","AISC F.1-2B W18x50","AISC Design Examples v16, F.1-2B, p. F-11","φbMn","kip-ft",304,305.00474459106096,0.3305,0.5,published
+"AISC 360 flexure","AISC F.1-2B W18x50","AISC Design Examples v16, F.1-2B, p. F-10","Mn at the printed Lp = 69.9 in (= Mp)","kip-in",5050,5049.999348482607,-0.0000,0.5,published
+"AISC 360 flexure","AISC F.1-2B W18x50","AISC Design Examples v16, F.1-2B, p. F-10","Mn at the printed Lr = 203 in (= 0.7 Fy Sx)","kip-in",3111.5,3117.0228826902267,0.1775,0.5,published
+"AISC 360 flexure","AISC F.1-3B W18x50","AISC Design Examples v16, F.1-3B, p. F-14","Cb (F1-1), half span","-",1.3,1.2987012987012987,-0.0999,0.5,published
+"AISC 360 flexure","AISC F.1-3B W18x50","AISC Design Examples v16, F.1-3B, p. F-15","Fcr (F2-4)","ksi",43.2,43.18154961834391,-0.0427,0.5,published
+"AISC 360 flexure","AISC F.1-3B W18x50","AISC Design Examples v16, F.1-3B, p. F-15","Mn (F2-3)","kip-in",3840,3838.839761070774,-0.0302,0.5,published
+"AISC 360 flexure","AISC F.1-3B W18x50","AISC Design Examples v16, F.1-3B, p. F-15","φbMn","kip-ft",288,287.9129820803081,-0.0302,0.5,published
+"AISC 360 flexure","AISC F.3B W21x48","AISC Design Examples v16, F.3B, p. F-25","Mn (F3-1, flange local buckling)","kip-in",5310,5306.185364508786,-0.0718,0.5,published
+"AISC 360 flexure","AISC F.3B W21x48","AISC Design Examples v16, F.3B, p. F-25","φbMn","kip-ft",398,397.96390233815896,-0.0091,0.5,published
+"AISC 360 flexure","AISC F.5 W12x58","AISC Design Examples v16, F.5, p. F-29","Mny (F6-1)","kip-in",1630,1624.9997903533142,-0.3068,0.5,published
+"AISC 360 flexure","AISC F.5 W12x58","AISC Design Examples v16, F.5, p. F-29","φbMny","kip-ft",122,121.87498427649858,-0.1025,0.5,published
+"AISC 360 shear","AISC G.1B W24x62","AISC Design Examples v16, G.1B, p. G-4","φvVn = Vn (G2-1, φv = 1.0)","kip",306,305.7299605567499,-0.0882,0.5,published
+"AISC 360 flexure","AISC H.3 W14x82","AISC Design Examples v16, H.3, p. H-9","Mn at the printed Lp = 8.76 ft (= Mp)","kip-in",6950,6949.9991033572505,-0.0000,0.5,published
+"AISC 360 flexure","AISC H.3 W14x82","AISC Design Examples v16, H.3, p. H-9","Mn at the printed Lr = 33.2 ft (= 0.7 Fy Sx)","kip-in",4305,4279.118091114292,-0.6012,1,published
+"AISC 360 flexure","AISC H.3 W14x82","F1-1 on the constructed diagram (target 1.41)","Cb","-",1.41,1.41,0.0000,0.01,closed-form
+"AISC 360 tension","AISC H.3 W14x82","AISC Design Examples v16, H.3, p. H-9","φtPn (D2-1)","kip",1080,1079.999860665587,-0.0000,0.5,published
+"AISC 360 flexure","AISC H.3 W14x82","AISC Design Examples v16, H.3, p. H-10","Mnx (F2-2, Cb 1.41)","kip-in",6560,6538.277557735449,-0.3311,0.5,published
+"AISC 360 flexure","AISC H.3 W14x82","AISC Design Examples v16, H.3, p. H-10","φbMnx","kip-ft",492,490.3708168301587,-0.3311,0.5,published
+"AISC 360 flexure","AISC H.3 W14x82","AISC Design Examples v16, H.3, p. H-10","Mny (F6-1)","kip-in",2240,2239.999711010107,-0.0000,0.5,published
+"AISC 360 flexure","AISC H.3 W14x82","AISC Design Examples v16, H.3, p. H-10","φbMny","kip-ft",168,167.99997832575804,-0.0000,0.5,published
+"AISC 360 interaction","AISC H.3 W14x82","AISC Design Examples v16, H.3, p. H-11","Pr/Pc (steel::check)","-",0.161,0.1611111318965972,0.0690,0.5,published
+"AISC 360 interaction","AISC H.3 W14x82","AISC Design Examples v16, H.3, p. H-11","H1-1b (steel::check)","-",0.873,0.8744769992606116,0.1692,0.5,published
+"EN 1992-1-1 (cross-check)","JRC-EC2 3.2.1.3 T-beam","Biasioli et al. (2014), §3.2.1.3, p. 57","MRd(As = 556 mm²), mid-span","kNm",89.3,89.2555662737685,-0.0498,0.5,published
+"EN 1992-1-1 (cross-check)","JRC-EC2 3.2.1.3 T-beam","Biasioli et al. (2014), §3.2.1.3, p. 58","MRd(As = 947 mm²), support","kNm",132.9,132.82346313799624,-0.0576,0.5,published
+"EN 1992-1-1 (cross-check)","JRC-EC2 3.2.1.4 shear","Biasioli et al. (2014), §3.2.1.4, p. 59","VRd,c (6.2.a)","kN",47.9,47.90236530502513,0.0049,0.5,published
+"EN 1992-1-1 (cross-check)","JRC-EC2 3.2.1.4 shear","Biasioli et al. (2014), §3.2.1.4, p. 60","VRd,s (6.8, asw 317 mm²/m, cot θ 2.5)","kN",115.52,115.36043478260868,-0.1381,0.5,published
+"EN 1992-1-1 (cross-check)","stirrup grade","EN 1992-1-1 (6.8): VRd,s ∝ fywd","VRd,s(fyt 235) / VRd,s(fyt 390)","-",0.6025641025641025,0.6025641025641026,0.0000,0.5,closed-form
+"EN 1993-1-1","H 300x150x6.5x9, M20, 2 holes per flange","EN 1993-1-1 6.2.3(2)b: 0.9 Anet fu/γM2","Nu,Rd","kN",1119.1884023644775,1119.1884023644775,0.0000,0.01,closed-form
+"EN 1993-1-1","P364 Ex.9 UKC 356x368x129","SCI P364 (2009), Ex. 9, sheet 2","section class (Table 5.2)","-",3,3,0.0000,0.000000001,published
+"EN 1993-1-1","P364 Ex.9 UKC 356x368x129","SCI P364 (2009), Ex. 9, sheet 4 (χ to 2 dp)","χz","-",0.65,0.6490362557594352,-0.1483,0.8,published
+"EN 1993-1-1","P364 Ex.9 UKC 356x368x129","SCI P364 (2009), Ex. 9, sheet 4","Nb,z,Rd","kN",3678,3672.2471350868846,-0.1564,0.8,published
+"EN 1993-1-1","P364 Ex.9 UKC 356x368x129","SCI P364 (2009), Ex. 9 (Blue Book)","Nb,y,Rd","kN",5010,5012.335192119196,0.0466,0.5,published
+"EN 1993-1-1","P364 Ex.9 UKC 356x368x129","SCI P364 (2009), Ex. 9, sheet 3","Nc,Rd = A fy/γM0","kN",5658,5658.000000000001,0.0000,0.5,published
+"EN 1993-1-1","SBE A.1 IPE330","SBE Multi-Storey Part 4 (2010), A.1, p. 4-59","Av (6.2.6(3))","mm²",3080,3080.250000000001,0.0081,0.5,published
+"EN 1993-1-1","SBE A.1 IPE330","SBE Multi-Storey Part 4 (2010), A.1, p. 4-58","Mc,Rd (6.2.5)","kNm",189.01,189.01049999999998,0.0003,0.5,published
+"EN 1993-1-1","SBE A.1 IPE330","SBE Multi-Storey Part 4 (2010), A.1, p. 4-58","MEd/Mc,Rd","-",0.479,0.4787035640877095,-0.0619,0.5,published
+"EN 1993-1-1","SBE A.1 IPE330","SBE Multi-Storey Part 4 (2010), A.1, p. 4-59","Vpl,Rd (6.2.6)","kN",417.9,417.92004416776626,0.0048,0.5,published
+"EN 1993-1-1","SBE A.1 IPE330","SBE Multi-Storey Part 4 (2010), A.1, p. 4-60 (SN003)","C1 (Pondus: SN003 value for the diagram it recognises)","-",1.127,1.127,0.0000,1,published
+"EN 1993-1-1","SBE A.1 IPE330","SBE Multi-Storey Part 4 (2010), A.1, p. 4-61","Mcr (top flange, zg = +165 mm)","kNm",113.9,113.8583122652002,-0.0366,1,published
+"EN 1993-1-1","SBE A.1 IPE330","SBE Multi-Storey Part 4 (2010), A.1, p. 4-61","λ̄LT","-",1.288,1.28842930602455,0.0333,0.5,published
+"EN 1993-1-1","SBE A.2 IPE400","SBE Multi-Storey Part 4 (2010), A.2, p. 4-66","Av (6.2.6(3))","mm²",4269,4269.1,0.0023,0.5,published
+"EN 1993-1-1","SBE A.2 IPE400","SBE Multi-Storey Part 4 (2010), A.2, p. 4-66","Mc,Rd (6.2.5)","kNm",307.15,307.145,-0.0016,0.5,published
+"EN 1993-1-1","SBE A.2 IPE400","SBE Multi-Storey Part 4 (2010), A.2, p. 4-66","Vpl,Rd (6.2.6)","kN",579.21,579.2200180363965,0.0017,0.5,published
+"EN 1993-1-1","SBE A.5 HEB300","SBE Multi-Storey Part 4 (2010), A.5, p. 4-96","χy","-",0.808,0.8082776388967821,0.0344,0.5,published
+"EN 1993-1-1","SBE A.5 HEB300","SBE Multi-Storey Part 4 (2010), A.5, p. 4-96","χz","-",0.671,0.6704983544135754,-0.0748,0.5,published
+"EN 1993-1-1","SBE A.5 HEB300","SBE Multi-Storey Part 4 (2010), A.5, p. 4-97","Nb,Rd (6.3.1.1)","kN",2349.5,2347.7499879791344,-0.0745,0.5,published
+"EN 1993-1-1","SBE A.5 HEB300","SBE Multi-Storey Part 4 (2010), A.5, p. 4-97","NEd/Nb,Rd (printed to 2 figures)","-",0.85,0.8518794634183062,0.2211,1,published
+"EN 1993-1-1","SBE-MS8 Ex.2 IPE450","uniform moment: C1 = 1 (SN003)","C1","-",1,1,0.0000,0.000000001,closed-form
+"EN 1993-1-1","SBE-MS8 Ex.2 IPE450","SBE Multi-Storey Part 8 (2010), App. A Ex. 2, p. 8-18","section class under N + M (Table 5.2)","-",1,1,0.0000,0.000000001,published
+"EN 1993-1-1","SBE-MS8 Ex.2 IPE450","SBE Multi-Storey Part 8 (2010), App. A Ex. 2, pp. 8-19 – 8-21","χy","-",1,1,0.0000,0.5,published
+"EN 1993-1-1","SBE-MS8 Ex.2 IPE450","SBE Multi-Storey Part 8 (2010), App. A Ex. 2, pp. 8-19 – 8-21","χz","-",0.865,0.8659700594210182,0.1121,0.5,published
+"EN 1993-1-1","SBE-MS8 Ex.2 IPE450","SBE Multi-Storey Part 8 (2010), App. A Ex. 2, pp. 8-19 – 8-21","Nb,y,Rd","kN",3507,3507.4,0.0114,0.5,published
+"EN 1993-1-1","SBE-MS8 Ex.2 IPE450","SBE Multi-Storey Part 8 (2010), App. A Ex. 2, pp. 8-19 – 8-21","Nb,z,Rd","kN",3034,3037.303386413279,0.1089,0.5,published
+"EN 1993-1-1","SBE-MS8 Ex.2 IPE450","SBE Multi-Storey Part 8 (2010), App. A Ex. 2, pp. 8-19 – 8-21","kyy (Annex B, Table B.2)","-",0.997,0.9971127885428862,0.0113,0.5,published
+"EN 1993-1-1","SBE-MS8 Ex.2 IPE450","SBE Multi-Storey Part 8 (2010), App. A Ex. 2, pp. 8-19 – 8-21","kzy (Annex B, Table B.2)","-",0.997,0.9969883858693941,-0.0012,0.5,published
+"Connections","shear tab 4-M20 (Fnv 372 MPa) at 75 mm","AISC 360-16 J3.6, elastic bolt-group method","bolt ratio","-",0.6683009907002245,0.6683009907002244,-0.0000,0.5,closed-form
+"Connections","shear tab 4-M20 (Fnv 372 MPa) at 75 mm","AISC 360-16 J3.10 (2.4 d t Fu, web 8 mm)","bearing ratio","-",0.5084797966085062,0.5084797966085061,-0.0000,0.5,closed-form
+"Connections","shear tab 4-M20 (Fnv 372 MPa) at 75 mm","AISC 360-16 J4.2 (yielding, rupture)","plate shear ratio","-",0.3840245775729647,0.3840245775729647,0.0000,0.5,closed-form

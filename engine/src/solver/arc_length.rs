@@ -1,0 +1,994 @@
+/// Arc-length (Riks) and displacement control solvers for tracing
+/// nonlinear equilibrium paths including limit points and snap-through.
+///
+/// Crisfield spherical arc-length:
+///   ||Δu||² + Δλ² × ||f_ref||² = Δs²
+///
+/// Reference: Crisfield, "Non-linear Finite Element Analysis of Solids
+///            and Structures" Vol. 1, Ch. 9
+
+use serde::{Serialize, Deserialize};
+use crate::types::*;
+use crate::linalg::*;
+use super::dof::DofNumbering;
+use super::assembly::{self, InclinedFrame, InclinedTransformData2D};
+use super::corotational::{add_spring_contributions, assemble_corotational_public, assemble_corotational_triplets_2d};
+use super::constraints::FreeConstraintSystem;
+use super::linear::SPARSE_THRESHOLD;
+use super::sparse_tangent::{
+    cached_symbolic, tangent_free_sparse, tangent_free_sparse_triplets, SparseSymbolicCache,
+};
+use super::time_integration::MAX_DENSE_FALLBACK_DOFS;
+
+/// Arc-length analysis input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArcLengthInput {
+    pub solver: SolverInput,
+    /// Maximum number of arc-length steps
+    #[serde(default = "default_max_steps")]
+    pub max_steps: usize,
+    /// Maximum N-R iterations per step
+    #[serde(default = "default_max_iter")]
+    pub max_iter: usize,
+    /// Convergence tolerance
+    #[serde(default = "default_tol")]
+    pub tolerance: f64,
+    /// Initial arc-length increment
+    #[serde(default = "default_initial_ds")]
+    pub initial_ds: f64,
+    /// Minimum arc-length
+    #[serde(default = "default_min_ds")]
+    pub min_ds: f64,
+    /// Maximum arc-length
+    #[serde(default = "default_max_ds")]
+    pub max_ds: f64,
+    /// Target N-R iterations per step (for adaptive Δs)
+    #[serde(default = "default_target_iter")]
+    pub target_iter: usize,
+}
+
+fn default_max_steps() -> usize { 100 }
+fn default_max_iter() -> usize { 30 }
+fn default_tol() -> f64 { 1e-6 }
+fn default_initial_ds() -> f64 { 0.1 }
+fn default_min_ds() -> f64 { 1e-6 }
+fn default_max_ds() -> f64 { 1.0 }
+fn default_target_iter() -> usize { 5 }
+
+/// Displacement control input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplacementControlInput {
+    pub solver: SolverInput,
+    /// Control node ID
+    pub control_node: usize,
+    /// Control DOF (0=ux, 1=uy, 2=rz)
+    pub control_dof: usize,
+    /// Target displacement at the control DOF
+    pub target_displacement: f64,
+    /// Number of displacement increments
+    #[serde(default = "default_n_disp_steps")]
+    pub n_steps: usize,
+    /// Max N-R iterations per step
+    #[serde(default = "default_max_iter")]
+    pub max_iter: usize,
+    /// Convergence tolerance
+    #[serde(default = "default_tol")]
+    pub tolerance: f64,
+}
+
+fn default_n_disp_steps() -> usize { 20 }
+
+/// Per-step snapshot on the equilibrium path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EquilibriumStep {
+    pub step: usize,
+    pub load_factor: f64,
+    pub control_displacement: f64,
+    pub converged: bool,
+    pub iterations: usize,
+}
+
+/// Arc-length analysis result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArcLengthResult {
+    pub results: AnalysisResults,
+    pub steps: Vec<EquilibriumStep>,
+    pub final_load_factor: f64,
+    pub converged: bool,
+    pub total_iterations: usize,
+}
+
+/// Displacement control result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplacementControlResult {
+    pub results: AnalysisResults,
+    pub steps: Vec<EquilibriumStep>,
+    pub final_load_factor: f64,
+    pub converged: bool,
+    pub total_iterations: usize,
+}
+
+/// Solve using Crisfield spherical arc-length method.
+pub fn solve_arc_length(input: &ArcLengthInput) -> Result<ArcLengthResult, String> {
+    // Assembly resolves ids by direct map indexing: an element naming a
+    // node that does not exist panicked there, which in WASM ends the
+    // module rather than the call.
+    super::linear::validate_input_2d(&input.solver)?;
+    // The co-rotational tangent here carries no prescribed displacements, and
+    // it treats temperature as fixed global forces (see
+    // `solve_corotational_2d`). Connectors are supported (fix/nonlinear-solvers,
+    // shear on a connector with length refused below) and inclined rollers are
+    // solved in their frames (fix/inclined-supports, checked against the
+    // rotated model).
+    super::feature_gates::refuse_2d(&input.solver, "Arc-length analysis", &[
+        super::feature_gates::Feature::PrescribedDisplacements,
+        super::feature_gates::Feature::ThermalLoads,
+    ])?;
+    crate::element::connector::refuse_for_corotational_2d(&input.solver, "Arc-length analysis")?;
+
+    let dof_num = DofNumbering::build_2d(&input.solver);
+    if dof_num.n_free == 0 {
+        return Err("No free DOFs".into());
+    }
+
+    let n = dof_num.n_total;
+    let nf = dof_num.n_free;
+
+    // Build constraint system (if constraints present)
+    let cs = FreeConstraintSystem::build_2d(&input.solver, &dof_num)?;
+    let ns = cs.as_ref().map_or(nf, |c| c.n_free_indep);
+
+    // At or above SPARSE_THRESHOLD independent DOFs the tangent is assembled
+    // as lower-triangle triplets feeding the CSC sparse solve — no O(n²)
+    // dense tangent is ever built; below the threshold, dense n×n as before.
+    let sparse = ns >= SPARSE_THRESHOLD;
+
+    // Sparse symbolic factorization cache (ns >= SPARSE_THRESHOLD only): the
+    // tangent's sparsity pattern is constant within a solve call, so the
+    // symbolic phase is computed once and only the numeric phase repeats
+    // per iteration.
+    let mut sparse_sym_cache: Option<SparseSymbolicCache> = None;
+
+    // Reference load vector
+    // f_ref, the tangent and `u_full` are in the inclined-roller frames the
+    // restraints are numbered in (`assemble_tangent` rotates); results are
+    // rotated back to global axes.
+    let asm = assembly::assemble_2d(&input.solver, &dof_num);
+    let art = assembly::artificial_stiffness_entries(&asm);
+    let its = asm.inclined_transforms_2d;
+    let f_ref: Vec<f64> = asm.f[..nf].to_vec();
+    let f_ref_s = if let Some(ref cs) = cs {
+        cs.reduce_vector(&f_ref)
+    } else {
+        f_ref.clone()
+    };
+    let f_ref_norm = vec_norm(&f_ref);
+    if f_ref_norm < 1e-15 {
+        return Err("Zero reference load".into());
+    }
+
+    let mut u_full = vec![0.0; n];
+    let mut lambda = 0.0_f64;
+    let mut ds = input.initial_ds;
+    let mut steps = Vec::new();
+    let mut total_iters = 0;
+    let mut overall_converged = true;
+
+    // Previous increment direction (for sign determination)
+    let mut prev_delta_u = vec![0.0; nf];
+    let mut prev_delta_lambda = 1.0_f64;
+
+    let mut step = 0;
+    while step < input.max_steps {
+        // Predictor: solve K_T * δu_hat = f_ref
+        let asm_t = assemble_tangent(&input.solver, &dof_num, &u_full, &art, sparse, &its);
+
+        let du_hat_s = {
+            // New tangent each step: factor once, solve the predictor RHS.
+            let tangent = factor_assembled(&asm_t, n, nf, ns, &cs, &mut sparse_sym_cache)?;
+            solve_with_tangent(&tangent, &f_ref_s, ns)?
+        };
+        let du_hat = if let Some(ref cs) = cs { cs.expand_solution(&du_hat_s) } else { du_hat_s };
+
+        // Determine Δλ from arc-length constraint
+        // ||Δu||² + Δλ² × ||f_ref||² = Δs²
+        let du_hat_norm = vec_norm(&du_hat);
+        let denom = du_hat_norm * du_hat_norm + f_ref_norm * f_ref_norm;
+        let mut delta_lambda = ds / denom.sqrt();
+
+        // Sign: follow previous direction
+        let dot = dot_product(&prev_delta_u, &du_hat) + prev_delta_lambda * delta_lambda * f_ref_norm * f_ref_norm;
+        if dot < 0.0 {
+            delta_lambda = -delta_lambda;
+        }
+
+        // Predictor step
+        let mut delta_u: Vec<f64> = du_hat.iter().map(|&v| delta_lambda * v).collect();
+
+        // Apply predictor
+        for i in 0..nf {
+            u_full[i] += delta_u[i];
+        }
+        lambda += delta_lambda;
+
+        // Corrector: N-R iterations with arc-length constraint
+        let mut step_converged = false;
+        let mut step_iters = 0;
+
+        for _iter in 0..input.max_iter {
+            step_iters += 1;
+            total_iters += 1;
+
+            // Compute residual
+            let asm_t = assemble_tangent(&input.solver, &dof_num, &u_full, &art, sparse, &its);
+            let f_int_new = &asm_t.f_int;
+
+            let mut residual = vec![0.0; nf];
+            for i in 0..nf {
+                residual[i] = lambda * f_ref[i] - f_int_new[i];
+            }
+
+            // Check convergence on independent (reduced) DOFs
+            let r_check = if let Some(ref cs) = cs {
+                cs.reduce_vector(&residual)
+            } else {
+                residual.clone()
+            };
+            let r_norm = vec_norm(&r_check);
+            let f_ext_norm = (lambda.abs() * f_ref_norm).max(1e-15);
+            if r_norm / f_ext_norm < input.tolerance {
+                step_converged = true;
+                break;
+            }
+
+            // Two-system solve with a single factorization per iteration:
+            // K_T * δu_r = R   (residual correction)
+            // K_T * δu_t = f_ref (tangent correction)
+            let residual_s = if let Some(ref cs) = cs { cs.reduce_vector(&residual) } else { residual.clone() };
+            let tangent = factor_assembled(&asm_t, n, nf, ns, &cs, &mut sparse_sym_cache)?;
+            let du_r_s = solve_with_tangent(&tangent, &residual_s, ns)?;
+            let du_t_s = solve_with_tangent(&tangent, &f_ref_s, ns)?;
+            let du_r = if let Some(ref cs) = cs { cs.expand_solution(&du_r_s) } else { du_r_s };
+            let du_t = if let Some(ref cs) = cs { cs.expand_solution(&du_t_s) } else { du_t_s };
+
+            // Arc-length constraint: quadratic equation for δλ
+            // a*δλ² + b*δλ + c = 0
+            let a_coeff = dot_product(&du_t, &du_t) + f_ref_norm * f_ref_norm;
+            let b_coeff = 2.0 * (dot_product(&delta_u, &du_t) + dot_product(&du_r, &du_t)
+                + delta_lambda * f_ref_norm * f_ref_norm);
+            let c_coeff = dot_product(&delta_u, &delta_u) + 2.0 * dot_product(&delta_u, &du_r)
+                + dot_product(&du_r, &du_r)
+                + delta_lambda * delta_lambda * f_ref_norm * f_ref_norm
+                - ds * ds;
+
+            let discriminant = b_coeff * b_coeff - 4.0 * a_coeff * c_coeff;
+            let d_lambda = if discriminant >= 0.0 {
+                let sqrt_d = discriminant.sqrt();
+                let root1 = (-b_coeff + sqrt_d) / (2.0 * a_coeff);
+                let root2 = (-b_coeff - sqrt_d) / (2.0 * a_coeff);
+
+                // Choose root that gives positive work (follows the path)
+                let du1: Vec<f64> = (0..nf).map(|i| du_r[i] + root1 * du_t[i]).collect();
+                let du2: Vec<f64> = (0..nf).map(|i| du_r[i] + root2 * du_t[i]).collect();
+                let work1 = dot_product(&delta_u, &du1);
+                let work2 = dot_product(&delta_u, &du2);
+
+                if work1 >= work2 { root1 } else { root2 }
+            } else {
+                // Negative discriminant: use minimum residual approach
+                -b_coeff / (2.0 * a_coeff)
+            };
+
+            // Update
+            for i in 0..nf {
+                let du_i = du_r[i] + d_lambda * du_t[i];
+                u_full[i] += du_i;
+                delta_u[i] += du_i;
+            }
+            lambda += d_lambda;
+            delta_lambda += d_lambda;
+        }
+
+        if !step_converged {
+            // Restore the last converged state FIRST, so that if the retry
+            // budget runs out the final results are built from the last
+            // converged equilibrium state — not from the failed step's
+            // unconverged iterate.
+            for i in 0..nf {
+                u_full[i] -= delta_u[i];
+            }
+            lambda -= delta_lambda;
+
+            // Halve arc-length and retry (don't consume step budget)
+            ds *= 0.5;
+            if ds < input.min_ds {
+                overall_converged = false;
+                break;
+            }
+            continue;
+        }
+
+        // Record converged step
+        step += 1;
+        steps.push(EquilibriumStep {
+            step,
+            load_factor: lambda,
+            control_displacement: u_full.get(0).copied().unwrap_or(0.0),
+            converged: true,
+            iterations: step_iters,
+        });
+
+        // Save direction for next step
+        prev_delta_u = delta_u;
+        prev_delta_lambda = delta_lambda;
+
+        // Adaptive arc-length
+        if step_iters <= input.target_iter / 2 {
+            ds = (ds * 2.0).min(input.max_ds);
+        } else if step_iters > input.target_iter * 2 {
+            ds = (ds * 0.5).max(input.min_ds);
+        }
+    }
+
+    // Build final results using corotational forces (not linear)
+    let u_global = assembly::to_global(&u_full[..nf], n, &its);
+    let displacements = super::linear::build_displacements_2d(&dof_num, &u_global);
+    let element_forces = super::corotational::compute_corotational_forces(&input.solver, &dof_num, &u_global);
+
+    // Compute constraint forces using final tangent stiffness
+    let constraint_forces = if let Some(ref fcs) = cs {
+        let asm_final = assemble_tangent(&input.solver, &dof_num, &u_full, &art, sparse, &its);
+        let raw = if sparse {
+            // Unreduced free-block CSC (lower triangle) for K_ff * u_f — the
+            // dense final tangent is never built on the sparse path.
+            let k_ff_csc = tangent_free_sparse_triplets(
+                &asm_final.trip_rows, &asm_final.trip_cols, &asm_final.trip_vals, nf, &None,
+            );
+            fcs.compute_constraint_forces_sparse(&k_ff_csc, &u_full[..nf], &asm_final.f_int[..nf])
+        } else {
+            let free_idx: Vec<usize> = (0..nf).collect();
+            let k_ff = extract_submatrix(&asm_final.k_t, n, &free_idx, &free_idx);
+            fcs.compute_constraint_forces(&k_ff, &u_full[..nf], &asm_final.f_int[..nf])
+        };
+        fcs.constraint_forces(&raw, &dof_num)
+    } else {
+        vec![]
+    };
+
+    Ok(ArcLengthResult {
+        results: AnalysisResults {
+            displacements,
+            reactions: vec![],
+            element_forces,
+            constraint_forces,
+            diagnostics: vec![],
+            solver_diagnostics: vec![],
+            structured_diagnostics: vec![],
+            equilibrium: None,
+            result_summary: None, solver_run_meta: None,
+        },
+        steps,
+        final_load_factor: lambda,
+        converged: overall_converged,
+        total_iterations: total_iters,
+    })
+}
+
+/// Solve using displacement control method.
+pub fn solve_displacement_control(input: &DisplacementControlInput) -> Result<DisplacementControlResult, String> {
+    // As above: validated before assembly indexes by id.
+    super::linear::validate_input_2d(&input.solver)?;
+    super::feature_gates::refuse_2d(&input.solver, "Displacement-control analysis", &[
+        super::feature_gates::Feature::PrescribedDisplacements,
+        super::feature_gates::Feature::InclinedSupports, super::feature_gates::Feature::ThermalLoads,
+    ])?;
+    crate::element::connector::refuse_for_corotational_2d(&input.solver, "Displacement-control analysis")?;
+
+    let dof_num = DofNumbering::build_2d(&input.solver);
+    if dof_num.n_free == 0 {
+        return Err("No free DOFs".into());
+    }
+
+    let n = dof_num.n_total;
+    let nf = dof_num.n_free;
+
+    // Build constraint system (if constraints present)
+    let cs_dc = FreeConstraintSystem::build_2d(&input.solver, &dof_num)?;
+    let ns_dc = cs_dc.as_ref().map_or(nf, |c| c.n_free_indep);
+
+    // At or above SPARSE_THRESHOLD independent DOFs the tangent is assembled
+    // as lower-triangle triplets feeding the CSC sparse solve — no O(n²)
+    // dense tangent is ever built; below the threshold, dense n×n as before.
+    let sparse = ns_dc >= SPARSE_THRESHOLD;
+
+    // Sparse symbolic factorization cache (ns >= SPARSE_THRESHOLD only): the
+    // tangent's sparsity pattern is constant within a solve call, so the
+    // symbolic phase is computed once and only the numeric phase repeats
+    // per iteration.
+    let mut sparse_sym_cache: Option<SparseSymbolicCache> = None;
+
+    // Find global DOF index for control point
+    let control_global = dof_num.map.get(&(input.control_node, input.control_dof))
+        .ok_or("Control node/DOF not found in free DOFs")?;
+    if *control_global >= nf {
+        return Err("Control DOF is restrained".into());
+    }
+    let ctrl = *control_global;
+
+    // Degenerate inputs, rejected before any work. These all reach here through
+    // the public WASM entry point, which deserializes the whole struct from
+    // caller JSON, so `n_steps` and `target_displacement` are whatever was sent.
+    // Without these the function returns `converged: true` for an analysis that
+    // never ran: `n_steps = 0` makes `delta_d` infinite and skips the step loop
+    // entirely, leaving the initial zero state to be reported as the answer.
+    if input.n_steps == 0 {
+        return Err("Number of displacement steps must be at least 1".into());
+    }
+    if input.max_iter == 0 {
+        return Err("Max iterations must be at least 1".into());
+    }
+    if !input.target_displacement.is_finite() || input.target_displacement == 0.0 {
+        return Err("Target displacement must be finite and non-zero".into());
+    }
+    if !input.tolerance.is_finite() || input.tolerance <= 0.0 {
+        return Err("Convergence tolerance must be finite and positive".into());
+    }
+
+    // Reference load
+    // f_ref, the tangent and `u_full` are in the inclined-roller frames the
+    // restraints are numbered in (`assemble_tangent` rotates); results are
+    // rotated back to global axes.
+    let asm = assembly::assemble_2d(&input.solver, &dof_num);
+    let art = assembly::artificial_stiffness_entries(&asm);
+    let its = asm.inclined_transforms_2d;
+    let f_ref: Vec<f64> = asm.f[..nf].to_vec();
+    let f_ref_s_dc = if let Some(ref cs) = cs_dc {
+        cs.reduce_vector(&f_ref)
+    } else {
+        f_ref.clone()
+    };
+    // Loop-invariant: f_ref is built once and never mutated.
+    let f_ref_norm = vec_norm(&f_ref);
+    // Same guard `solve_arc_length` applies. Without a reference load the
+    // tangent correction du_t is zero, so d_lambda is pinned at zero and the
+    // control DOF is never driven anywhere — the solver would burn
+    // n_steps * max_iter corotational assemblies to report a failure whose
+    // cause was in the input all along.
+    if f_ref_norm < 1e-15 {
+        return Err("Zero reference load".into());
+    }
+
+    let mut u_full = vec![0.0; n];
+    let mut lambda = 0.0_f64;
+    let mut steps = Vec::new();
+    let mut total_iters = 0;
+    let mut overall_converged = true;
+
+    let delta_d = input.target_displacement / input.n_steps as f64;
+    // Scale for the displacement side of the convergence test. See the check
+    // itself for why it must be relative.
+    let disp_scale = delta_d.abs();
+    // #174 hoisted a loop-invariant `free_idx` here for the dense
+    // `extract_submatrix` call in the iteration. `factor_assembled` owns that
+    // extraction now and builds the index vector only on the branch that needs
+    // it, so the hoisted copy has no remaining reader.
+
+    for step in 0..input.n_steps {
+        let target_disp = (step + 1) as f64 * delta_d;
+
+        // N-R iterations
+        let mut step_converged = false;
+        let mut step_iters = 0;
+
+        for _iter in 0..input.max_iter {
+            step_iters += 1;
+            total_iters += 1;
+
+            // Compute tangent stiffness and internal forces
+            let asm_t = assemble_tangent(&input.solver, &dof_num, &u_full, &art, sparse, &its);
+            let f_int = &asm_t.f_int;
+
+            // Residual
+            let mut residual = vec![0.0; nf];
+            for i in 0..nf {
+                residual[i] = lambda * f_ref[i] - f_int[i];
+            }
+
+            // Displacement constraint: u[ctrl] = target_disp
+            let disp_error = target_disp - u_full[ctrl];
+
+            // Reduce once. This vector is BOTH what the convergence test has to
+            // measure and the right-hand side the Newton step needs, so computing
+            // it here costs nothing extra and removes a full copy of the residual
+            // on the unconstrained path.
+            //
+            // Measuring the reduced residual is the correctness point. The Newton
+            // step below solves the reduced system (Cᵀ K C, Cᵀ R), so the iteration
+            // drives Cᵀ R to zero — not R. At a constrained equilibrium R equals the
+            // constraint reaction forces and stays nonzero forever, so testing the
+            // full residual meant no constrained model could ever converge: step 1
+            // exhausted max_iter and the whole analysis was truncated after it.
+            // `solve_arc_length` has always reduced here.
+            let residual_s = if let Some(ref cs) = cs_dc {
+                cs.reduce_vector(&residual)
+            } else {
+                residual
+            };
+            let r_norm = vec_norm(&residual_s);
+            let f_ext_norm = (lambda.abs() * f_ref_norm).max(1.0);
+            // The displacement side is measured RELATIVE to the increment this step
+            // asks for. It used to be `disp_error.abs() < tolerance * 10.0`, which
+            // compares a displacement in model units against the dimensionless
+            // residual tolerance: any step whose increment happened to be smaller
+            // than that figure was declared converged having done no work at all.
+            // With target 1e-7 over 20 steps, 19 of the 20 reported path points sat
+            // at the origin with load factor zero and only the last did anything —
+            // a fabricated equilibrium path from a method whose entire purpose is
+            // to trace the real one.
+            let disp_ok = disp_error.abs() <= input.tolerance * disp_scale;
+            if r_norm / f_ext_norm < input.tolerance && disp_ok {
+                step_converged = true;
+                break;
+            }
+
+            // Two-system solve with a single factorization per iteration:
+            // K_T * δu_r = R   (residual correction)
+            // K_T * δu_t = f_ref (tangent correction)
+            //
+            // `residual_s` is the reduced residual the convergence test above
+            // already built — the same vector this right-hand side needs. An
+            // earlier version of this branch shadowed it with a second
+            // `cs.reduce_vector(&residual)`, which is the recompute #174
+            // removed; the sparse dispatch below does not need it back.
+            let tangent = factor_assembled(&asm_t, n, nf, ns_dc, &cs_dc, &mut sparse_sym_cache)?;
+            let du_r_s = solve_with_tangent(&tangent, &residual_s, ns_dc)?;
+            let du_t_s = solve_with_tangent(&tangent, &f_ref_s_dc, ns_dc)?;
+            let du_r = if let Some(ref cs) = cs_dc { cs.expand_solution(&du_r_s) } else { du_r_s };
+            let du_t = if let Some(ref cs) = cs_dc { cs.expand_solution(&du_t_s) } else { du_t_s };
+
+            // Determine δλ from displacement constraint:
+            // (u[ctrl] + δu_r[ctrl] + δλ * δu_t[ctrl]) = target_disp
+            // δλ = (target_disp - u[ctrl] - δu_r[ctrl]) / δu_t[ctrl]
+            let d_lambda = if du_t[ctrl].abs() > 1e-15 {
+                (disp_error - du_r[ctrl]) / du_t[ctrl]
+            } else {
+                0.0
+            };
+
+            // Update
+            for i in 0..nf {
+                u_full[i] += du_r[i] + d_lambda * du_t[i];
+            }
+            lambda += d_lambda;
+        }
+
+        steps.push(EquilibriumStep {
+            step: step + 1,
+            load_factor: lambda,
+            control_displacement: u_full[ctrl],
+            converged: step_converged,
+            iterations: step_iters,
+        });
+
+        if !step_converged {
+            overall_converged = false;
+            break;
+        }
+    }
+
+    let u_global = assembly::to_global(&u_full[..nf], n, &its);
+    let displacements = super::linear::build_displacements_2d(&dof_num, &u_global);
+    let element_forces = super::corotational::compute_corotational_forces(&input.solver, &dof_num, &u_global);
+
+    // Compute constraint forces using final tangent stiffness
+    let constraint_forces = if let Some(ref fcs) = cs_dc {
+        let asm_final = assemble_tangent(&input.solver, &dof_num, &u_full, &art, sparse, &its);
+        let raw = if sparse {
+            // Unreduced free-block CSC (lower triangle) for K_ff * u_f — the
+            // dense final tangent is never built on the sparse path.
+            let k_ff_csc = tangent_free_sparse_triplets(
+                &asm_final.trip_rows, &asm_final.trip_cols, &asm_final.trip_vals, nf, &None,
+            );
+            fcs.compute_constraint_forces_sparse(&k_ff_csc, &u_full[..nf], &asm_final.f_int[..nf])
+        } else {
+            let free_idx: Vec<usize> = (0..nf).collect();
+            let k_ff = extract_submatrix(&asm_final.k_t, n, &free_idx, &free_idx);
+            fcs.compute_constraint_forces(&k_ff, &u_full[..nf], &asm_final.f_int[..nf])
+        };
+        fcs.constraint_forces(&raw, &dof_num)
+    } else {
+        vec![]
+    };
+
+    Ok(DisplacementControlResult {
+        results: AnalysisResults {
+            displacements,
+            reactions: vec![],
+            element_forces,
+            constraint_forces,
+            diagnostics: vec![],
+            solver_diagnostics: vec![],
+            structured_diagnostics: vec![],
+            equilibrium: None,
+            result_summary: None, solver_run_meta: None,
+        },
+        steps,
+        final_load_factor: lambda,
+        converged: overall_converged,
+        total_iterations: total_iters,
+    })
+}
+
+// ==================== Helpers ====================
+
+fn vec_norm(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+fn dot_product(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Tangent stiffness factored once, reusable for multiple right-hand sides.
+/// The dense decompositions (Cholesky with LU fallback) match what the
+/// previous per-RHS solve did, so one factor for two RHS gives identical
+/// results to factoring twice. Above `SPARSE_THRESHOLD` independent DOFs the
+/// tangent is factored with sparse Cholesky instead (symbolic phase cached
+/// per solve call in `SparseSymbolicCache`).
+enum FactoredTangent {
+    /// Cholesky factor L (lower triangle stored in n*n array)
+    Cholesky { l: Vec<f64> },
+    /// LU decomposition with partial pivoting
+    Lu { a: Vec<f64>, piv: Vec<usize> },
+    /// Sparse Cholesky numeric factor (ns >= SPARSE_THRESHOLD)
+    Sparse { num: NumericCholesky },
+}
+
+/// Factor K_T once for repeated solves over multiple right-hand sides.
+///
+/// `k_ff` is the dense free block; constraint reduction happens inside:
+/// sparse (`reduce_matrix_sparse`) at or above `SPARSE_THRESHOLD` independent
+/// DOFs, dense (`reduce_matrix`) below it, keeping the dense path
+/// byte-identical to before.
+fn factor_tangent(
+    k_ff: &[f64],
+    nf: usize,
+    ns: usize,
+    cs: &Option<FreeConstraintSystem>,
+    cache: &mut Option<SparseSymbolicCache>,
+) -> Result<FactoredTangent, String> {
+    if ns >= SPARSE_THRESHOLD {
+        let k_s_csc = tangent_free_sparse(k_ff, nf, cs);
+        return factor_tangent_sparse(&k_s_csc, ns, cache);
+    }
+
+    let k_s = if let Some(ref cs) = cs { cs.reduce_matrix(k_ff) } else { k_ff.to_vec() };
+    let mut l = k_s.clone();
+    if cholesky_decompose(&mut l, ns) {
+        return Ok(FactoredTangent::Cholesky { l });
+    }
+    factor_tangent_lu(k_s, ns)
+}
+
+/// Sparse factorization of an already constraint-reduced CSC tangent:
+/// symbolic factorization is cached across iterations (the pattern is
+/// constant within a solve call); if the numeric phase reports a non-SPD
+/// tangent, falls back to dense LU, size-capped by `MAX_DENSE_FALLBACK_DOFS` —
+/// mirrors `sparse_tangent::solve_tangent_sparse` /
+/// `time_integration::factor_effective_stiffness`.
+fn factor_tangent_sparse(
+    k_s_csc: &CscMatrix,
+    ns: usize,
+    cache: &mut Option<SparseSymbolicCache>,
+) -> Result<FactoredTangent, String> {
+    let sym = cached_symbolic(cache, k_s_csc);
+    if let Some(num) = numeric_cholesky(sym, k_s_csc) {
+        return Ok(FactoredTangent::Sparse { num });
+    }
+    // Sparse Cholesky reports a non-SPD tangent: dense LU fallback,
+    // size-capped like corotational/time_integration.
+    if ns > MAX_DENSE_FALLBACK_DOFS {
+        return Err(format!(
+            "Tangent stiffness is not SPD (sparse Cholesky) and the dense LU fallback would need a {ns}×{ns} dense matrix ({} MB), over the {MAX_DENSE_FALLBACK_DOFS}-DOF ceiling",
+            8 * ns * ns / 1_000_000
+        ));
+    }
+    factor_tangent_lu(k_s_csc.to_dense_symmetric(), ns)
+}
+
+/// Dense LU factorization with partial pivoting — identical factorization
+/// phase to `lu_solve`. Shared by the below-threshold path and the sparse
+/// non-SPD fallback.
+fn factor_tangent_lu(k_s: Vec<f64>, ns: usize) -> Result<FactoredTangent, String> {
+    let mut a = k_s;
+    let mut piv: Vec<usize> = (0..ns).collect();
+
+    for k in 0..ns {
+        let mut max_val = a[piv[k] * ns + k].abs();
+        let mut max_row = k;
+        for i in (k + 1)..ns {
+            let val = a[piv[i] * ns + k].abs();
+            if val > max_val {
+                max_val = val;
+                max_row = i;
+            }
+        }
+
+        if max_val < 1e-14 {
+            return Err("Singular tangent stiffness".to_string());
+        }
+
+        piv.swap(k, max_row);
+
+        let pivot = a[piv[k] * ns + k];
+        for i in (k + 1)..ns {
+            let factor = a[piv[i] * ns + k] / pivot;
+            a[piv[i] * ns + k] = factor;
+            for j in (k + 1)..ns {
+                let val = a[piv[k] * ns + j];
+                a[piv[i] * ns + j] -= factor * val;
+            }
+        }
+    }
+
+    Ok(FactoredTangent::Lu { a, piv })
+}
+
+/// Solve with a pre-factored tangent. The dense substitution steps are
+/// identical to `cholesky_solve` / `lu_solve`, so dense results match a
+/// fresh per-RHS solve bit for bit.
+fn solve_with_tangent(factored: &FactoredTangent, rhs: &[f64], nf: usize) -> Result<Vec<f64>, String> {
+    match factored {
+        FactoredTangent::Cholesky { l } => {
+            let y = forward_solve(l, rhs, nf);
+            Ok(back_solve(l, &y, nf))
+        }
+        FactoredTangent::Lu { a, piv } => {
+            // Forward substitution (Ly = Pb)
+            let mut y = vec![0.0; nf];
+            for i in 0..nf {
+                y[i] = rhs[piv[i]];
+                for j in 0..i {
+                    y[i] -= a[piv[i] * nf + j] * y[j];
+                }
+            }
+            // Back substitution (Ux = y)
+            let mut x = vec![0.0; nf];
+            for i in (0..nf).rev() {
+                x[i] = y[i];
+                for j in (i + 1)..nf {
+                    x[i] -= a[piv[i] * nf + j] * x[j];
+                }
+                x[i] /= a[piv[i] * nf + i];
+            }
+            // Same NaN/Inf guard as `lu_solve`
+            if x.iter().any(|v| v.is_nan() || v.is_infinite()) {
+                return Err("Singular tangent stiffness".to_string());
+            }
+            Ok(x)
+        }
+        FactoredTangent::Sparse { num } => Ok(sparse_cholesky_solve(num, rhs)),
+    }
+}
+
+// Sparse symbolic factorization cache and tangent conversion helpers now
+// live in `super::sparse_tangent` (shared with corotational and contact).
+
+/// Co-rotational tangent + internal forces for one Newton iteration: dense n×n
+/// tangent below `SPARSE_THRESHOLD`, lower-triangle (gi >= gj) COO triplets at
+/// or above it — the sparse path never materializes the O(n²) dense tangent.
+/// `f_int` is accumulated over ALL n DOFs identically in both paths.
+struct TangentAssembly {
+    f_int: Vec<f64>,
+    /// Dense n×n tangent (dense path only; empty on the sparse path)
+    k_t: Vec<f64>,
+    /// Lower-triangle triplets (sparse path only)
+    trip_rows: Vec<usize>,
+    trip_cols: Vec<usize>,
+    trip_vals: Vec<f64>,
+}
+
+/// `u_frame` and the returned tangent and `f_int` are in the inclined-roller
+/// frames `its`; the elements see the displacement in global axes.
+fn assemble_tangent(
+    input: &SolverInput,
+    dof_num: &DofNumbering,
+    u_frame: &[f64],
+    art: &[(usize, f64)],
+    sparse: bool,
+    its: &[InclinedTransformData2D],
+) -> TangentAssembly {
+    let n = dof_num.n_total;
+    let u_global = assembly::to_global(&u_frame[..dof_num.n_free], n, its);
+    let u_full = &u_global[..];
+    let mut f_int = vec![0.0; n];
+    let mut k_t: Vec<f64> = Vec::new();
+    let mut trip_rows: Vec<usize> = Vec::new();
+    let mut trip_cols: Vec<usize> = Vec::new();
+    let mut trip_vals: Vec<f64> = Vec::new();
+
+    if sparse {
+        assemble_corotational_triplets_2d(
+            input, dof_num, u_full, &mut f_int,
+            &mut trip_rows, &mut trip_cols, &mut trip_vals,
+        );
+        // Springs, connectors and artificial stiffness, shared with the
+        // co-rotational solver (off-diagonal entries included).
+        add_spring_contributions(input, dof_num, u_full, &mut f_int, art, &mut |gi, gj, v| {
+            if gi >= gj {
+                trip_rows.push(gi);
+                trip_cols.push(gj);
+                trip_vals.push(v);
+            }
+        });
+    } else {
+        k_t = vec![0.0; n * n];
+        assemble_corotational_public(input, dof_num, u_full, &mut f_int, &mut k_t);
+        add_spring_contributions(input, dof_num, u_full, &mut f_int, art, &mut |gi, gj, v| {
+            k_t[gi * n + gj] += v;
+        });
+    }
+
+    for it in its {
+        if sparse {
+            it.rotate_triplets(&mut trip_rows, &mut trip_cols, &mut trip_vals);
+        } else {
+            it.rotate_dense(&mut k_t, n);
+        }
+        it.rotate(&mut f_int);
+    }
+
+    TangentAssembly { f_int, k_t, trip_rows, trip_cols, trip_vals }
+}
+
+/// Factor the assembled tangent once for repeated solves over multiple
+/// right-hand sides. Sparse path: free×free triplets -> constraint-reduced CSC
+/// -> cached-symbolic sparse Cholesky. Dense path: extract the free block and
+/// factor exactly as before.
+fn factor_assembled(
+    asm: &TangentAssembly,
+    n: usize,
+    nf: usize,
+    ns: usize,
+    cs: &Option<FreeConstraintSystem>,
+    cache: &mut Option<SparseSymbolicCache>,
+) -> Result<FactoredTangent, String> {
+    if ns >= SPARSE_THRESHOLD {
+        let k_s_csc = tangent_free_sparse_triplets(
+            &asm.trip_rows, &asm.trip_cols, &asm.trip_vals, nf, cs,
+        );
+        return factor_tangent_sparse(&k_s_csc, ns, cache);
+    }
+    let free_idx: Vec<usize> = (0..nf).collect();
+    let k_ff = extract_submatrix(&asm.k_t, n, &free_idx, &free_idx);
+    factor_tangent(&k_ff, nf, ns, cs, cache)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_cantilever() -> SolverInput {
+        let mut nodes = HashMap::new();
+        nodes.insert("0".into(), SolverNode { id: 0, x: 0.0, z: 0.0 });
+        nodes.insert("1".into(), SolverNode { id: 1, x: 5.0, z: 0.0 });
+
+        let mut materials = HashMap::new();
+        materials.insert("1".into(), SolverMaterial { id: 1, e: 200_000.0, nu: 0.3 });
+
+        let mut sections = HashMap::new();
+        sections.insert("1".into(), SolverSection { id: 1, a: 0.01, iz: 1e-4, as_y: None });
+
+        let mut elements = HashMap::new();
+        elements.insert("1".into(), SolverElement {
+            id: 1, elem_type: "frame".into(),
+            node_i: 0, node_j: 1, material_id: 1, section_id: 1,
+            hinge_start: false, hinge_end: false,
+        });
+
+        let mut supports = HashMap::new();
+        supports.insert("0".into(), SolverSupport {
+            id: 0, node_id: 0, support_type: "fixed".into(),
+            kx: None, ky: None, kz: None,
+            dx: None, dz: None, dry: None, angle: None,
+        });
+
+        SolverInput {
+            solver_options: None,
+            nodes, materials, sections, elements, supports,
+            loads: vec![SolverLoad::Nodal(SolverNodalLoad {
+                node_id: 1, fx: 0.0, fz: -10.0, my: 0.0,
+            })],
+            constraints: vec![],
+            connectors: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_displacement_control_basic() {
+        let solver = make_cantilever();
+        let input = DisplacementControlInput {
+            solver,
+            control_node: 1,
+            control_dof: 1, // uy
+            target_displacement: -0.01,
+            n_steps: 5,
+            max_iter: 30,
+            tolerance: 1e-6,
+        };
+        let result = solve_displacement_control(&input).unwrap();
+        assert!(result.converged, "Should converge");
+        assert!(result.steps.len() > 0);
+
+        // Control DOF should reach target
+        let d1 = result.results.displacements.iter().find(|d| d.node_id == 1).unwrap();
+        assert!(
+            (d1.uz - (-0.01)).abs() < 1e-4,
+            "Control DOF: got {} expected -0.01", d1.uz
+        );
+    }
+
+    #[test]
+    fn test_arc_length_basic() {
+        let solver = make_cantilever();
+        let input = ArcLengthInput {
+            solver,
+            max_steps: 20,
+            max_iter: 30,
+            tolerance: 1e-6,
+            initial_ds: 0.5,
+            min_ds: 1e-6,
+            max_ds: 2.0,
+            target_iter: 5,
+        };
+        let result = solve_arc_length(&input).unwrap();
+        assert!(result.steps.len() > 0, "Should have at least one step");
+
+        // For a linear cantilever, arc-length should trace the path
+        // Load factor should be positive after the first step
+        if let Some(last) = result.steps.last() {
+            assert!(last.load_factor > 0.0, "Load factor should be positive");
+        }
+    }
+
+    #[test]
+    fn test_arc_length_abort_returns_last_converged_state() {
+        // Force the abort path: max_iter = 1 cannot converge a genuinely
+        // nonlinear large-load step, and ds halves below min_ds quickly.
+        // The final results must reflect the last converged state (here:
+        // no converged step -> zero displacements, zero load factor), not
+        // the failed step's unconverged iterate.
+        let solver = make_cantilever();
+        let input = ArcLengthInput {
+            solver,
+            max_steps: 10,
+            max_iter: 1,
+            tolerance: 1e-6,
+            initial_ds: 0.5,
+            min_ds: 0.1,
+            max_ds: 2.0,
+            target_iter: 5,
+        };
+        let result = solve_arc_length(&input).unwrap();
+        assert!(!result.converged, "Should report non-convergence");
+        assert!(result.steps.is_empty(), "No step should have converged");
+        assert!(
+            result.final_load_factor == 0.0,
+            "Load factor should be restored to 0.0, got {}",
+            result.final_load_factor
+        );
+        for d in &result.results.displacements {
+            assert!(
+                d.ux.abs() < 1e-15 && d.uz.abs() < 1e-15 && d.ry.abs() < 1e-15,
+                "Displacements should be the last converged (zero) state, got ux={} uz={} ry={} at node {}",
+                d.ux, d.uz, d.ry, d.node_id
+            );
+        }
+    }
+}

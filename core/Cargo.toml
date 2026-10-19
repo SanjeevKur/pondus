@@ -1,0 +1,18 @@
+[package]
+name = "pondus-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pondus core: the structural model, analysis with the Stabileo engine, RC and steel design, and the MCP server"
+license = "AGPL-3.0-only"
+authors = ["Sompote Youwai"]
+repository = "https://github.com/Sompote/pondus"
+
+[dependencies]
+dedaliano-engine = { path = "../engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = "0.17"
+krilla = "0.8.2"
+rust_xlsxwriter = "0.100"
+calamine = "0.26"
+ttf-parser = "0.25"

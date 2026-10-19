@@ -1,0 +1,38 @@
+# Vendored from Stabileo (github.com/lambdaclass/stabileo, engine/ at commit
+# 7985e8c59605e26fcff75516ccf02f580809c570), AGPL-3.0-only. This manifest drops the wasm cdylib,
+# benches and dev-dependencies so Pondus builds it as a native library. Two source changes, marked
+# [Pondus]: solver/winkler.rs, the sign of the w-θy coupling of the z foundation matrix (a bug);
+# solver/plastic_3d.rs, a sparse Cholesky test before the dense rank test of each event (speed only).
+[package]
+name = "dedaliano-engine"
+version = "0.2.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+authors = ["Dedaliano Team"]
+description = "High-performance 2D/3D structural analysis engine (vendored from Stabileo)"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+parallel = ["rayon"]
+manual-bench-phases = []
+
+[dependencies]
+wasm-bindgen = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-wasm-bindgen = "0.6"
+spade = { version = "2.15", default-features = false }
+num-bigint = "0.4"
+num-rational = { version = "0.4", default-features = false, features = ["num-bigint-std", "std"] }
+num-traits = "0.2"
+num-integer = "0.1"
+console_error_panic_hook = { version = "0.1", optional = true }
+web-sys = { version = "0.3", features = ["console"] }
+rayon = { version = "1.10", optional = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

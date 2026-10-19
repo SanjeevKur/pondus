@@ -1,0 +1,15 @@
+# build output
+/target/
+**/*.rs.bk
+.DS_Store
+
+# paper build intermediates (paper.pdf, the figures and the sources are kept)
+/paper/*.png
+/paper/build.log
+/paper/paper.log
+/paper/paper.tex
+/paper/paper_full.md
+/paper/generated/
+
+# third-party reference material kept locally only (cited by URL in calibration/NOTES_*.md)
+/calibration/sources/

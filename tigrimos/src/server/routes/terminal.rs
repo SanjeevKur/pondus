@@ -1,0 +1,128 @@
+use std::sync::Arc;
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Json},
+    routing::{get, post},
+    Router,
+};
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::server::AppState;
+
+// ---------------------------------------------------------------------------
+// Request types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ExecBody {
+    command: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+/// POST /exec — execute a shell command and return stdout, stderr, exitCode
+async fn exec_command(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ExecBody>,
+) -> impl IntoResponse {
+    let command = match &body.command {
+        Some(c) if !c.is_empty() => c.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "No command provided"})),
+            )
+        }
+    };
+
+    let cwd = if state.sandbox_dir.is_empty() {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string())
+    } else {
+        state.sandbox_dir.clone()
+    };
+
+    // Hard timeout + kill_on_drop: an interactive/hung command (top, vim, a
+    // server) would otherwise block this handler forever and leak the child
+    // process — enough of those accumulate to exhaust the host.
+    // Cross-platform shell: cmd.exe on Windows, /bin/sh elsewhere.
+    #[cfg(target_os = "windows")]
+    let mut shell = {
+        let mut c = tokio::process::Command::new("cmd.exe");
+        c.arg("/C").arg(&command);
+        c
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut shell = {
+        let mut c = tokio::process::Command::new("/bin/bash");
+        c.arg("-c").arg(&command);
+        c
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        shell
+            .current_dir(&cwd)
+            .env("TERM", "dumb")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+
+    let result = match result {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "stdout": "",
+                    "stderr": "Command timed out after 120s and was killed.",
+                    "exitCode": 124,
+                })),
+            )
+        }
+    };
+
+    match result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let exit_code = output.status.code().unwrap_or(1);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exitCode": exit_code,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": e.to_string(),
+                "exitCode": 1,
+            })),
+        ),
+    }
+}
+
+/// GET /history — stub returning empty array
+async fn get_history() -> impl IntoResponse {
+    Json(json!([]))
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/exec", post(exec_command))
+        .route("/history", get(get_history))
+}

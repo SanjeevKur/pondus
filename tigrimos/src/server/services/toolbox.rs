@@ -1,0 +1,11785 @@
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::fs;
+use tokio::process::Command;
+use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::time::{timeout, Duration};
+use tracing::{error, info, warn};
+use crate::server::services::protocols;
+use crate::server::services::compact;
+use crate::server::services::mcp;
+use crate::server::services::proc_registry;
+
+// ---------------------------------------------------------------------------
+// Per-session process execution context
+// ---------------------------------------------------------------------------
+//
+// Set around every tool dispatch (see execute_tool_dispatch) so that any child
+// process spawned deep inside a tool can be attributed to the owning session
+// and watched against that session's cancel flag — without threading both
+// values through every exec_* signature. Reads gracefully return None for
+// utility call paths that run outside a dispatch scope.
+#[derive(Clone)]
+struct ExecCtx {
+    session_id: String,
+    cancel: Arc<AtomicBool>,
+}
+
+tokio::task_local! {
+    static EXEC_CTX: ExecCtx;
+}
+
+/// Spawn `cmd` in its own process group, track it under the current session,
+/// and await completion against BOTH a timeout and the session cancel flag.
+///
+/// Drop-in for `timeout(Duration::from_secs(secs), cmd.kill_on_drop(true).output())`:
+/// returns `Ok(Ok(output))` when the process ran, `Ok(Err(e))` when it failed to
+/// spawn, and `Err(())` when it timed out or the chat task was killed. On the
+/// `Err(())` paths the whole process group is SIGKILLed so no child (or
+/// grandchild) outlives the cancellation.
+async fn run_guarded(
+    cmd: &mut Command,
+    timeout_secs: u64,
+) -> Result<std::io::Result<std::process::Output>, ()> {
+    #[cfg(unix)]
+    cmd.process_group(0); // child becomes its own group leader (pgid == pid)
+    cmd.kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let ctx = EXEC_CTX.try_with(|c| c.clone()).ok();
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Ok(Err(e)),
+    };
+    let pid = child.id();
+    if let (Some(ctx), Some(pid)) = (ctx.as_ref(), pid) {
+        proc_registry::register(&ctx.session_id, pid);
+    }
+
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
+    let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(deadline);
+
+    let outcome = loop {
+        tokio::select! {
+            out = &mut wait => break Some(out),
+            _ = &mut deadline => break None, // timed out
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                // Poll the session cancel flag between waits so a chat-kill
+                // interrupts a long-running process promptly.
+                if ctx.as_ref().map(|c| c.cancel.load(Ordering::Relaxed)).unwrap_or(false) {
+                    break None;
+                }
+            }
+        }
+    };
+
+    if let (Some(ctx), Some(pid)) = (ctx.as_ref(), pid) {
+        proc_registry::unregister(&ctx.session_id, pid);
+    }
+
+    match outcome {
+        Some(out) => Ok(out),
+        None => {
+            if let Some(pid) = pid {
+                proc_registry::kill_group(pid);
+            }
+            Err(())
+        }
+    }
+}
+
+/// Distinguish a user-cancelled run from a genuine timeout for an `Err(())`
+/// returned by `run_guarded`.
+fn interrupted_reason(timeout_secs: u64) -> String {
+    let cancelled = EXEC_CTX
+        .try_with(|c| c.cancel.load(Ordering::Relaxed))
+        .unwrap_or(false);
+    if cancelled {
+        "Execution stopped: task was cancelled by user".to_string()
+    } else {
+        format!("Execution timed out ({timeout_secs}s)")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Find python binary — checks PATH first, then common platform-specific locations.
+/// True when a python candidate actually runs. On Windows, `where python`
+/// happily returns the Microsoft Store ALIAS STUB in \Microsoft\WindowsApps\ —
+/// a fake exe that exits 9009 with "install from the Microsoft Store". Never
+/// accept a candidate without a successful --version probe.
+#[cfg(target_os = "windows")]
+fn python_candidate_works(path: &str) -> bool {
+    if path.to_lowercase().contains("\\microsoft\\windowsapps\\") {
+        return false;
+    }
+    std::process::Command::new(path)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub(crate) fn find_python() -> String {
+    // A caller that chose the interpreter (e.g. an app embedding the CLI) passes it in
+    // TIGRIMOS_PYTHON; it wins when the file exists.
+    if let Ok(p) = std::env::var("TIGRIMOS_PYTHON") {
+        if !p.trim().is_empty() && std::path::Path::new(p.trim()).is_file() {
+            return p.trim().to_string();
+        }
+    }
+    // On Windows, try "python" first (standard), then "python3"
+    // On Unix, try "python3" first, then "python"
+    #[cfg(target_os = "windows")]
+    let (primary, secondary) = ("python", "python3");
+    #[cfg(not(target_os = "windows"))]
+    let (primary, secondary) = ("python3", "python");
+
+    // Try `which` (Unix) or `where` (Windows) to find in PATH
+    #[cfg(target_os = "windows")]
+    let which_cmd = "where";
+    #[cfg(not(target_os = "windows"))]
+    let which_cmd = "/usr/bin/which";
+
+    for name in &[primary, secondary] {
+        if let Ok(output) = std::process::Command::new(which_cmd).arg(name).output() {
+            if output.status.success() {
+                #[cfg(target_os = "windows")]
+                {
+                    // `where` can return several matches — take the first one
+                    // that is not the Store alias stub and actually runs.
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        let path = line.trim();
+                        if !path.is_empty() && python_candidate_works(path) {
+                            return path.to_string();
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let path = String::from_utf8_lossy(&output.stdout)
+                        .lines().next().unwrap_or("").trim().to_string();
+                    if !path.is_empty() {
+                        return path;
+                    }
+                }
+            }
+        }
+    }
+
+    // Platform-specific fallback locations
+    #[cfg(target_os = "macos")]
+    {
+        for candidate in &[
+            "/usr/bin/python3",
+            "/usr/local/bin/python3",
+            "/opt/homebrew/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+        ] {
+            if std::path::Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for candidate in &["/usr/bin/python3", "/usr/local/bin/python3", "/usr/bin/python"] {
+            if std::path::Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Check common Windows Python install locations (winget user scope)
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let programs = std::path::PathBuf::from(&local).join("Programs").join("Python");
+            if let Ok(entries) = std::fs::read_dir(&programs) {
+                for entry in entries.flatten() {
+                    let py = entry.path().join("python.exe");
+                    if py.exists() && python_candidate_works(&py.to_string_lossy()) {
+                        return py.to_string_lossy().to_string();
+                    }
+                }
+            }
+        }
+        // Conda-family distributions (Miniforge3 via winget, Miniconda,
+        // Anaconda): python.exe sits at the distribution ROOT and is NOT on
+        // PATH by default — seen in the field: winget listed Miniforge3 as
+        // installed while `where python` only found the Store alias stub.
+        let mut bases: Vec<String> = Vec::new();
+        for var in ["USERPROFILE", "LOCALAPPDATA"] {
+            if let Ok(p) = std::env::var(var) {
+                bases.push(p);
+            }
+        }
+        bases.push(r"C:\".to_string());
+        for base in &bases {
+            for distro in ["miniforge3", "Miniforge3", "miniconda3", "Miniconda3", "anaconda3", "Anaconda3", "mambaforge"] {
+                let py = std::path::Path::new(base).join(distro).join("python.exe");
+                if py.exists() && python_candidate_works(&py.to_string_lossy()) {
+                    return py.to_string_lossy().to_string();
+                }
+            }
+        }
+        // Machine-wide installer default: C:\Program Files\Python3xx\
+        for pf in [r"C:\Program Files", r"C:\Program Files (x86)"] {
+            if let Ok(entries) = std::fs::read_dir(pf) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_lowercase();
+                    if name.starts_with("python") {
+                        let py = entry.path().join("python.exe");
+                        if py.exists() && python_candidate_works(&py.to_string_lossy()) {
+                            return py.to_string_lossy().to_string();
+                        }
+                    }
+                }
+            }
+        }
+        for candidate in &[
+            r"C:\Python312\python.exe",
+            r"C:\Python311\python.exe",
+            r"C:\Python310\python.exe",
+            r"C:\Python39\python.exe",
+        ] {
+            if std::path::Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+    }
+
+    primary.to_string()
+}
+
+/// Ensure PATH includes common tool locations (for .app bundles / Windows shortcuts).
+fn ensure_full_path() {
+    let current = std::env::var("PATH").unwrap_or_default();
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if !current.contains("/opt/homebrew/bin") || !current.contains("/usr/local/bin") {
+            let full = format!(
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{}",
+                current
+            );
+            std::env::set_var("PATH", full);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Ensure common Windows Python/tool paths are on PATH
+        let mut extra = Vec::new();
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let programs = std::path::PathBuf::from(&local).join("Programs").join("Python");
+            if let Ok(entries) = std::fs::read_dir(&programs) {
+                for entry in entries.flatten() {
+                    let dir = entry.path();
+                    if dir.is_dir() {
+                        extra.push(dir.to_string_lossy().to_string());
+                        extra.push(dir.join("Scripts").to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+
+        // Repair PATHs missing the Windows system directories. Broken installers
+        // and unexpanded %SystemRoot% registry entries do strip them, and without
+        // System32 even `where`, `find`, `tasklist` and a nested `cmd` fail with
+        // "'x' is not recognized" (seen in the field: powershell resolved via its
+        // own PATH entry while System32 itself was gone). Compare whole PATH
+        // entries, NOT substrings — the WindowsPowerShell entry contains
+        // "System32" as a substring and would mask a missing System32 entry.
+        let sysroot = std::env::var("SystemRoot")
+            .or_else(|_| std::env::var("windir"))
+            .unwrap_or_else(|_| "C:\\Windows".to_string());
+        let entries: Vec<String> = current
+            .split(';')
+            .map(|e| e.trim().trim_end_matches('\\').to_lowercase())
+            .collect();
+        let mut missing_system = Vec::new();
+        for dir in [
+            format!("{sysroot}\\System32"),
+            sysroot.clone(),
+            format!("{sysroot}\\System32\\Wbem"),
+            format!("{sysroot}\\System32\\WindowsPowerShell\\v1.0"),
+        ] {
+            if !entries.contains(&dir.trim_end_matches('\\').to_lowercase()) {
+                missing_system.push(dir);
+            }
+        }
+
+        if !extra.is_empty() || !missing_system.is_empty() {
+            // Python dirs prepended (they should win over Store aliases);
+            // system dirs appended (repair only — never shadow user entries).
+            let mut full = current.clone();
+            if !extra.is_empty() {
+                full = format!("{};{}", extra.join(";"), full);
+            }
+            if !missing_system.is_empty() {
+                warn!(
+                    "[env] PATH is missing Windows system dir(s), appending: {}",
+                    missing_system.join(";")
+                );
+                full = format!("{};{}", full, missing_system.join(";"));
+            }
+            std::env::set_var("PATH", full);
+        }
+    }
+}
+
+/// Check if the VM is running by probing the SSH port.
+async fn is_vm_running() -> bool {
+    tokio::net::TcpStream::connect(format!("127.0.0.1:{}", crate::vm::VmConfig::SSH_HOST_PORT))
+        .await
+        .is_ok()
+}
+
+/// Run a command inside the VM via SSH. Returns Ok((stdout, stderr, success)) or Err.
+async fn run_in_vm(cmd: &str, timeout_secs: u64) -> Result<(String, String, bool), String> {
+    let port = crate::vm::VmConfig::SSH_HOST_PORT.to_string();
+    // Guard the local ssh client so a chat-kill SIGKILLs it (the remote command
+    // still runs on the VM, but the local SSH session is reaped, not orphaned).
+    let result = run_guarded(
+        Command::new("sshpass")
+            .args([
+                "-p", "tigris",
+                "ssh",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=5",
+                "-o", "LogLevel=ERROR",
+                "-p", &port,
+                "tigris@localhost",
+                cmd,
+            ]),
+        timeout_secs,
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Ok((stdout, stderr, output.status.success()))
+        }
+        Ok(Err(e)) => Err(format!("Failed to run in VM: {e}")),
+        Err(_) => Err(interrupted_reason(timeout_secs)),
+    }
+}
+
+/// Build a Command for Python execution.
+fn python_command() -> Command {
+    ensure_full_path();
+    let python = find_python();
+    Command::new(&python)
+}
+
+/// Build a shell Command. Windows builds construct cmd.exe inline in
+/// exec_run_shell instead (raw_arg quoting — see the comment there).
+#[cfg(not(target_os = "windows"))]
+fn shell_command() -> Command {
+    ensure_full_path();
+    Command::new("/bin/sh")
+}
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub enum ToolUpdate {
+    ToolCall { name: String, args: Value },
+    ToolResult { name: String, result: Value },
+    TextChunk(String),
+    Error(String),
+    /// Request user approval before executing a dangerous tool.
+    /// The UI must call `respond_tool_approval(true/false)` to continue.
+    ApprovalRequired { name: String, args: Value },
+}
+
+/// Strip `<think>...</think>` blocks from LLM output (reasoning tags).
+fn strip_think_blocks(text: &str) -> String {
+    let mut result = text.to_string();
+    while let Some(start) = result.find("<think>") {
+        if let Some(end) = result.find("</think>") {
+            let end_pos = end + "</think>".len();
+            result = format!("{}{}", &result[..start], result[end_pos..].trim_start());
+        } else {
+            // Unclosed <think> — remove from tag to end
+            result = result[..start].to_string();
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tool approval gate (global channel for UI ↔ toolbox)
+// ---------------------------------------------------------------------------
+
+static APPROVAL_TX: OnceLock<TokioMutex<Option<tokio::sync::oneshot::Sender<bool>>>> =
+    OnceLock::new();
+static APPROVAL_RX: OnceLock<TokioMutex<Option<tokio::sync::oneshot::Receiver<bool>>>> =
+    OnceLock::new();
+
+/// Check if a tool requires user approval based on settings
+/// The BASELINE approval default for a tool: settings toggles + custom-tool
+/// kinds only — explicitly WITHOUT the data/tools global config layer, since
+/// the tool editor diffs documents against this baseline (reading the layer
+/// here would make a saved override self-referential and impossible to reset).
+pub async fn tool_default_requires_approval(tool_name: &str) -> bool {
+    tool_requires_approval_base(tool_name).await
+}
+
+/// CENTRAL implementation registry for built-in tools, rendered into each
+/// tool's YAML editor document: what the native Rust code actually does, plus
+/// a READY-TO-EDIT replacement implementation (real command/API code) so a
+/// tool can be taken over in YAML without touching the Rust source.
+pub fn builtin_impl_doc(name: &str) -> String {
+    // (how it works, ready-to-edit override example — each line "# "-prefixed)
+    let (algo, example): (&str, &str) = match name {
+        "web_search" => (
+            "Multi-engine: drives the live browser to Google when Browser Control is on; else the Python duckduckgo-search library; falls back to the DDG instant-answer API, Google Custom Search (if configured), Wikipedia, and OpenRouter web search.",
+            "# kind: http\n# override: true\n# request:\n#   method: GET\n#   url: \"https://api.duckduckgo.com/?q={{query}}&format=json&no_html=1\"\n#   timeout_secs: 20\n# response:\n#   format: json\n#   max_len: 4000",
+        ),
+        "search_papers" => (
+            "HTTP GET to the free OpenAlex API (api.openalex.org/works) with search/filter/sort query params; reconstructs abstracts from OpenAlex's inverted index; returns title/authors/year/venue/DOI/citations/OA-PDF per work.",
+            "# kind: http\n# override: true\n# request:\n#   method: GET\n#   url: \"https://api.openalex.org/works?search={{query}}&per-page={{limit}}\"\n#   headers:\n#     User-Agent: \"TigrimOS/1.0\"\n#   timeout_secs: 20\n# response:\n#   format: json\n#   select: \"/results\"\n#   max_len: 6000",
+        ),
+        "fetch_url" => (
+            "reqwest GET/POST with a browser-like User-Agent, an SSRF guard blocking private/loopback/metadata addresses, and body truncation.",
+            "# kind: http\n# override: true\n# request:\n#   method: GET\n#   url: \"{{url}}\"\n#   timeout_secs: 30\n# response:\n#   format: auto\n#   max_len: 8000",
+        ),
+        "run_shell" => (
+            "Runs the command via /bin/sh (cmd.exe /S /C on Windows) inside the sandbox: dangerous-pattern blocklist, sandbox-jailed cwd, per-session process groups (killed with the chat), optional VM/container routing, output truncation.",
+            "# kind: shell\n# override: true\n# run:\n#   command: \"{{command}}\"\n#   timeout_secs: 60",
+        ),
+        "run_python" => (
+            "Writes the code to the sandbox and runs python3 with a matplotlib Agg backend preamble: plt.show() auto-saves PNGs to output_file/, save_output() helper, _project_dir var; 3-tier sandboxing (Apple container CLI, sandbox-exec, direct) and per-session process groups.",
+            "# kind: shell\n# override: true\n# run:\n#   # NOTE: naive templating of multi-line code into a shell string is fragile —\n#   # prefer keeping the native implementation, or route to your own runner API:\n#   command: \"python3 -c '{{code}}'\"\n#   timeout_secs: 120",
+        ),
+        "run_react" => (
+            "Strips imports from the JSX, detects the exported component, wraps it in an HTML page loading React 18 + Babel standalone + Recharts from CDNs, writes it to output_file/ and renders it in the output panel.",
+            "# kind: shell\n# override: true\n# run:\n#   command: \"printf '%s' '{{code}}' > output_file/component_$(date +%s).jsx && echo saved\"\n#   timeout_secs: 30",
+        ),
+        "read_file" => (
+            "Sandbox-jailed read (path-traversal guarded). PDFs are extracted with pdftotext/PyPDF and returned in chunks (chunk 0 + total_chunks; use offset); text results are UTF-8-safely truncated.",
+            "# kind: shell\n# override: true\n# run:\n#   command: \"cat {{path}}\"\n#   timeout_secs: 15",
+        ),
+        "write_file" => (
+            "Sandbox-jailed write with parent-directory creation and path-traversal guards; rendered files (md/csv/json/html/png…) appear in the output panel.",
+            "# kind: shell\n# override: true\n# run:\n#   command: \"printf '%s' '{{content}}' > {{path}} && echo written\"\n#   timeout_secs: 15",
+        ),
+        "list_files" => (
+            "Sandbox-jailed directory listing (name/size/type per entry), optional recursion.",
+            "# kind: shell\n# override: true\n# run:\n#   command: \"ls -la {{path}}\"\n#   timeout_secs: 15",
+        ),
+        "delete_file" => (
+            "Sandbox-jailed single-file delete with path-traversal guards (approval-gated by default).",
+            "# kind: shell\n# override: true\n# run:\n#   command: \"rm -- {{path}} && echo deleted\"\n#   timeout_secs: 15",
+        ),
+        "claude_code_agent" => (
+            "Spawns the local `claude` CLI (claude -p <task> --output-format json) in the sandbox with per-session process-group cleanup; no API key needed.",
+            "# kind: shell\n# override: true\n# run:\n#   command: \"claude -p '{{task}}' --output-format text\"\n#   timeout_secs: 600",
+        ),
+        "gemini_cli_agent" => (
+            "Spawns the local `gemini` CLI with the task prompt in the sandbox; per-session process-group cleanup.",
+            "# kind: shell\n# override: true\n# run:\n#   command: \"gemini -p '{{task}}'\"\n#   timeout_secs: 600",
+        ),
+        "openrouter_web_search" => (
+            "POST to OpenRouter's responses API with the web_search_preview tool enabled, using the OpenRouter key from Settings; returns AI-summarized results with citations.",
+            "# kind: http\n# override: true\n# request:\n#   method: POST\n#   url: \"https://openrouter.ai/api/v1/responses\"\n#   headers:\n#     Authorization: \"Bearer sk-or-REPLACE-ME\"\n#     Content-Type: \"application/json\"\n#   body: '{\"model\":\"openai/gpt-4o-mini\",\"input\":\"{{query}}\",\"tools\":[{\"type\":\"web_search_preview\"}]}'\n#   timeout_secs: 60",
+        ),
+        "remote_task" => (
+            "HTTP POST of the task to another TigrimOS instance's /api/remote endpoints (submit, poll, kill) using the remote token from Settings.",
+            "# kind: http\n# override: true\n# request:\n#   method: POST\n#   url: \"http://REMOTE-HOST:3001/api/remote/submit\"\n#   headers:\n#     Authorization: \"Bearer REMOTE-TOKEN\"\n#     Content-Type: \"application/json\"\n#   body: '{\"task\":\"{{task}}\"}'\n#   timeout_secs: 120",
+        ),
+        "clawhub_search" | "clawhub_install" => (
+            "HTTP calls to the ClawHub skill-marketplace registry (search / download + install into the skills directory).",
+            "# kind: http\n# override: true\n# request:\n#   method: GET\n#   url: \"https://clawhub.example/api/search?q={{query}}\"\n#   timeout_secs: 30",
+        ),
+        "list_skills" | "load_skill" | "save_skill" => (
+            "Native skills registry: lists/loads/writes SKILL.md packages under the app's skills directory (data/skills) and registers them for the agent loop.",
+            "# (native registry — replacement rarely useful; example)\n# kind: shell\n# override: true\n# run:\n#   command: \"ls data/skills\"",
+        ),
+        "cron_create" | "cron_list" | "cron_toggle" | "cron_delete" | "cron_run_now" => (
+            "Native scheduler CRUD on data/tasks.json; a 30s scheduler tick runs due tasks as background agent jobs.",
+            "# (native scheduler state — YAML replacement not recommended)",
+        ),
+        "list_local_mounts" => (
+            "Native: lists the host folders granted to the agent via Settings > File Mounts.",
+            "# (native — reads the mounts configuration)",
+        ),
+        n if n.starts_with("proto_") || n.starts_with("bb_") => (
+            "Native in-process inter-agent protocol state (TCP/Bus/Queue/Blackboard) shared across the swarm — protected: cannot be hidden or replaced while sub-agents are enabled.",
+            "# (protected coordination tool — not replaceable)",
+        ),
+        _ => (
+            "Implemented natively in Rust (src/server/services/toolbox.rs).",
+            "# kind: shell\n# override: true\n# run:\n#   command: \"echo replace-me {{param}}\"",
+        ),
+    };
+    format!(
+        "#\n# --- Implementation ---\n# How it works: {algo}\n#\n# Ready-to-edit replacement (uncomment + adjust to take over this tool in YAML;\n# your version runs through the same sandbox/SSRF guards as any custom tool):\n{example}\n"
+    )
+}
+
+/// A built-in tool's RAW description from the compiled-in definitions —
+/// unaffected by data/tools overrides (baseline for the tool editor).
+pub fn builtin_tool_description(name: &str) -> Option<String> {
+    tool_definitions().iter().find_map(|t| {
+        if t.pointer("/function/name").and_then(|n| n.as_str()) == Some(name) {
+            t.pointer("/function/description")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// The JSON parameter schema of a built-in or custom tool (the `parameters`
+/// object of its function spec) — shown in the per-tool config editor so
+/// users know which argument keys params/pinned_params can target.
+pub fn tool_parameter_schema(name: &str) -> Option<Value> {
+    tool_definitions()
+        .into_iter()
+        .chain(crate::server::services::custom_tools::definitions())
+        .find_map(|t| {
+            if t.pointer("/function/name").and_then(|n| n.as_str()) == Some(name) {
+                t.pointer("/function/parameters").cloned()
+            } else {
+                None
+            }
+        })
+}
+
+async fn tool_requires_approval(tool_name: &str) -> bool {
+    // Global per-tool YAML config (data/tools/<name>.yaml `config:` block)
+    // overrides the settings defaults; per-profile config overrides both
+    // (handled in execute_tool_dispatch_inner).
+    if let Some(v) = crate::server::services::custom_tools::global_config(tool_name)
+        .and_then(|c| c.require_approval)
+    {
+        return v;
+    }
+    tool_requires_approval_base(tool_name).await
+}
+
+/// Settings-toggle + custom-kind approval defaults, WITHOUT the data/tools
+/// global config layer (see tool_default_requires_approval).
+async fn tool_requires_approval_base(tool_name: &str) -> bool {
+    let settings = crate::server::data::get_settings().await;
+    match tool_name {
+        "run_shell" | "cron_create" | "cron_run_now" => {
+            settings.approval_required_for_shell.unwrap_or(true)
+        }
+        "run_python" | "run_react" => settings.approval_required_for_python.unwrap_or(true),
+        "write_file" => settings.approval_required_for_file_write.unwrap_or(false),
+        // save_skill writes OUTSIDE the sandbox (data_dir()/skills) and the
+        // saved skill shapes future agent behavior — always gate it under the
+        // file-write toggle at minimum, defaulting to ask.
+        "save_skill" => settings.approval_required_for_file_write.unwrap_or(true),
+        "delete_file" => settings.approval_required_for_file_delete.unwrap_or(true),
+        "claude_code_agent" => settings.approval_required_for_agent_spawn.unwrap_or(false),
+        "gemini_cli_agent" => settings.approval_required_for_agent_spawn.unwrap_or(false),
+        // User-defined YAML tools: honor an explicit `require_approval`, else
+        // default shell-kind tools to the shell-approval toggle (HTTP tools
+        // default to no approval, like web_search/fetch_url).
+        other => match crate::server::services::custom_tools::approval_kind(other) {
+            Some(crate::server::services::custom_tools::CustomApproval::Force(v)) => v,
+            Some(crate::server::services::custom_tools::CustomApproval::ShellDefault) => {
+                settings.approval_required_for_shell.unwrap_or(true)
+            }
+            Some(crate::server::services::custom_tools::CustomApproval::HttpDefault) => false,
+            None => false,
+        },
+    }
+}
+
+/// Called by the tool dispatch to request approval. Returns true if approved.
+async fn request_tool_approval(
+    tool_name: &str,
+    tool_args: &Value,
+    on_update: &Arc<dyn Fn(ToolUpdate) + Send + Sync + 'static>,
+) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+
+    // Store the receiver so the approval response can be read
+    {
+        let lock = APPROVAL_RX.get_or_init(|| TokioMutex::new(None));
+        *lock.lock().await = Some(rx);
+    }
+    {
+        let lock = APPROVAL_TX.get_or_init(|| TokioMutex::new(None));
+        *lock.lock().await = Some(tx);
+    }
+
+    // Notify UI
+    on_update(ToolUpdate::ApprovalRequired {
+        name: tool_name.to_string(),
+        args: tool_args.clone(),
+    });
+
+    // Wait for user response (with timeout)
+    let rx_lock = APPROVAL_RX.get_or_init(|| TokioMutex::new(None));
+    let rx = rx_lock.lock().await.take();
+    match rx {
+        Some(rx) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+                Ok(Ok(approved)) => approved,
+                _ => false, // timeout or channel error → deny
+            }
+        }
+        None => false,
+    }
+}
+
+/// Called by the UI to approve or deny a pending tool execution.
+pub async fn respond_tool_approval(approved: bool) {
+    let lock = APPROVAL_TX.get_or_init(|| TokioMutex::new(None));
+    if let Some(tx) = lock.lock().await.take() {
+        let _ = tx.send(approved);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolLoopResult {
+    pub content: String,
+    pub tool_results: Vec<ToolCallRecord>,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCallRecord {
+    pub tool: String,
+    pub result: Value,
+}
+
+// ---------------------------------------------------------------------------
+// Sub-agent context (passed through the tool loop)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct SubAgentConfig {
+    pub enabled: bool,
+    pub config_file: String,
+    pub agent_ids: Vec<String>,       // available agent IDs from YAML
+    pub api_key: String,
+    pub api_url: String,
+    pub model: String,
+    pub depth: usize,                 // recursion depth (prevent infinite loops)
+    pub session_id: String,           // for JSONL history logging
+    pub agent_id: String,             // current agent's own ID (for protocol tools)
+    pub mode: String,                 // "fully_auto", "auto", "auto_swarm", "manual", "router"
+    pub agent_role: String,            // "orchestrator", "worker", etc. — used for tool filtering
+    pub cancel_flag: Arc<AtomicBool>,  // set to true to abort the tool loop (saves checkpoint)
+    // --- Router mode only (empty/ignored in every other mode) ---
+    pub model_pool: Vec<Value>,        // serialized ModelPoolEntry list (id/label/model/api_url/api_key/tier/strengths)
+    pub router_tier: String,           // "fast" | "ultra"; "" outside router mode
+    // --- User agent-loop profile (None = built-in behavior) ---
+    pub loop_profile: Option<Arc<crate::server::services::agent_loop::AgentLoopProfile>>,
+    // --- Graph mode: judge panel gating the final answer (None = no gate) ---
+    pub graph_profile: Option<Arc<crate::server::services::graph::GraphProfile>>,
+}
+
+impl Default for SubAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            config_file: String::new(),
+            agent_ids: Vec::new(),
+            api_key: String::new(),
+            api_url: String::new(),
+            model: String::new(),
+            depth: 0,
+            session_id: String::new(),
+            agent_id: "main".to_string(),
+            mode: "auto".to_string(),
+            agent_role: String::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            model_pool: Vec::new(),
+            router_tier: String::new(),
+            loop_profile: None,
+            graph_profile: None,
+        }
+    }
+}
+
+/// Effective max sub-agent recursion depth: profile knob clamped to 1..=5, default 3.
+pub fn effective_max_spawn_depth(sub_agent: &SubAgentConfig) -> usize {
+    sub_agent
+        .loop_profile
+        .as_deref()
+        .and_then(|p| p.loop_.as_ref())
+        .and_then(|l| l.max_spawn_depth)
+        .map(|d| (d as usize).clamp(1, 5))
+        .unwrap_or(3)
+}
+
+/// Tools the profile filter must never remove while orchestration is active,
+/// so a user profile cannot brick swarm/router coordination.
+pub fn is_protected_tool(name: &str, sub_agent: &SubAgentConfig) -> bool {
+    if !sub_agent.enabled {
+        return false;
+    }
+    matches!(
+        name,
+        "send_task" | "wait_result" | "check_agents" | "create_architecture" | "select_swarm" | "spawn_subagent"
+    ) || name.starts_with("proto_")
+        || name.starts_with("bb_")
+}
+
+/// Apply per-tool profile config (tools.config in the agent-loop YAML) to an
+/// assembled tool-spec list:
+/// - remove tools with enabled:false (protected coordination tools exempt)
+/// - override function.description
+/// Runs after MCP tools are appended, so it covers built-in and MCP specs
+/// uniformly (both are OpenAI-format {"type":"function","function":{...}}).
+pub fn apply_profile_tool_overrides(tools: &mut Vec<Value>, sub_agent: &SubAgentConfig) {
+    let Some(tf) = sub_agent.loop_profile.as_deref().and_then(|p| p.tools.as_ref()) else {
+        return;
+    };
+    if tf.config.is_empty() {
+        return;
+    }
+    let before = tools.len();
+    tools.retain(|t| {
+        let name = t["function"]["name"].as_str().unwrap_or("");
+        is_protected_tool(name, sub_agent)
+            || tf.config.get(name).and_then(|c| c.enabled) != Some(false)
+    });
+    if tools.len() != before {
+        info!(
+            "[call_with_tools] profile tools.config disabled {} tool(s)",
+            before - tools.len()
+        );
+    }
+    for t in tools.iter_mut() {
+        let name = t["function"]["name"].as_str().unwrap_or("").to_string();
+        if let Some(desc) = tf.config.get(&name).and_then(|c| c.description.as_deref()) {
+            t["function"]["description"] = json!(desc);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Realtime multi-agent session (tiger_cowork realtime mode clone)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct AgentResult {
+    pub result: String,
+    pub output_files: Vec<String>,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// Step-verification verdict (None when verification is disabled or failed open)
+    pub verified: Option<bool>,
+    pub verify_score: Option<f64>,
+    pub verify_gaps: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct AgentTask {
+    pub from: String,
+    pub task: String,
+    pub context: Option<String>,
+}
+
+#[allow(dead_code)]
+pub struct RealtimeAgentHandle {
+    pub agent_def: Value,
+    pub status: Arc<TokioMutex<String>>,          // "idle" | "working"
+    pub task_tx: tokio::sync::mpsc::Sender<AgentTask>,
+    /// Who sent the task this agent is currently working on (empty when idle).
+    /// Used to reject an agent waiting on its own delegator (guaranteed deadlock).
+    pub current_task_from: Arc<TokioMutex<String>>,
+}
+
+#[allow(dead_code)]
+pub struct RealtimeSession {
+    pub session_id: String,
+    pub agents: HashMap<String, RealtimeAgentHandle>,
+    pub system_config: Value,
+    /// Completed results keyed by agent_id — FIFO queue per agent so multiple
+    /// queued tasks don't overwrite each other; consumed by wait_result
+    pub results: Arc<TokioMutex<HashMap<String, Vec<AgentResult>>>>,
+    /// Notified whenever a new result is published
+    pub result_notify: Arc<Notify>,
+    pub abort_tx: tokio::sync::broadcast::Sender<()>,
+    /// Shared cancel flag for every agent in this session. `abort_tx` only
+    /// unblocks an agent that is idle (waiting on its task channel); an agent
+    /// busy inside call_with_tools won't see the broadcast until its current
+    /// task finishes. This flag is threaded into each agent's SubAgentConfig so
+    /// the tool loop stops at the next round/tool boundary AND run_guarded
+    /// SIGKILLs any in-flight child process — closing the window where a killed
+    /// swarm keeps spawning processes that escape the one-shot registry sweep.
+    pub cancel_flag: Arc<AtomicBool>,
+    /// Who is currently blocked in wait_result on whom (caller_id -> target_id).
+    /// Used for self-wait and circular-wait (deadlock) detection.
+    pub waiting_on: Arc<TokioMutex<HashMap<String, String>>>,
+    /// Consecutive hard-timeout count per "caller->target" wait edge.
+    /// Reset on a successful result; used to escalate the hint so the
+    /// orchestrator stops waiting forever and assembles partial results.
+    pub wait_hard_timeouts: Arc<TokioMutex<HashMap<String, u32>>>,
+}
+
+// Global store: session_id -> RealtimeSession
+static REALTIME_SESSIONS: std::sync::OnceLock<TokioMutex<HashMap<String, Arc<TokioMutex<RealtimeSession>>>>> =
+    std::sync::OnceLock::new();
+
+fn realtime_sessions() -> &'static TokioMutex<HashMap<String, Arc<TokioMutex<RealtimeSession>>>> {
+    REALTIME_SESSIONS.get_or_init(|| TokioMutex::new(HashMap::new()))
+}
+
+// Global store: session_id -> selected swarm filename
+static AUTO_SWARM_SELECTIONS: std::sync::OnceLock<TokioMutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn auto_swarm_selections() -> &'static TokioMutex<HashMap<String, String>> {
+    AUTO_SWARM_SELECTIONS.get_or_init(|| TokioMutex::new(HashMap::new()))
+}
+
+// Global store: session_id -> auto-created architecture filename
+static AUTO_CREATED_ARCHITECTURES: std::sync::OnceLock<TokioMutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn auto_created_architectures() -> &'static TokioMutex<HashMap<String, String>> {
+    AUTO_CREATED_ARCHITECTURES.get_or_init(|| TokioMutex::new(HashMap::new()))
+}
+
+// Global broadcast channel for subagent activity visible in the UI chat log.
+// Each message: (session_id, agent_id, line)
+static SUBAGENT_LOG_TX: std::sync::OnceLock<tokio::sync::broadcast::Sender<(String, String, String)>> =
+    std::sync::OnceLock::new();
+
+fn subagent_log_tx() -> &'static tokio::sync::broadcast::Sender<(String, String, String)> {
+    SUBAGENT_LOG_TX.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(256);
+        tx
+    })
+}
+
+/// Subscribe to subagent activity log for a given session.
+pub fn subscribe_subagent_log() -> tokio::sync::broadcast::Receiver<(String, String, String)> {
+    subagent_log_tx().subscribe()
+}
+
+/// Append a line to the session's activity log file (mirrors TS appendSessionProgress).
+/// Used by orchestrator tool call logging so the Activity panel shows orchestrator actions.
+pub fn append_session_progress(session_id: &str, text: &str) {
+    let log_dir = crate::server::data::data_dir().join("activity_logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join(format!("{}.log", session_id));
+    // Disk-fill guard: a looping agent can append forever — cap each session's
+    // activity log at 20MB and stop appending past that.
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > 20 * 1024 * 1024 { return; }
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+}
+
+/// Log agent tool call to the Activity panel (mirrors TS socket.ts onToolCall).
+fn log_agent_tool_call(session_id: &str, agent_id: &str, name: &str, args: &Value) {
+    let label = if agent_id.is_empty() || agent_id == "main" { "Orchestrator".to_string() } else { agent_id.to_string() };
+    if name.starts_with("proto_") {
+        let proto_name = name.replace("proto_", "").split('_').next().unwrap_or("").to_uppercase();
+        append_session_progress(session_id,
+            &format!("> **{}** **{}** → `{}`\n", proto_name, label, name));
+    } else if name == "send_task" {
+        let to = args.get("to").and_then(|v| v.as_str())
+            .or_else(|| args.get("agent_name").and_then(|v| v.as_str()))
+            .unwrap_or("agent");
+        append_session_progress(session_id,
+            &format!("> **{}** delegating task to {}\n", label, to));
+    } else if name == "wait_result" {
+        let from = args.get("from").and_then(|v| v.as_str()).unwrap_or("agent");
+        append_session_progress(session_id,
+            &format!("> **{}** waiting for {}\n", label, from));
+    } else {
+        append_session_progress(session_id,
+            &format!("> **{}** → `{}`\n", label, name));
+    }
+}
+
+// Global signal: when fully_auto creates an architecture, set this so the Agents tab can auto-load it.
+static PENDING_ARCH_FILE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+/// Set the pending architecture file for the Agents tab to auto-load.
+pub fn set_pending_arch_file(filename: &str) {
+    let m = PENDING_ARCH_FILE.get_or_init(|| std::sync::Mutex::new(None));
+    // Recover from a poisoned mutex rather than propagating the panic across the
+    // long-running server — a prior holder panicking must not wedge this signal.
+    *m.lock().unwrap_or_else(|e| e.into_inner()) = Some(filename.to_string());
+}
+
+/// Take the pending architecture file (clears it after reading).
+pub fn take_pending_arch_file() -> Option<String> {
+    let m = PENDING_ARCH_FILE.get_or_init(|| std::sync::Mutex::new(None));
+    m.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// Query live agent statuses from the active realtime session.
+/// Returns a map of agent_id -> status ("idle", "working").
+pub async fn get_all_agent_statuses() -> HashMap<String, String> {
+    let map = realtime_sessions().lock().await;
+    let mut result = HashMap::new();
+    for (_sid, session_arc) in map.iter() {
+        let session = session_arc.lock().await;
+        for (id, handle) in &session.agents {
+            let status = handle.status.lock().await.clone();
+            result.insert(id.clone(), status);
+        }
+    }
+    result
+}
+
+/// Boot all agents in the YAML config as persistent tokio tasks.
+/// Returns immediately; agents wait for tasks on their mpsc channels.
+/// Fire-and-forget helper to boot a realtime session without blocking the caller.
+/// Uses a oneshot to wait for the session to be ready before returning.
+fn boot_realtime_session_deferred(
+    session_id: String, config_file: String,
+    api_key: String, api_url: String, model: String,
+    sandbox_dir: String,
+) {
+    tokio::spawn(async move {
+        start_realtime_session(&session_id, &config_file, &api_key, &api_url, &model, &sandbox_dir).await;
+    });
+}
+
+/// Force create_architecture on first message in auto_create mode.
+/// Called proactively by the UI — does NOT wait for LLM to choose the tool.
+/// Returns (ok, config_filename, summary_message).
+pub async fn force_create_architecture(
+    user_message: &str,
+    sub_agent: &SubAgentConfig,
+    _sandbox_dir: &str,
+) -> (bool, Option<String>, String) {
+    let args = serde_json::json!({
+        "description": user_message,
+        "architectureType": "hierarchical",
+        "agentCount": "auto",
+    });
+    let result = exec_create_architecture(&args, sub_agent).await;
+    let ok = result["ok"].as_bool().unwrap_or(false);
+    if ok {
+        let filename = result["filename"].as_str().unwrap_or("").to_string();
+        let message = result["message"].as_str().unwrap_or("Architecture created.").to_string();
+        // NOTE: realtime session boot is handled by the caller (chat.rs)
+        (true, Some(filename), message)
+    } else {
+        let err = result["error"].as_str().unwrap_or("Unknown error").to_string();
+        (false, None, format!("Failed to create architecture: {}", err))
+    }
+}
+
+/// Check if this session already has an auto-created architecture.
+pub async fn get_session_architecture(session_id: &str) -> Option<String> {
+    auto_created_architectures().lock().await.get(session_id).cloned()
+}
+
+pub async fn start_realtime_session(
+    session_id: &str,
+    config_file: &str,
+    api_key: &str,
+    api_url: &str,
+    model: &str,
+    sandbox_dir: &str,
+) -> bool {
+    // Already running?
+    {
+        let map = realtime_sessions().lock().await;
+        if map.contains_key(session_id) {
+            info!("[Realtime] Session {} already active", session_id);
+            return true;
+        }
+    }
+
+    let (yaml_val, _) = match load_agent_yaml(config_file) {
+        Some(v) => v,
+        None => {
+            error!("[Realtime] Failed to load agent config: {}", config_file);
+            return false;
+        }
+    };
+
+    let (abort_tx, _) = tokio::sync::broadcast::channel::<()>(4);
+    let session_cancel = Arc::new(AtomicBool::new(false));
+    let results = Arc::new(TokioMutex::new(HashMap::<String, Vec<AgentResult>>::new()));
+    let result_notify = Arc::new(Notify::new());
+
+    let agents_arr = yaml_val["agents"].as_array().cloned().unwrap_or_default();
+    let mut agent_handles: HashMap<String, RealtimeAgentHandle> = HashMap::new();
+
+    for agent_def in &agents_arr {
+        let agent_id = match agent_def.get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let role = agent_def.get("role").and_then(|v| v.as_str()).unwrap_or("worker");
+
+        let (task_tx, task_rx) = tokio::sync::mpsc::channel::<AgentTask>(8);
+        let status = Arc::new(TokioMutex::new("idle".to_string()));
+        let current_task_from = Arc::new(TokioMutex::new(String::new()));
+
+        // Human nodes don't get an LLM loop
+        if role != "human" {
+            let abort_rx = abort_tx.subscribe();
+            tokio::spawn(realtime_agent_loop(
+                agent_def.clone(),
+                session_id.to_string(),
+                yaml_val.clone(),
+                api_key.to_string(),
+                api_url.to_string(),
+                model.to_string(),
+                sandbox_dir.to_string(),
+                task_rx,
+                results.clone(),
+                result_notify.clone(),
+                status.clone(),
+                current_task_from.clone(),
+                abort_rx,
+                session_cancel.clone(),
+            ));
+        }
+
+        agent_handles.insert(agent_id.clone(), RealtimeAgentHandle {
+            agent_def: agent_def.clone(),
+            status,
+            task_tx,
+            current_task_from,
+        });
+
+        // Write SUBAGENT_SPAWN to agent history so the graphic view can show this agent
+        if role != "human" {
+            let name = agent_def.get("name").and_then(|v| v.as_str()).unwrap_or(&agent_id);
+            write_agent_history(session_id, "SUBAGENT_SPAWN", json!({
+                "agent_name": agent_id,
+                "display_name": name,
+                "role": role,
+                "parent": "main",
+            })).await;
+        }
+
+        info!("[Realtime] Agent {} ({}) booted and listening", agent_id, role);
+    }
+
+    // Write SESSION_CONFIG so the graphic view knows the orchestration mode and YAML connections
+    let orch_mode = yaml_val["system"]["orchestration_mode"].as_str().unwrap_or("hierarchical");
+    write_agent_history(session_id, "SESSION_CONFIG", json!({
+        "orchestration_mode": orch_mode,
+        "connections": yaml_val.get("connections").cloned().unwrap_or(json!([])),
+        "workflow": yaml_val.get("workflow").cloned().unwrap_or(json!({})),
+    })).await;
+
+    let session = Arc::new(TokioMutex::new(RealtimeSession {
+        session_id: session_id.to_string(),
+        agents: agent_handles,
+        system_config: yaml_val,
+        results,
+        result_notify,
+        abort_tx,
+        cancel_flag: session_cancel,
+        waiting_on: Arc::new(TokioMutex::new(HashMap::new())),
+        wait_hard_timeouts: Arc::new(TokioMutex::new(HashMap::new())),
+    }));
+
+    realtime_sessions().lock().await.insert(session_id.to_string(), session);
+    info!("[Realtime] Session {} started with {} agents", session_id, agents_arr.len());
+    true
+}
+
+/// Shut down all agent tasks for a session.
+pub async fn shutdown_realtime_session(session_id: &str) {
+    let mut map = realtime_sessions().lock().await;
+    if let Some(session_arc) = map.remove(session_id) {
+        let session = session_arc.lock().await;
+        // Set the shared cancel flag FIRST so any agent busy inside
+        // call_with_tools stops at its next round/tool boundary and
+        // run_guarded SIGKILLs its in-flight child; then broadcast abort to
+        // unblock idle agents waiting on their task channel.
+        session.cancel_flag.store(true, Ordering::Relaxed);
+        let _ = session.abort_tx.send(());
+        info!("[Realtime] Session {} shut down", session_id);
+    }
+    // Free any per-agent isolated browser windows this session launched.
+    crate::server::services::mcp::shutdown_agent_browsers(session_id).await;
+}
+
+/// Get all non-human agent IDs from the system config.
+fn all_non_human_ids(system_config: &Value) -> Vec<String> {
+    system_config["agents"].as_array()
+        .map(|arr| arr.iter()
+            .filter_map(|a| a["id"].as_str().map(|s| s.to_string()))
+            .filter(|id| id != "human")
+            .collect())
+        .unwrap_or_default()
+}
+
+/// Get downstream targets for an agent from workflow + connections.
+fn get_downstream(agent_id: &str, system_config: &Value) -> Vec<String> {
+    let workflow_outputs: Vec<String> = system_config
+        .get("workflow").and_then(|w| w.get("sequence")).and_then(|s| s.as_array())
+        .and_then(|arr| arr.iter().find(|s| s.get("agent").and_then(|v| v.as_str()) == Some(agent_id)))
+        .and_then(|step| step.get("outputs_to").and_then(|v| v.as_array()))
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    let conn_targets: Vec<String> = system_config
+        .get("connections").and_then(|v| v.as_array())
+        .map(|arr| arr.iter()
+            .filter(|c| c.get("from").and_then(|v| v.as_str()) == Some(agent_id))
+            .filter_map(|c| c.get("to").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
+
+    let mut d = workflow_outputs;
+    for t in conn_targets { if !d.contains(&t) { d.push(t); } }
+    d.retain(|id| id != "human");
+    d
+}
+
+/// Check if an agent has mesh.enabled in its YAML definition.
+fn agent_has_mesh(agent_def: &Value) -> bool {
+    agent_def.get("mesh")
+        .and_then(|m| m.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Get mesh-enabled agent IDs from system config.
+fn mesh_agent_ids(system_config: &Value) -> Vec<String> {
+    system_config["agents"].as_array()
+        .map(|arr| arr.iter()
+            .filter(|a| agent_has_mesh(a) && a["role"].as_str() != Some("human"))
+            .filter_map(|a| a["id"].as_str().map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Skills advertising — mirrors tiger_cowork buildEnabledSkillsBlock()
+// ---------------------------------------------------------------------------
+
+const SUBAGENT_SKILLS_PERSONA: &str =
+    "BEFORE you start the assigned task, scan this skill list. If a skill's description \
+     matches the task, you MUST call load_skill(\"<skill-name>\") FIRST and follow its \
+     SKILL.md instructions instead of writing your own code from scratch. These skills are \
+     shared with the orchestrator and other agents — using them keeps the team consistent.";
+
+/// Build the `=== INSTALLED SKILLS ===` block that is injected into sub-agent
+/// and realtime-agent prompts so they can discover available skills without
+/// having to call `list_skills` first.  Mirrors TS `buildEnabledSkillsBlock`.
+async fn build_enabled_skills_block(persona: Option<&str>, project_skills: Option<&[String]>) -> String {
+    let skills_path = crate::server::data::data_file_path("skills.json");
+    let registry: Vec<Value> = match tokio::fs::read_to_string(&skills_path).await {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => vec![],
+    };
+
+    let enabled: Vec<&Value> = registry
+        .iter()
+        .filter(|s| s.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true))
+        .filter(|s| {
+            match project_skills {
+                Some(allowed) => {
+                    let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    allowed.iter().any(|a| a == id || a == name)
+                }
+                None => true,
+            }
+        })
+        .collect();
+
+    // Also scan the skills root for custom skills with SKILL.md
+    let skills_dir = crate::server::data::skills_root();
+    let mut custom_skills: Vec<(String, String, Vec<String>)> = Vec::new(); // (name, description, files)
+    if let Ok(mut entries) = tokio::fs::read_dir(&skills_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                let skill_md = entry.path().join("SKILL.md");
+                if tokio::fs::metadata(&skill_md).await.is_ok() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    // Don't double-list skills already in registry
+                    let already = enabled.iter().any(|s| {
+                        let sn = s.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        sn == name || slugify_skill_name(sn) == slugify_skill_name(&name)
+                    });
+                    if already { continue; }
+                    // Skip custom skills not in the project's allowed list
+                    if let Some(allowed) = project_skills {
+                        if !allowed.iter().any(|a| a == &name || slugify_skill_name(a) == slugify_skill_name(&name)) {
+                            continue;
+                        }
+                    }
+                    // Read description from SKILL.md frontmatter
+                    let desc = if let Ok(content) = tokio::fs::read_to_string(&skill_md).await {
+                        content.lines()
+                            .find(|l| l.starts_with("description:"))
+                            .map(|l| l.trim_start_matches("description:").trim().trim_matches('"').to_string())
+                            .unwrap_or_default()
+                    } else { String::new() };
+                    // List supporting files
+                    let mut files = Vec::new();
+                    if let Ok(mut fentries) = tokio::fs::read_dir(entry.path()).await {
+                        while let Ok(Some(f)) = fentries.next_entry().await {
+                            let fname = f.file_name().to_string_lossy().to_string();
+                            if fname != "SKILL.md" && !fname.starts_with('.') && fname != "__MACOSX" {
+                                files.push(fname);
+                            }
+                        }
+                    }
+                    custom_skills.push((name, desc, files));
+                }
+            }
+        }
+    }
+
+    if enabled.is_empty() && custom_skills.is_empty() {
+        return String::new();
+    }
+
+    let lead = persona.unwrap_or(
+        "IMPORTANT: BEFORE answering any user request, scan the skill list below. \
+         If a skill's description matches the user's task, you MUST load and use that \
+         skill FIRST by calling load_skill(\"<skill-name>\"), then follow its SKILL.md \
+         instructions. Do NOT write your own code from scratch when a matching skill exists. \
+         Skills contain tested implementations and supporting files (like Python engines) that should be used."
+    );
+
+    let mut block = format!("\n\n=== INSTALLED SKILLS ===\n{}", lead);
+
+    if !custom_skills.is_empty() {
+        block.push_str("\n\nCustom skills (priority — always prefer these):");
+        for (name, desc, files) in &custom_skills {
+            let files_str = if files.is_empty() { String::new() } else { format!(" [files: {}]", files.join(", ")) };
+            if desc.is_empty() {
+                block.push_str(&format!("\n  - \"{}\"{}", name, files_str));
+            } else {
+                block.push_str(&format!("\n  - \"{}\": {}{}", name, desc, files_str));
+            }
+        }
+    }
+
+    if !enabled.is_empty() {
+        block.push_str("\n\nRegistered skills:");
+        for s in &enabled {
+            let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+            let desc = s.get("description").and_then(|d| d.as_str()).unwrap_or("");
+            let source = s.get("source").and_then(|n| n.as_str()).unwrap_or("unknown");
+            // Check if this skill has files on disk
+            let has_files = resolve_skill_dir(name, Some(s)).is_some();
+            let files_flag = if has_files { " [has SKILL.md]" } else { "" };
+            if desc.is_empty() {
+                block.push_str(&format!("\n  - {} ({}){}", name, source, files_flag));
+            } else {
+                let short_desc = crate::util::truncate_utf8(desc, 150);
+                block.push_str(&format!("\n  - {} ({}) — {}{}", name, source, short_desc, files_flag));
+            }
+        }
+    }
+
+    block.push_str("\n\nSkill usage workflow: 1) call load_skill(\"<name>\") to read SKILL.md \
+        and see supporting files, 2) if the skill has supporting .py files, use read_file to \
+        load them, 3) use run_python or run_shell to execute following the skill instructions.");
+
+    block
+}
+
+/// Public wrapper for chat.rs to inject skills into the main agent prompt.
+/// When `project_skills` is Some, only skills whose id/name matches the list are included.
+pub async fn build_enabled_skills_block_pub(project_skills: Option<&[String]>) -> String {
+    build_enabled_skills_block(None, project_skills).await
+}
+
+/// Build the system prompt for a realtime agent — mode-aware (tiger_cowork clone).
+fn build_realtime_agent_prompt(agent_def: &Value, system_config: &Value) -> String {
+    let agent_id = agent_def["id"].as_str().unwrap_or("agent");
+    let name = agent_def["name"].as_str().unwrap_or("Agent");
+    let role = agent_def["role"].as_str().unwrap_or("worker");
+    let persona = agent_def.get("persona").and_then(|v| v.as_str()).unwrap_or("");
+    let responsibilities = agent_def
+        .get("responsibilities")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| format!("  - {s}"))
+            .collect::<Vec<_>>()
+            .join("\n"))
+        .unwrap_or_default();
+
+    let orch_mode = system_config["system"]["orchestration_mode"]
+        .as_str().unwrap_or("hierarchical");
+
+    let all_agents = all_non_human_ids(system_config);
+    let others: Vec<&str> = all_agents.iter()
+        .filter(|id| id.as_str() != agent_id)
+        .map(|s| s.as_str()).collect();
+    let downstream = get_downstream(agent_id, system_config);
+
+    // Base prompt
+    let mut prompt = format!(
+        "You are {name} (ID: {agent_id}) in a REALTIME multi-agent system.\n\
+        {persona}\n\
+        Your responsibilities:\n{responsibilities}\n"
+    );
+
+    // Mode-specific instructions
+    match orch_mode {
+        "hierarchical" => {
+            if role == "orchestrator" {
+                // Build worker roster with responsibilities for the orchestrator
+                let agents_arr = system_config["agents"].as_array();
+                let worker_roster: String = agents_arr.map(|arr| {
+                    arr.iter()
+                        .filter(|a| {
+                            let r = a["role"].as_str().unwrap_or("worker");
+                            r == "worker" && a["id"].as_str().unwrap_or("") != agent_id
+                        })
+                        .map(|a| {
+                            let wid = a["id"].as_str().unwrap_or("?");
+                            let wname = a["name"].as_str().unwrap_or(wid);
+                            let resp = a["responsibilities"].as_array()
+                                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("; "))
+                                .unwrap_or_default();
+                            if resp.is_empty() {
+                                format!("  - {} (\"{}\")", wid, wname)
+                            } else {
+                                format!("  - {} (\"{}\") — {}", wid, wname, resp)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }).unwrap_or_default();
+
+                prompt += &format!(
+                    "\n\n═══ HIERARCHICAL MODE — YOU ARE THE ORCHESTRATOR ═══\n\
+                    You control the team and coordinate ALL work. Your PRIMARY job is to DELEGATE.\n\n\
+                    Your worker agents:\n{}\n\n\
+                    RULES (MANDATORY — violating these is a system error):\n\
+                    1. You MUST delegate ALL substantive work to worker agents via send_task / wait_result.\n\
+                    2. Give each worker a DETAILED task description — include ALL context they need.\n\
+                    3. Send tasks to MULTIPLE agents in a SINGLE response for parallel execution when possible.\n\
+                    4. After collecting ALL worker results via wait_result, synthesize into a comprehensive final response.\n\
+                    5. You may use your own tools (web_search, read_file, etc.) ONLY for quick supplementary checks.\n\
+                    6. NEVER do a worker's job yourself — that defeats the purpose of multi-agent delegation.\n\n\
+                    Workflow: send_task({{to: \"<agentId>\", task: \"<detailed task>\"}}) → wait_result({{from: \"<agentId>\"}}) → synthesize.\n\
+                    Reachable agents: [{}]",
+                    worker_roster, downstream.join(", ")
+                );
+            } else {
+                prompt += "\n\nHIERARCHICAL MODE (WORKER): You receive tasks from the orchestrator.\n\
+                    Complete each task using your available tools, then provide your result as a clear text response.\n\
+                    Do NOT delegate — execute the task yourself.";
+                if !downstream.is_empty() {
+                    prompt += &format!(
+                        "\nException: You can delegate sub-tasks to: [{}]",
+                        downstream.join(", ")
+                    );
+                }
+            }
+        }
+        "hybrid" => {
+            let mesh_ids = mesh_agent_ids(system_config);
+            if role == "orchestrator" {
+                prompt += &format!(
+                    "\n\n═══ HYBRID MODE — YOU ARE THE ORCHESTRATOR ═══\n\
+                    You control the team and coordinate ALL work. Your PRIMARY job is to DELEGATE.\n\
+                    Your connected agents: [{}]\n\
+                    Mesh-enabled agents (can collaborate freely): [{}]\n\n\
+                    RULES (MANDATORY):\n\
+                    1. You MUST delegate ALL substantive work to agents via send_task / wait_result.\n\
+                    2. Give each agent a DETAILED task description with ALL context they need.\n\
+                    3. Monitor mesh agents' progress via check_agents.\n\
+                    4. Collect ALL results via wait_result and synthesize a comprehensive final response.\n\
+                    5. If mesh agents loop or stall, reassign the task.\n\
+                    6. NEVER do a worker's job yourself — delegate everything.",
+                    downstream.join(", "),
+                    mesh_ids.join(", ")
+                );
+            } else if agent_has_mesh(agent_def) {
+                prompt += &format!(
+                    "\n\nHYBRID MODE (MESH WORKER): You can collaborate freely with other mesh agents.\n\
+                    Mesh peers: [{}]\n\
+                    Use send_task/wait_result to delegate sub-tasks to any mesh peer.\n\
+                    Complete your assigned tasks using available tools.",
+                    mesh_ids.iter().filter(|id| id.as_str() != agent_id).cloned().collect::<Vec<_>>().join(", ")
+                );
+            } else {
+                prompt += "\n\nHYBRID MODE (WORKER): You receive tasks from the orchestrator.\n\
+                    Complete each task using your available tools.";
+            }
+        }
+        "mesh" => {
+            prompt += &format!(
+                "\n\nMESH MODE: All agents are peer collaborators — no hierarchy.\n\
+                You can send tasks to ANY agent: [{}]\n\
+                Use send_task({{to: \"<agentId>\", task: \"...\"}}) then wait_result({{from: \"<agentId>\"}}).\n\
+                Send tasks to MULTIPLE agents in a SINGLE response for parallel execution.\n\
+                Collaborate dynamically. Do NOT use proto_tcp_send or proto_bus_publish for tasks — use send_task.",
+                others.join(", ")
+            );
+        }
+        "pipeline" => {
+            if downstream.is_empty() {
+                prompt += "\n\nPIPELINE MODE (FINAL STAGE): You are the last agent in the pipeline.\n\
+                    Process the input you receive and provide your final result.\n\
+                    Synthesize all upstream work into a comprehensive response.";
+            } else {
+                prompt += &format!(
+                    "\n\nPIPELINE MODE: You are one stage in a sequential pipeline.\n\
+                    After completing your work, you MUST forward your result to the next agent: [{}]\n\
+                    Use send_task({{to: \"{}\", task: \"<your result + instructions>\"}}) then wait_result.\n\
+                    Pass along ALL relevant context and data to the next stage.",
+                    downstream.join(", "),
+                    downstream.first().unwrap_or(&String::new())
+                );
+            }
+        }
+        "p2p" | "p2p_orchestrator" => {
+            if role == "orchestrator" {
+                prompt += &format!(
+                    "\n\n═══ P2P ORCHESTRATOR MODE ═══\n\
+                    You coordinate the team. Your PRIMARY job is to DELEGATE — NEVER do workers' jobs yourself.\n\
+                    Delegate tasks in two ways:\n\
+                    1. DIRECT: send_task to connected agents: [{}]\n\
+                    2. BIDDING: bb_propose → bb_read (check bids) → bb_award → send_task to winner\n\
+                    After bb_award, you MUST send_task to the winner — award alone does NOT send.\n\
+                    Use check_agents to monitor progress. Synthesize ALL results into your final response.",
+                    downstream.join(", ")
+                );
+            } else {
+                prompt += &format!(
+                    "\n\nPEER-TO-PEER SWARM MODE: You are an autonomous peer agent in a flat P2P swarm.\n\
+                    No agent holds persistent authority. Peer agents: [{}]\n\
+                    COORDINATION PROTOCOL (Contract Net):\n\
+                      1. PROPOSE: Use bb_propose to post work on the blackboard\n\
+                      2. BID: When you see open tasks via bb_read, use bb_bid with your confidence score (0-1)\n\
+                      3. AWARD: The proposer calls bb_award — highest-confidence bidder wins\n\
+                      4. SEND: After awarding, proposer MUST send_task to winner\n\
+                      5. EXECUTE: The winning agent executes the task\n\
+                      6. COMPLETE: Report results via bb_complete\n\
+                    RULES: Only bid on tasks matching your expertise. Yield to higher-confidence peers.\n\
+                    Avoid livelock — if negotiating too long, accept current best bid.",
+                    others.join(", ")
+                );
+            }
+        }
+        _ => {
+            // Fallback: generic realtime agent
+            prompt += "\n\nComplete tasks using your available tools. Provide clear text responses.";
+            if !downstream.is_empty() {
+                prompt += &format!(
+                    "\nYou can delegate sub-tasks to: [{}]",
+                    downstream.join(", ")
+                );
+            }
+        }
+    }
+
+    prompt += &format!(
+        "\n\nDELEGATION SAFETY RULES (apply in every mode):\n\
+        - NEVER call wait_result on yourself ('{agent_id}') — it deadlocks.\n\
+        - NEVER wait_result on the agent that sent you your current task — it is already \
+          waiting for YOU; finish your work and return your answer as text instead.\n\
+        - Call wait_result exactly once per task you sent (one task = one result).\n\
+        - When you finish your assigned task, your final TEXT response IS your deliverable — \
+          it is automatically returned to whoever delegated to you."
+    );
+    prompt += "\n\nERROR RECOVERY: If a tool fails, analyze the error, fix it, and retry. Try a different approach after two failures.";
+    prompt
+}
+
+/// The LLM loop for a realtime agent — waits for tasks, runs tools, publishes results.
+async fn realtime_agent_loop(
+    agent_def: Value,
+    session_id: String,
+    system_config: Value,
+    api_key: String,
+    api_url: String,
+    model: String,
+    sandbox_dir: String,
+    mut task_rx: tokio::sync::mpsc::Receiver<AgentTask>,
+    results: Arc<TokioMutex<HashMap<String, Vec<AgentResult>>>>,
+    result_notify: Arc<Notify>,
+    status: Arc<TokioMutex<String>>,
+    current_task_from: Arc<TokioMutex<String>>,
+    mut abort_rx: tokio::sync::broadcast::Receiver<()>,
+    cancel_flag: Arc<AtomicBool>,
+) {
+    let agent_id = agent_def["id"].as_str().unwrap_or("agent").to_string();
+
+    // Per-agent model resolution (router mode). Each agent may carry its own
+    // model/api_url/api_key from the generated YAML; fall back to the shared
+    // session values when absent, so every other mode is unchanged.
+    let agent_model = agent_def.get("model").and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| model.clone());
+    let agent_api_url = agent_def.get("api_url").and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| api_url.clone());
+    let agent_api_key = agent_def.get("api_key").and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| api_key.clone());
+
+    // Per-agent loop profile from optional YAML fields (tools/mcp_servers/
+    // skills/loop/compaction/system_prompt). Realtime agents get ONLY their own
+    // YAML fields — the main session's profile governs the orchestrator.
+    let agent_profile = crate::server::services::agent_loop::profile_from_agent_def(&agent_def).map(Arc::new);
+
+    let mut system_prompt = build_realtime_agent_prompt(&agent_def, &system_config);
+    if let Some(sp) = agent_profile.as_deref().and_then(|p| p.system_prompt.as_ref()) {
+        if !sp.text.trim().is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&sp.text);
+        }
+    }
+
+    // Advertise enabled skills (incl. auto-generated) — same block the
+    // orchestrator sees, so realtime agents can discover newly approved skills.
+    match build_enabled_skills_block(Some(SUBAGENT_SKILLS_PERSONA), None).await {
+        block if !block.is_empty() => system_prompt.push_str(&block),
+        _ => {}
+    }
+
+    info!("[Realtime] Agent {} loop started", agent_id);
+
+    loop {
+        // Session was killed while we were busy on the previous task — stop
+        // before picking up anything new (abort_rx may race with a buffered task).
+        if cancel_flag.load(Ordering::Relaxed) {
+            info!("[Realtime] Agent {} stopping — session cancelled", agent_id);
+            break;
+        }
+
+        // Wait for a task or shutdown signal
+        let task = tokio::select! {
+            t = task_rx.recv() => match t {
+                Some(t) => t,
+                None => {
+                    info!("[Realtime] Agent {} channel closed — exiting", agent_id);
+                    break;
+                }
+            },
+            _ = abort_rx.recv() => {
+                info!("[Realtime] Agent {} aborted", agent_id);
+                break;
+            }
+        };
+
+        *status.lock().await = "working".to_string();
+        *current_task_from.lock().await = task.from.clone();
+        info!("[Realtime] Agent {} received task from {}: {:.80}", agent_id, task.from, task.task);
+
+        // ── P2P bid request handling ──────────────────────────────────────
+        // If this is a bid request (from bb_propose in P2P mode), evaluate
+        // with a constrained tool set (bb_read + bb_bid only) and continue.
+        if task.from.starts_with("bid_request:") {
+            info!("[Realtime] Agent {} evaluating bid request: {:.80}", agent_id, task.task);
+            let bid_messages = vec![json!({"role": "user", "content": task.task})];
+            let bid_system = format!(
+                "{}\n\nYou are evaluating a bid request. Read the task details, \
+                 then decide whether to bid using bb_bid (with your confidence 0-1 and reasoning) \
+                 or simply respond with text if you choose not to bid.",
+                system_prompt
+            );
+            let bid_sub = SubAgentConfig {
+                enabled: false,
+                session_id: session_id.clone(),
+                agent_id: agent_id.clone(),
+                cancel_flag: cancel_flag.clone(),
+                ..SubAgentConfig::default()
+            };
+            let bid_log_tx = subagent_log_tx().clone();
+            let bid_log_sid = session_id.clone();
+            let bid_log_aid = agent_id.clone();
+            let bid_progress_sid = session_id.clone();
+            let bid_on_update = move |update: ToolUpdate| {
+                let ts = chrono::Utc::now().format("%H:%M:%S").to_string();
+                let line = match &update {
+                    ToolUpdate::ToolCall { name, args } => {
+                        log_agent_tool_call(&bid_progress_sid, &bid_log_aid, name, args);
+                        let a = serde_json::to_string(args).unwrap_or_default();
+                        let a_short = crate::util::truncate_utf8_ellipsis(&a, 300);
+                        format!("[{}] [{}] BID TOOL CALL: {}\n  args: {}", ts, bid_log_aid, name, a_short)
+                    }
+                    ToolUpdate::ToolResult { name, result } => {
+                        let r = serde_json::to_string(result).unwrap_or_default();
+                        let r_short = crate::util::truncate_utf8_ellipsis(&r, 500);
+                        format!("[{}] [{}] BID TOOL RESULT: {}\n  {}", ts, bid_log_aid, name, r_short)
+                    }
+                    ToolUpdate::TextChunk(t) => {
+                        let clean = strip_think_blocks(t);
+                        if clean.is_empty() { return; }
+                        let display = crate::util::truncate_utf8_ellipsis(&clean, 100);
+                        format!("[{}] [{}] BID TEXT: {}", ts, bid_log_aid, display)
+                    }
+                    ToolUpdate::Error(e) => format!("[{}] [{}] BID ERROR: {}", ts, bid_log_aid, e),
+                    ToolUpdate::ApprovalRequired { name, .. } => format!("[{}] [{}] BID APPROVAL: {}", ts, bid_log_aid, name),
+                };
+                let _ = bid_log_tx.send((bid_log_sid.clone(), bid_log_aid.clone(), line));
+            };
+            // Use the standard call_with_tools (non-realtime, no delegation) —
+            // the dispatcher already routes bb_bid / bb_read to the correct handlers.
+            let _ = call_with_tools(
+                &api_key, &api_url, &model, bid_messages,
+                Some(bid_system), &sandbox_dir, bid_on_update, bid_sub,
+            ).await;
+            *current_task_from.lock().await = String::new();
+            *status.lock().await = "idle".to_string();
+            continue;
+        }
+        // ── End bid request handling ──────────────────────────────────────
+
+        // Build messages for this agent's LLM call
+        let user_content = if let Some(ctx) = &task.context {
+            format!("Task from {}: {}\n\nContext: {}", task.from, task.task, ctx)
+        } else {
+            format!("Task from {}: {}", task.from, task.task)
+        };
+
+        // (conversation for the agent is built per attempt below — step
+        // verification may retry with feedback appended)
+
+        // Sub-agent config: who gets send_task/wait_result depends on orchestration mode
+        let role = agent_def["role"].as_str().unwrap_or("worker");
+        let orch_mode = system_config["system"]["orchestration_mode"]
+            .as_str().unwrap_or("hierarchical");
+        let is_orchestrator = role == "orchestrator";
+        let has_mesh = agent_has_mesh(&agent_def);
+        let downstream = get_downstream(&agent_id, &system_config);
+
+        // Determine if this agent can delegate (gets send_task/wait_result)
+        let can_delegate = match orch_mode {
+            "hierarchical" => is_orchestrator || !downstream.is_empty(),
+            "hybrid" => is_orchestrator || has_mesh || !downstream.is_empty(),
+            "mesh" => true,           // all agents can send to any other
+            "pipeline" => !downstream.is_empty(), // only if has next stage
+            "p2p" | "p2p_orchestrator" => true, // all peers can delegate
+            // Flat fan-out (router): workers are LEAF nodes. Only the top-level
+            // caller orchestrates — workers must not delegate to each other or to
+            // a stray sub-orchestrator, which otherwise tangles into queued loops.
+            "flat" => false,
+            _ => is_orchestrator || !downstream.is_empty(),
+        };
+
+        // Determine which agents this agent can reach
+        let reachable_ids: Vec<String> = match orch_mode {
+            "mesh" | "p2p" | "p2p_orchestrator" => {
+                // Can reach ANY non-human agent
+                all_non_human_ids(&system_config).into_iter()
+                    .filter(|id| id != &agent_id)
+                    .collect()
+            }
+            "hybrid" if has_mesh => {
+                // Mesh agents can reach any other agent
+                all_non_human_ids(&system_config).into_iter()
+                    .filter(|id| id != &agent_id)
+                    .collect()
+            }
+            _ => {
+                // Hierarchical/pipeline/hybrid non-mesh: only downstream
+                downstream.clone()
+            }
+        };
+
+        let sub_agent = SubAgentConfig {
+            enabled: can_delegate,
+            mode: if can_delegate { "manual".to_string() } else { String::new() },
+            agent_ids: reachable_ids,
+            session_id: session_id.clone(),
+            agent_id: agent_id.clone(),
+            agent_role: role.to_string(),
+            cancel_flag: cancel_flag.clone(),
+            loop_profile: agent_profile.clone(),
+            ..SubAgentConfig::default()
+        };
+
+        let result_arc = results.clone();
+        let notify_arc = result_notify.clone();
+        let _aid = agent_id.clone();
+        let status_arc = status.clone();
+
+        let log_tx = subagent_log_tx().clone();
+        let fwd_log_tx = log_tx.clone(); // for pipeline auto-forward logging
+        let verify_log_tx = log_tx.clone(); // for step-verification logging
+        let log_sid = session_id.clone();
+        let log_aid = agent_id.clone();
+        let progress_sid = session_id.clone(); // for activity log
+        let progress_aid = agent_id.clone(); // agent ID for activity log
+        let on_update_cb = move |update: ToolUpdate| {
+            let ts = chrono::Utc::now().format("%H:%M:%S").to_string();
+            let line = match &update {
+                ToolUpdate::ToolCall { name, args } => {
+                    // Mirror agent tool calls into the Activity panel
+                    log_agent_tool_call(&progress_sid, &progress_aid, name, args);
+
+                    let args_str = serde_json::to_string(args).unwrap_or_default();
+                    let args_short = crate::util::truncate_utf8_ellipsis(&args_str, 300);
+                    format!("[{}] [{}] TOOL CALL: {}\n  args: {}", ts, log_aid, name, args_short)
+                }
+                ToolUpdate::ToolResult { name, result } => {
+                    let r_str = serde_json::to_string(result).unwrap_or_default();
+                    let r_short = crate::util::truncate_utf8_ellipsis(&r_str, 500);
+                    format!("[{}] [{}] TOOL RESULT: {}\n  {}", ts, log_aid, name, r_short)
+                }
+                ToolUpdate::TextChunk(t) => {
+                    let clean = strip_think_blocks(t);
+                    if clean.is_empty() { return; }
+                    let display = crate::util::truncate_utf8_ellipsis(&clean, 100);
+                    format!("[{}] [{}] TEXT: {}", ts, log_aid, display)
+                }
+                ToolUpdate::Error(e) => {
+                    format!("[{}] [{}] ERROR: {}", ts, log_aid, e)
+                }
+                ToolUpdate::ApprovalRequired { name, .. } => {
+                    format!("[{}] [{}] APPROVAL REQUIRED: {}", ts, log_aid, name)
+                }
+            };
+            let _ = log_tx.send((log_sid.clone(), log_aid.clone(), line));
+        };
+        // Check agent type: "remote", "cli", or default "llm"
+        let agent_type = agent_def.get("type").and_then(|v| v.as_str()).unwrap_or("llm");
+
+        // The on_update closure is consumed by each call_with_tools invocation;
+        // step-verification retries need it again, so share it via Arc.
+        let on_update_arc: Arc<dyn Fn(ToolUpdate) + Send + Sync + 'static> = Arc::new(on_update_cb);
+
+        // Step verification: judge each finished step against its assigned
+        // task; on failure, retry the same agent with the judge's gap list.
+        // Per-agent profile knob wins over the global setting.
+        let vsettings = load_agent_settings();
+        let step_verify = agent_profile
+            .as_deref()
+            .and_then(|p| p.loop_.as_ref())
+            .and_then(|l| l.step_verification)
+            .unwrap_or_else(|| vsettings["agentStepVerifyEnabled"].as_bool().unwrap_or(true));
+        let verify_threshold = vsettings["agentStepVerifyThreshold"].as_f64().unwrap_or(0.7);
+        let verify_max_retries = vsettings["agentStepVerifyMaxRetries"].as_u64().unwrap_or(1) as usize;
+
+        let mut attempt_messages = vec![json!({"role": "user", "content": user_content})];
+        let mut effective_task = user_content.clone(); // retry carrier for remote/cli agents
+        let mut verdict: Option<JudgeVerdict> = None;
+        let mut verified: Option<bool> = None;
+        let judge_client = Client::new();
+        let mut attempt: usize = 0;
+
+        let loop_result = loop {
+            let result = match agent_type {
+                "remote" => {
+                    // Delegate to a remote TigrimOS instance
+                    let remote_url = agent_def.get("remote_url")
+                        .or_else(|| agent_def.get("url"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let remote_token = agent_def.get("remote_token")
+                        .or_else(|| agent_def.get("token"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if remote_url.is_empty() {
+                        ToolLoopResult {
+                            content: format!("Remote agent '{}' has no URL configured", agent_id),
+                            tool_results: vec![],
+                            files: vec![],
+                        }
+                    } else {
+                        info!("[Realtime] Agent {} delegating to remote: {}", agent_id, remote_url);
+                        let result = exec_remote_task(&json!({
+                            "instance": json!({"url": remote_url, "token": remote_token}).to_string(),
+                            "task": effective_task,
+                        })).await;
+                        ToolLoopResult {
+                            content: result["result"].as_str().unwrap_or(
+                                result["error"].as_str().unwrap_or("Remote task completed")
+                            ).to_string(),
+                            tool_results: vec![],
+                            files: vec![],
+                        }
+                    }
+                }
+                "cli" => {
+                    // Route to a CLI agent (claude_code or codex)
+                    let cli_provider = agent_def.get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("claude_code");
+
+                    info!("[Realtime] Agent {} running via CLI provider: {}", agent_id, cli_provider);
+                    let cli_result = match cli_provider {
+                        "codex" => {
+                            exec_run_shell(&json!({
+                                "command": format!("echo '{}' | codex --quiet", effective_task.replace('\'', "'\\''")),
+                            }), &sandbox_dir).await
+                        }
+                        _ => {
+                            // Default to claude_code CLI
+                            exec_run_shell(&json!({
+                                "command": format!("echo '{}' | claude --print", effective_task.replace('\'', "'\\''")),
+                            }), &sandbox_dir).await
+                        }
+                    };
+                    ToolLoopResult {
+                        content: cli_result["stdout"].as_str()
+                            .or(cli_result["output"].as_str())
+                            .unwrap_or("CLI agent completed").to_string(),
+                        tool_results: vec![],
+                        files: vec![],
+                    }
+                }
+                _ => {
+                    // Default LLM agent — run on the agent's own model, with
+                    // bounded failover to the next pool model on a terminal error.
+                    // Outside router mode the candidate list is just [self], so
+                    // this loop runs exactly once (identical to before).
+                    let candidates = build_failover_candidates(
+                        &agent_def, &system_config,
+                        &agent_model, &agent_api_url, &agent_api_key,
+                    );
+                    let mut llm_result = ToolLoopResult {
+                        content: String::new(), tool_results: vec![], files: vec![],
+                    };
+                    for (i, (m, u, k)) in candidates.iter().take(3).enumerate() {
+                        let cb = on_update_arc.clone();
+                        llm_result = if can_delegate {
+                            call_with_tools_realtime(
+                                k, u, m, attempt_messages.clone(),
+                                Some(system_prompt.clone()), &sandbox_dir,
+                                move |x| cb(x), sub_agent.clone(),
+                            ).await
+                        } else {
+                            call_with_tools(
+                                k, u, m, attempt_messages.clone(),
+                                Some(system_prompt.clone()), &sandbox_dir,
+                                move |x| cb(x), sub_agent.clone(),
+                            ).await
+                        };
+                        if !is_terminal_llm_error(&llm_result.content) {
+                            break;
+                        }
+                        if i + 1 < candidates.len().min(3) {
+                            warn!(
+                                "[Router] Agent {} model '{}' failed (attempt {}), routing to next model",
+                                agent_id, m, i + 1
+                            );
+                            append_session_progress(
+                                &session_id,
+                                &format!(
+                                    "> ⚠ **{}** model `{}` failed — routing to next model\n",
+                                    agent_id, m
+                                ),
+                            );
+                        }
+                    }
+                    llm_result
+                }
+            };
+
+            if !step_verify {
+                break result;
+            }
+
+            // Judge the step result against the assigned task
+            let mut evidence = summarize_tool_records(&result.tool_results);
+            evidence.push_str(&format!(
+                "FILES GENERATED: {}",
+                if result.files.is_empty() { "(none)".to_string() } else { result.files.join(", ") }
+            ));
+            let objective = match &task.context {
+                Some(ctx) => format!("{}\n\nContext: {}", task.task, ctx),
+                None => task.task.clone(),
+            };
+
+            match judge_task_result(
+                &judge_client, &api_key, &api_url, &model,
+                &objective, &evidence, &result.content,
+                "its assigned task",
+            ).await {
+                None => break result, // judge call/parse failed → fail open
+                Some(v) if v.satisfied || v.score >= verify_threshold => {
+                    info!("[StepVerify] Agent {} passed (score {:.2})", agent_id, v.score);
+                    append_session_progress(&session_id,
+                        &format!("> ✓ **{}** step verified (score {:.2})\n", agent_id, v.score));
+                    let _ = verify_log_tx.send((session_id.clone(), agent_id.clone(),
+                        format!("[{}] [{}] STEP VERIFIED: score {:.2}",
+                            chrono::Utc::now().format("%H:%M:%S"), agent_id, v.score)));
+                    verified = Some(true);
+                    verdict = Some(v);
+                    break result;
+                }
+                Some(v) if attempt >= verify_max_retries => {
+                    warn!("[StepVerify] Agent {} UNVERIFIED after {} retries (score {:.2}): {}",
+                        agent_id, attempt, v.score, crate::util::truncate_utf8(&v.missing, 200));
+                    append_session_progress(&session_id,
+                        &format!("> ✗ **{}** delivered UNVERIFIED (score {:.2})\n", agent_id, v.score));
+                    let _ = verify_log_tx.send((session_id.clone(), agent_id.clone(),
+                        format!("[{}] [{}] STEP UNVERIFIED: score {:.2} — {}",
+                            chrono::Utc::now().format("%H:%M:%S"), agent_id, v.score,
+                            crate::util::truncate_utf8(&v.missing, 200))));
+                    verified = Some(false);
+                    verdict = Some(v);
+                    break result;
+                }
+                Some(v) => {
+                    attempt += 1;
+                    info!("[StepVerify] Agent {} retry {}/{} (score {:.2}): {}",
+                        agent_id, attempt, verify_max_retries, v.score,
+                        crate::util::truncate_utf8(&v.missing, 200));
+                    append_session_progress(&session_id,
+                        &format!("> ↻ **{}** step verify retry {}/{} (score {:.2}): {}\n",
+                            agent_id, attempt, verify_max_retries, v.score,
+                            crate::util::truncate_utf8(&v.missing, 160)));
+                    let _ = verify_log_tx.send((session_id.clone(), agent_id.clone(),
+                        format!("[{}] [{}] STEP VERIFY RETRY {}/{}: score {:.2} — {}",
+                            chrono::Utc::now().format("%H:%M:%S"), agent_id, attempt,
+                            verify_max_retries, v.score, crate::util::truncate_utf8(&v.missing, 200))));
+
+                    let feedback = format!(
+                        "⚠️ STEP VERIFICATION: your result scored {:.1}/1.0 (threshold {:.1}). Gaps found:\n{}\n\n\
+                        Fix ONLY what is missing and return the COMPLETE result (previous correct parts included).",
+                        v.score, verify_threshold, v.missing
+                    );
+                    attempt_messages.push(json!({"role": "assistant", "content": result.content}));
+                    attempt_messages.push(json!({"role": "user", "content": feedback}));
+                    effective_task = format!(
+                        "{}\n\nYOUR PREVIOUS ATTEMPT:\n{}\n\n{}",
+                        user_content, crate::util::truncate_utf8(&result.content, 4000), feedback
+                    );
+                    verdict = Some(v);
+                    // continue loop → re-run agent
+                }
+            }
+        };
+
+        let agent_result = AgentResult {
+            result: if loop_result.content.is_empty() {
+                "Task completed.".to_string()
+            } else {
+                loop_result.content.clone()
+            },
+            output_files: loop_result.files.clone(),
+            ok: true,
+            error: None,
+            verified,
+            verify_score: verdict.as_ref().map(|v| v.score),
+            verify_gaps: verdict.as_ref().and_then(|v| {
+                if v.missing.trim().is_empty() { None } else { Some(v.missing.clone()) }
+            }),
+        };
+
+        info!("[Realtime] Agent {} finished. Result length: {}", agent_id, agent_result.result.len());
+
+        // Pipeline auto-forwarding: if this agent has a downstream target in pipeline mode,
+        // automatically send_task to the next agent in the chain.
+        let orch_mode = system_config["system"]["orchestration_mode"]
+            .as_str().unwrap_or("hierarchical");
+        if orch_mode == "pipeline" {
+            let downstream = get_downstream(&agent_id, &system_config);
+            if let Some(next_agent) = downstream.first() {
+                info!("[Realtime] Pipeline auto-forward: {} → {}", agent_id, next_agent);
+                let forward_task = format!(
+                    "Previous pipeline stage ({}) produced the following result. Continue processing:\n\n{}",
+                    agent_id, loop_result.content
+                );
+                let forward_args = serde_json::json!({
+                    "to": next_agent,
+                    "task": forward_task,
+                });
+                let fwd_result = exec_send_task_from(&forward_args, &session_id, &agent_id).await;
+                let fwd_ok = fwd_result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                if fwd_ok {
+                    info!("[Realtime] Pipeline auto-forward {} → {} succeeded", agent_id, next_agent);
+                    let _ = fwd_log_tx.send((
+                        session_id.clone(), agent_id.clone(),
+                        format!("[{}] [{}] PIPELINE FORWARD → {}", chrono::Utc::now().format("%H:%M:%S"), agent_id, next_agent),
+                    ));
+                } else {
+                    warn!("[Realtime] Pipeline auto-forward {} → {} failed: {:?}", agent_id, next_agent, fwd_result);
+                }
+            }
+        }
+
+        // Publish result — consumed by wait_result. Push (not insert) so an
+        // agent with multiple queued tasks doesn't overwrite earlier results
+        // before the requester collects them.
+        {
+            let mut map = result_arc.lock().await;
+            map.entry(agent_id.clone()).or_default().push(agent_result);
+        }
+        notify_arc.notify_waiters();
+
+        *current_task_from.lock().await = String::new();
+        *status_arc.lock().await = "idle".to_string();
+    }
+}
+
+/// Tool: send_task — sends a task to a realtime agent with mode-aware access control
+pub async fn exec_send_task(args: &Value, session_id: &str) -> Value {
+    exec_send_task_from(args, session_id, "main").await
+}
+
+/// send_task with caller ID for access control
+pub async fn exec_send_task_from(args: &Value, session_id: &str, caller_id: &str) -> Value {
+    let to = match args.get("to").and_then(|v| v.as_str())
+        .or_else(|| args.get("agent_name").and_then(|v| v.as_str()))
+        .or_else(|| args.get("agentId").and_then(|v| v.as_str()))
+        .or_else(|| args.get("agent_id").and_then(|v| v.as_str())) {
+        Some(s) => s.to_string(),
+        None => return json!({"ok": false, "error": "Missing 'to' parameter"}),
+    };
+    let task = match args.get("task").and_then(|v| v.as_str())
+        .or_else(|| args.get("task_description").and_then(|v| v.as_str()))
+        .or_else(|| args.get("message").and_then(|v| v.as_str())) {
+        Some(s) => s.to_string(),
+        None => return json!({"ok": false, "error": "Missing 'task' parameter"}),
+    };
+    let context = args.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let session_arc = {
+        let map = realtime_sessions().lock().await;
+        match map.get(session_id) {
+            Some(s) => s.clone(),
+            None => return json!({"ok": false, "error": "No realtime session active. Ensure sub-agent mode is 'realtime'."}),
+        }
+    };
+    let session = session_arc.lock().await;
+
+    // Access control based on orchestration mode
+    let orch_mode = session.system_config["system"]["orchestration_mode"]
+        .as_str().unwrap_or("hierarchical");
+
+    let handle = match session.agents.get(&to) {
+        Some(h) => h,
+        None => {
+            let available: Vec<&str> = session.agents.keys().map(|s| s.as_str()).collect();
+            return json!({"ok": false, "error": format!("Agent '{}' not found. Available: {}", to, available.join(", "))});
+        }
+    };
+
+    // When "main" sends tasks in hierarchical/hybrid mode, enforce orchestrator-first routing.
+    // The main LLM must delegate through the orchestrator, not directly to workers.
+    if caller_id == "main" && matches!(orch_mode, "hierarchical" | "hybrid") {
+        // Find if there's an orchestrator agent in the session
+        let has_orchestrator = session.agents.iter().any(|(_, h)| {
+            h.agent_def.get("role").and_then(|r| r.as_str()) == Some("orchestrator")
+        });
+        if has_orchestrator {
+            let target_role = handle.agent_def["role"].as_str().unwrap_or("");
+            if target_role != "orchestrator" {
+                // Find the orchestrator's ID for the error message
+                let orch_id = session.agents.iter()
+                    .find(|(_, h)| h.agent_def.get("role").and_then(|r| r.as_str()) == Some("orchestrator"))
+                    .map(|(id, _)| id.as_str())
+                    .unwrap_or("orchestrator");
+                return json!({
+                    "ok": false,
+                    "error": format!("In {} mode, tasks must go through the orchestrator '{}' first. Send your task to the orchestrator, who will delegate to workers.", orch_mode, orch_id)
+                });
+            }
+        }
+    }
+
+    // Hierarchical/pipeline: enforce connection-based access control
+    if matches!(orch_mode, "hierarchical" | "pipeline") && caller_id != "main" {
+        let caller_def = session.system_config["agents"].as_array()
+            .and_then(|arr| arr.iter().find(|a| a["id"].as_str() == Some(caller_id)));
+
+        // Block non-orchestrators from sending to orchestrator (circular delegation)
+        let target_role = handle.agent_def["role"].as_str().unwrap_or("");
+        if target_role == "orchestrator" && caller_def.map(|d| d["role"].as_str() != Some("orchestrator")).unwrap_or(true) {
+            return json!({"ok": false, "error": format!("Agent '{}' cannot send tasks to orchestrator (circular delegation)", caller_id)});
+        }
+
+        // Check connections
+        let downstream = get_downstream(caller_id, &session.system_config);
+        if !downstream.is_empty() && !downstream.contains(&to) {
+            return json!({"ok": false, "error": format!("Agent '{}' is not connected to '{}'. Connected to: {}", caller_id, to, downstream.join(", "))});
+        }
+    }
+    // hybrid: mesh agents bypass, others check connections
+    else if orch_mode == "hybrid" && caller_id != "main" {
+        let caller_def = session.system_config["agents"].as_array()
+            .and_then(|arr| arr.iter().find(|a| a["id"].as_str() == Some(caller_id)));
+
+        // Block non-orchestrators from sending to orchestrator (circular delegation)
+        let target_role = handle.agent_def["role"].as_str().unwrap_or("");
+        if target_role == "orchestrator" {
+            if caller_def.map(|d| d["role"].as_str() != Some("orchestrator")).unwrap_or(true) {
+                return json!({"ok": false, "error": format!("Agent '{}' cannot send tasks to orchestrator (circular delegation)", caller_id)});
+            }
+        }
+
+        let caller_has_mesh = caller_def.map(|d| agent_has_mesh(d)).unwrap_or(false);
+        if !caller_has_mesh {
+            let downstream = get_downstream(caller_id, &session.system_config);
+            if !downstream.is_empty() && !downstream.contains(&to) {
+                return json!({"ok": false, "error": format!("Agent '{}' is not connected to '{}'", caller_id, to)});
+            }
+        }
+    }
+    // p2p_orchestrator: bidder-only agents must be awarded on blackboard first
+    else if orch_mode == "p2p_orchestrator" && caller_id != "main" {
+        let caller_def = session.system_config["agents"].as_array()
+            .and_then(|arr| arr.iter().find(|a| a["id"].as_str() == Some(caller_id)));
+        let is_caller_orchestrator = caller_def
+            .map(|d| d["role"].as_str() == Some("orchestrator"))
+            .unwrap_or(false);
+
+        if is_caller_orchestrator {
+            // Orchestrator can send to direct agents (in connections/workflow) freely.
+            // But bidder-only agents (not in connections) require blackboard award first.
+            let downstream = get_downstream(caller_id, &session.system_config);
+            if !downstream.contains(&to) {
+                // Check if target was awarded on blackboard
+                let was_awarded = protocols::blackboard_check_awarded(session_id, &to).await;
+                if !was_awarded {
+                    return json!({
+                        "ok": false,
+                        "error": format!(
+                            "Agent '{}' is a bidder-only agent — not in your direct connections [{}]. \
+                             You must use blackboard bidding first: bb_propose → wait for bids → bb_award, \
+                             then send_task to the awarded winner.",
+                            to, downstream.join(", ")
+                        )
+                    });
+                }
+            }
+        }
+    }
+    // mesh, p2p: no access control — any agent can send to any
+
+    // Clone what we need and release the session lock BEFORE the (potentially
+    // blocking) channel send — the target agent's queue can be full, and holding
+    // the lock here would deadlock wait_result/check_agents/status polling.
+    let task_tx = handle.task_tx.clone();
+    let agent_name = handle.agent_def["name"].as_str().unwrap_or(&to).to_string();
+    let target_busy = handle.status.lock().await.as_str() == "working";
+    drop(session);
+
+    // Tasks queue FIFO behind whatever the agent is already doing — surface
+    // that so the caller doesn't expect an instant turnaround or flood the queue.
+    let queued_ahead = task_tx.max_capacity().saturating_sub(task_tx.capacity());
+
+    let agent_task = AgentTask { from: caller_id.to_string(), task: task.clone(), context };
+    match task_tx.send(agent_task).await {
+        Ok(_) => {
+            let mut note = format!("Task sent to {}. Use wait_result({{\"from\": \"{}\"}}) to collect the result.", to, to);
+            if target_busy || queued_ahead > 0 {
+                note.push_str(&format!(
+                    " NOTE: {} is currently busy{} — your task is queued and will run after the current work. \
+                     Each task produces exactly one result: call wait_result once per task you sent.",
+                    to,
+                    if queued_ahead > 0 { format!(" with {} task(s) already queued", queued_ahead) } else { String::new() }
+                ));
+            }
+            json!({
+                "ok": true,
+                "agentId": to,
+                "agentName": agent_name,
+                "sent": true,
+                "queued_ahead": queued_ahead,
+                "note": note
+            })
+        }
+        Err(e) => json!({"ok": false, "error": format!("Failed to send task: {e}")}),
+    }
+}
+
+/// Build the wait_result success JSON, including the step-verification verdict
+/// when verification ran. A failed verdict carries a hint so the orchestrator
+/// LLM knows it may re-delegate.
+fn wait_result_json(from: &str, result: &AgentResult) -> Value {
+    let mut out = json!({
+        "ok": result.ok,
+        "agentId": from,
+        "result": result.result,
+        "output_files": result.output_files,
+    });
+    if let Some(verified) = result.verified {
+        out["verified"] = json!(verified);
+        if let Some(score) = result.verify_score {
+            out["verify_score"] = json!(score);
+        }
+        if !verified {
+            if let Some(ref gaps) = result.verify_gaps {
+                out["verify_gaps"] = json!(gaps);
+            }
+            out["hint"] = json!(
+                "Result did NOT pass step verification after retries. Review verify_gaps — \
+                consider re-delegating with a more specific task or to a different agent."
+            );
+        }
+    }
+    out
+}
+
+/// Pop the oldest pending result for `from` (FIFO). Removes the key when empty.
+fn pop_result(map: &mut HashMap<String, Vec<AgentResult>>, from: &str) -> Option<AgentResult> {
+    let queue = map.get_mut(from)?;
+    if queue.is_empty() { map.remove(from); return None; }
+    let result = queue.remove(0);
+    if queue.is_empty() { map.remove(from); }
+    Some(result)
+}
+
+/// Tool: wait_result — blocks until the target agent publishes its result.
+/// Caller defaults to "main" (desktop UI / web orchestrator path).
+pub async fn exec_wait_result(args: &Value, session_id: &str) -> Value {
+    exec_wait_result_from(args, session_id, "main").await
+}
+
+/// wait_result with caller identity — enables self-wait and circular-wait
+/// (deadlock) detection: agent A waiting on B while B waits on A would
+/// otherwise spin until the hard timeout, which is what made long
+/// multi-agent sessions "never finish".
+pub async fn exec_wait_result_from(args: &Value, session_id: &str, caller_id: &str) -> Value {
+    let from = match args.get("from").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return json!({"ok": false, "error": "Missing 'from' parameter"}),
+    };
+
+    // Self-wait guard: an agent waiting on its own result deadlocks (its own
+    // status is "working" because it is the one calling) and can even steal
+    // its previously published result from the requester.
+    if from == caller_id {
+        return json!({
+            "ok": false,
+            "error": format!("You ('{}') cannot wait_result on yourself — that deadlocks.", caller_id),
+            "hint": "Finish your own task and return your final answer as text. \
+                     The agent that delegated to you will receive it automatically."
+        });
+    }
+
+    let settings = load_agent_settings();
+    let default_timeout = settings["agentWaitResultTimeout"].as_u64().unwrap_or(300);
+    let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(default_timeout).max(5);
+    // Hard limit per wait_result call — auto-retry internally up to this long.
+    // Configurable; the coordinator can always call wait_result again.
+    let hard_limit_secs: u64 = settings["agentWaitResultHardTimeout"].as_u64().unwrap_or(1800).max(60);
+
+    let (results, result_notify, waiting_on, wait_hard_timeouts) = {
+        let map = realtime_sessions().lock().await;
+        match map.get(session_id) {
+            Some(s) => {
+                let session = s.lock().await;
+                if !session.agents.contains_key(&from) {
+                    let available: Vec<&str> = session.agents.keys().map(|s| s.as_str()).collect();
+                    return json!({"ok": false, "error": format!("Agent '{}' not found. Available: {}", from, available.join(", "))});
+                }
+                // Delegator-wait guard: if the caller's CURRENT task was sent by
+                // `from`, then `from` is upstream expecting the caller's result —
+                // waiting on it is a guaranteed deadlock (observed in the wild as
+                // worker ⇄ orchestrator mutual waits that spin for hours).
+                if let Some(caller_handle) = session.agents.get(caller_id) {
+                    let delegator = caller_handle.current_task_from.lock().await.clone();
+                    if !delegator.is_empty() && delegator == from {
+                        return json!({
+                            "ok": false,
+                            "error": format!(
+                                "You cannot wait_result on '{}' — it delegated your CURRENT task to you \
+                                 and is waiting for YOUR result. This would deadlock.", from
+                            ),
+                            "hint": "Finish your assigned task and return your final answer as text — \
+                                     it is delivered to your delegator automatically."
+                        });
+                    }
+                }
+                (session.results.clone(), session.result_notify.clone(),
+                 session.waiting_on.clone(), session.wait_hard_timeouts.clone())
+            }
+            None => return json!({"ok": false, "error": "No realtime session active."}),
+        }
+    };
+
+    // Circular-wait (deadlock) detection: follow the chain of who `from` is
+    // waiting on; if it leads back to the caller, this wait can never finish.
+    // Skip when a result is already pending — then the wait returns instantly.
+    {
+        let pending = { results.lock().await.get(&from).map_or(false, |q| !q.is_empty()) };
+        if !pending {
+            let waits = waiting_on.lock().await;
+            let mut current = from.clone();
+            let mut chain = vec![from.clone()];
+            for _ in 0..waits.len() + 1 {
+                match waits.get(&current) {
+                    Some(next) => {
+                        chain.push(next.clone());
+                        if next == caller_id {
+                            warn!("[wait_result] Deadlock detected: {} → {}", caller_id, chain.join(" → "));
+                            return json!({
+                                "ok": false,
+                                "error": format!(
+                                    "Deadlock detected: '{}' is itself waiting for YOUR ('{}') result (chain: {} → {}). \
+                                     Waiting here would block forever.",
+                                    from, caller_id, caller_id, chain.join(" → ")
+                                ),
+                                "hint": "Do NOT wait for this agent. Finish your own task with the information you \
+                                         already have and return your final answer as text — the waiting agent will \
+                                         receive it and the deadlock resolves."
+                            });
+                        }
+                        current = next.clone();
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // Register this wait edge for cycle detection by other agents,
+    // and make sure it is removed on every exit path below.
+    { waiting_on.lock().await.insert(caller_id.to_string(), from.clone()); }
+    let out = wait_result_inner(
+        session_id, caller_id, &from, timeout_secs, hard_limit_secs,
+        &results, &result_notify, &waiting_on, &wait_hard_timeouts,
+    ).await;
+    { waiting_on.lock().await.remove(caller_id); }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_result_inner(
+    session_id: &str,
+    caller_id: &str,
+    from: &str,
+    timeout_secs: u64,
+    hard_limit_secs: u64,
+    results: &Arc<TokioMutex<HashMap<String, Vec<AgentResult>>>>,
+    result_notify: &Arc<Notify>,
+    waiting_on: &Arc<TokioMutex<HashMap<String, String>>>,
+    wait_hard_timeouts: &Arc<TokioMutex<HashMap<String, u32>>>,
+) -> Value {
+    let edge_key = format!("{}->{}", caller_id, from);
+    let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(hard_limit_secs);
+    let mut total_waited: u64 = 0;
+
+    loop {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+        loop {
+            // Check if result is already available
+            {
+                let mut map = results.lock().await;
+                if let Some(result) = pop_result(&mut map, from) {
+                    info!("[wait_result] Got result from '{}' after ~{}s", from, total_waited);
+                    wait_hard_timeouts.lock().await.remove(&edge_key);
+                    return wait_result_json(from, &result);
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { break; } // inner timeout → check if agent still working
+
+            tokio::select! {
+                _ = result_notify.notified() => continue,
+                _ = tokio::time::sleep(remaining) => { break; }
+            }
+        }
+
+        total_waited += timeout_secs;
+
+        // Check if agent is still working — if so, auto-retry the wait.
+        // task_tx.is_closed() means the agent's task loop terminated (e.g. panicked):
+        // its status will never change again, so report instead of waiting out the hard limit.
+        let (still_working, agent_dead) = {
+            let map = realtime_sessions().lock().await;
+            if let Some(s) = map.get(session_id) {
+                let session = s.lock().await;
+                if let Some(handle) = session.agents.get(from) {
+                    let status = handle.status.lock().await;
+                    (status.as_str() == "working", handle.task_tx.is_closed())
+                } else { (false, false) }
+            } else { (false, false) }
+        };
+
+        if agent_dead {
+            return json!({
+                "ok": false,
+                "error": format!("Agent '{}' crashed — its task loop terminated unexpectedly.", from),
+                "agentId": from,
+                "hint": "Re-send the task to another agent or restart the session."
+            });
+        }
+
+        // Deadlock can also FORM while we are already blocked here (the target
+        // starts waiting on us after our wait began) — re-check each round.
+        {
+            let waits = waiting_on.lock().await;
+            let mut current = from.to_string();
+            for _ in 0..waits.len() + 1 {
+                match waits.get(&current) {
+                    Some(next) if next == caller_id => {
+                        warn!("[wait_result] Deadlock formed while waiting: {} ↔ {}", caller_id, from);
+                        return json!({
+                            "ok": false,
+                            "error": format!(
+                                "Deadlock: '{}' started waiting for YOUR ('{}') result while you were waiting for it.",
+                                from, caller_id
+                            ),
+                            "hint": "Stop waiting. Finish your own task and return your final answer as text."
+                        });
+                    }
+                    Some(next) => current = next.clone(),
+                    None => break,
+                }
+            }
+        }
+
+        if still_working && tokio::time::Instant::now() < hard_deadline {
+            info!("[wait_result] Agent '{}' still working after {}s — auto-retrying wait", from, total_waited);
+            continue; // auto-retry
+        }
+
+        // Agent stopped or hard limit reached
+        if still_working {
+            let strikes = {
+                let mut map = wait_hard_timeouts.lock().await;
+                let n = map.entry(edge_key.clone()).or_insert(0);
+                *n += 1;
+                *n
+            };
+            // Show what the target is doing — if it's blocked on someone else,
+            // the caller LLM can reason about the chain instead of blind-waiting.
+            let target_waiting_on = waiting_on.lock().await.get(from).cloned();
+            let detail = match &target_waiting_on {
+                Some(t) => format!("'{}' is currently blocked waiting for '{}'.", from, t),
+                None => format!("'{}' is actively executing tools.", from),
+            };
+            let hint = if strikes >= 2 {
+                format!(
+                    "You have now waited {} times ({}s total) without a result. STOP waiting. \
+                     Use list_files + read_file to inspect the work files produced so far, \
+                     assemble the best possible final answer from them, and respond. \
+                     Do NOT call wait_result for '{}' again.",
+                    strikes, strikes as u64 * hard_limit_secs, from
+                )
+            } else {
+                "Call wait_result again to continue waiting. Do NOT resend the task.".to_string()
+            };
+            return json!({
+                "ok": false,
+                "error": format!("Agent '{}' is still working but hard timeout ({}s) reached. {}", from, hard_limit_secs, detail),
+                "agentId": from,
+                "hard_timeouts": strikes,
+                "hint": hint
+            });
+        } else {
+            // Agent finished but no result in map — retry a few times with brief delays
+            // (race: status set to idle slightly after result insertion)
+            for retry in 0..5 {
+                if retry > 0 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                let mut map = results.lock().await;
+                if let Some(result) = pop_result(&mut map, from) {
+                    info!("[wait_result] Got result from '{}' on idle-retry {}", from, retry);
+                    wait_hard_timeouts.lock().await.remove(&edge_key);
+                    return wait_result_json(from, &result);
+                }
+            }
+            return json!({
+                "ok": false,
+                "error": format!("Agent '{}' finished but no result was produced after {}s.", from, total_waited),
+                "agentId": from,
+                "hint": "The agent may have encountered an error. Check with check_agents or send a new task."
+            });
+        }
+    }
+}
+
+/// Tool: check_agents — list status of all agents in the realtime session
+pub async fn exec_check_agents(session_id: &str) -> Value {
+    let map = realtime_sessions().lock().await;
+    match map.get(session_id) {
+        Some(session_arc) => {
+            let session = session_arc.lock().await;
+            let mut agents = vec![];
+            for (id, handle) in &session.agents {
+                let status = handle.status.lock().await.clone();
+                agents.push(json!({
+                    "id": id,
+                    "name": handle.agent_def["name"].as_str().unwrap_or(id),
+                    "role": handle.agent_def["role"].as_str().unwrap_or("worker"),
+                    "status": status,
+                }));
+            }
+            json!({"ok": true, "agents": agents, "total": agents.len()})
+        }
+        None => json!({"ok": false, "error": "No realtime session active."}),
+    }
+}
+
+/// Load agent system YAML and return parsed Value + list of agent IDs
+pub fn load_agent_yaml(filename: &str) -> Option<(Value, Vec<String>)> {
+    let fp = crate::server::data::resolve_config_file(&format!("agents/{}", filename));
+    let content = std::fs::read_to_string(&fp).ok()?;
+    let parsed: Value = serde_yaml::from_str(&content).ok()?;
+    let ids = parsed
+        .get("agents")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .filter(|id| id != "human")
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((parsed, ids))
+}
+
+/// Build a system prompt for a specific agent from the YAML config
+fn build_agent_system_prompt(agent_def: &Value, system_config: &Value, available_targets: &[String]) -> String {
+    let agent_id = agent_def.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = agent_def.get("name").and_then(|v| v.as_str()).unwrap_or("Agent");
+    let role = agent_def.get("role").and_then(|v| v.as_str()).unwrap_or("worker");
+    let persona = agent_def.get("persona").and_then(|v| v.as_str()).unwrap_or("");
+    let responsibilities = agent_def
+        .get("responsibilities")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("  - {}", s))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    let system_name = system_config
+        .get("system")
+        .and_then(|s| s.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Multi-Agent System");
+
+    let orch_mode = system_config
+        .get("system")
+        .and_then(|s| s.get("orchestration_mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("hierarchical");
+
+    // Parse workflow sequence for this agent's step and action
+    let workflow_step = system_config
+        .get("workflow")
+        .and_then(|w| w.get("sequence"))
+        .and_then(|s| s.as_array())
+        .and_then(|steps| {
+            steps.iter().find(|s| {
+                s.get("agent").and_then(|a| a.as_str()) == Some(agent_id)
+            })
+        })
+        .cloned();
+
+    let my_action = workflow_step
+        .as_ref()
+        .and_then(|s| s.get("action"))
+        .and_then(|a| a.as_str())
+        .unwrap_or("");
+
+    let my_step_num = workflow_step
+        .as_ref()
+        .and_then(|s| s.get("step"))
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0);
+
+    let outputs_to = workflow_step
+        .as_ref()
+        .and_then(|s| s.get("outputs_to"))
+        .and_then(|o| o.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|id| *id != "human")
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+
+    // Parse who sends work to this agent (inputs_from)
+    let inputs_from: Vec<String> = system_config
+        .get("connections")
+        .and_then(|c| c.as_array())
+        .map(|conns| {
+            conns.iter()
+                .filter(|c| c.get("to").and_then(|v| v.as_str()) == Some(agent_id))
+                .filter_map(|c| {
+                    let from = c.get("from").and_then(|v| v.as_str())?;
+                    let proto = c.get("protocol").and_then(|v| v.as_str()).unwrap_or("tcp");
+                    Some(format!("{} ({})", from, proto))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Parse bus/mesh config for this agent
+    let bus_enabled = agent_def
+        .get("bus")
+        .and_then(|b| b.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mesh_enabled = agent_def
+        .get("mesh")
+        .and_then(|m| m.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let bus_topics: Vec<&str> = agent_def
+        .get("bus")
+        .and_then(|b| b.get("topics"))
+        .and_then(|t| t.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    // Build connectivity section
+    let mut connectivity = String::new();
+    if !inputs_from.is_empty() {
+        connectivity.push_str(&format!("\nReceives work from: {}", inputs_from.join(", ")));
+    }
+    if !outputs_to.is_empty() {
+        connectivity.push_str(&format!("\nOutputs results to: {}", outputs_to));
+    }
+    if bus_enabled && !bus_topics.is_empty() {
+        connectivity.push_str(&format!("\nBus topics: {}", bus_topics.join(", ")));
+    }
+    if mesh_enabled {
+        connectivity.push_str("\nMesh networking: enabled (can communicate with all peers)");
+    }
+
+    // Build targets section
+    let targets_info = if available_targets.is_empty() {
+        String::new()
+    } else {
+        // Look up names for available targets
+        let target_descs: Vec<String> = available_targets.iter().map(|tid| {
+            let tname = system_config
+                .get("agents")
+                .and_then(|a| a.as_array())
+                .and_then(|arr| arr.iter().find(|a| a.get("id").and_then(|v| v.as_str()) == Some(tid.as_str())))
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(tid.as_str());
+            let trole = system_config
+                .get("agents")
+                .and_then(|a| a.as_array())
+                .and_then(|arr| arr.iter().find(|a| a.get("id").and_then(|v| v.as_str()) == Some(tid.as_str())))
+                .and_then(|a| a.get("role"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("worker");
+            format!("  - {} ({}): {}", tid, trole, tname)
+        }).collect();
+        format!(
+            "\n\nAvailable agents to delegate to (use spawn_subagent tool):\n{}",
+            target_descs.join("\n")
+        )
+    };
+
+    let workflow_info = if my_step_num > 0 {
+        let action_info = if !my_action.is_empty() && my_action != "Analyze and process assigned tasks" {
+            format!("\nYour primary action: {}", my_action)
+        } else {
+            String::new()
+        };
+        format!("\nWorkflow step: {}{}", my_step_num, action_info)
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"You are {name}, operating in {system_name}.
+
+ROLE: {role} | ORCHESTRATION: {orch_mode}
+
+PERSONA:
+{persona}
+
+RESPONSIBILITIES:
+{responsibilities}
+{workflow_info}{connectivity}{targets_info}
+
+INSTRUCTIONS:
+- Focus strictly on your role and responsibilities
+- Use spawn_subagent to delegate to specialist agents when appropriate
+- When delegating, provide full context so the sub-agent can work independently
+- Return comprehensive, structured results when your task is complete
+- Collaborate effectively; your output feeds into the next stage of the workflow"#
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Tool definitions (OpenAI function-calling format)
+// ---------------------------------------------------------------------------
+
+/// (name, description) of every base tool — for agent-loop profile editors.
+pub fn tool_catalog() -> Vec<(String, String)> {
+    let mut cat: Vec<(String, String)> = tool_definitions()
+        .iter()
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            Some((
+                f.get("name")?.as_str()?.to_string(),
+                f.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+            ))
+        })
+        .collect();
+    // User-defined YAML tools so the agent-loop profile editor / validator
+    // recognizes their names (no "unknown tool" warning when configured).
+    // kind:builtin records customize an EXISTING entry (description) instead
+    // of adding a duplicate; shadows (override: true) also just update.
+    for t in crate::server::services::custom_tools::load_all() {
+        if let Some(entry) = cat.iter_mut().find(|(n, _)| n == &t.name) {
+            if !t.description.is_empty() {
+                entry.1 = t.description.clone();
+            }
+        } else {
+            cat.push((t.name.clone(), t.description.clone()));
+        }
+    }
+    cat
+}
+
+/// run_shell description matching the actual shell per platform, so the model
+/// doesn't burn rounds on bash-isms under cmd.exe (head, ls, $VAR, 2>/dev/null).
+#[cfg(target_os = "windows")]
+const SHELL_TOOL_DESC: &str = "Execute a shell command via Windows cmd.exe. Use Windows commands and syntax: dir, type, copy, del, where, findstr, %VAR%. Unix tools (ls, head, wc, grep, find -type) and /dev/null are NOT available; use PowerShell explicitly for anything advanced (powershell -Command \"...\").";
+#[cfg(not(target_os = "windows"))]
+const SHELL_TOOL_DESC: &str = "Execute a shell command via /bin/sh.";
+
+pub fn tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web using DuckDuckGo.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "search_papers",
+                "description": "Search academic/scientific papers via OpenAlex (250M+ scholarly works). Returns title, authors, year, venue, DOI, citation count, open-access PDF link, and abstract. Use this for research literature instead of web_search.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query (matched against title, abstract, and fulltext)" },
+                        "limit": { "type": "integer", "description": "Max results to return (default 10, max 25)" },
+                        "from_year": { "type": "integer", "description": "Only papers published in or after this year" },
+                        "to_year": { "type": "integer", "description": "Only papers published in or before this year" },
+                        "sort": { "type": "string", "description": "'relevance' (default) or 'citations' (most-cited first)" },
+                        "open_access_only": { "type": "boolean", "description": "Only return open-access papers with a free PDF/fulltext" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch content from a URL.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "The URL to fetch" },
+                        "method": { "type": "string", "description": "HTTP method (GET or POST). Defaults to GET." }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "run_python",
+                "description": if crate::server::data::project_dir().is_some() {
+                    // CLI mode: the sandbox IS the user's folder — work in place,
+                    // no output_file/ staging subdir.
+                    "Execute Python code in the project folder. CWD is the project directory (the user's current folder) — create and save files directly there. plt.show() auto-saves figures to the current folder. Variable _project_dir holds the project path."
+                } else {
+                    "Execute Python code in the project folder. CWD is the project directory. plt.show() auto-saves figures to output_file/. Use save_output('name.csv', data) to save files to output_file/. Variable _project_dir holds the project path."
+                },
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string", "description": "Python code to execute" }
+                    },
+                    "required": ["code"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "run_shell",
+                "description": SHELL_TOOL_DESC,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Shell command to execute" },
+                        "cwd": { "type": "string", "description": "Working directory (optional, sandbox-relative; paths outside the sandbox are rejected)" }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file from disk. For PDF files, content is returned in chunks. First call returns chunk 0 and total_chunks. Use 'offset' to read subsequent chunks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path to read" },
+                        "offset": { "type": "integer", "description": "Chunk number for PDF pagination (0-based). Omit to read from the beginning." }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": if crate::server::data::project_dir().is_some() {
+                    "Write content to a file. Use RELATIVE paths (e.g. 'model.py', 'index.html') to save directly in the project folder (the user's current folder). Do NOT create an output_file/ subdirectory — put files where the user expects them."
+                } else {
+                    "Write content to a file. Use RELATIVE paths (e.g. 'model.py', 'output_file/result.csv') to save inside the project folder. Plots and output should go in 'output_file/' subdirectory."
+                },
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path (relative to project folder preferred, e.g. 'script.py')" },
+                        "content": { "type": "string", "description": "Content to write" },
+                        "append": { "type": "boolean", "description": "Append instead of overwrite (default false)" }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files in a directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory path (defaults to sandbox root)" },
+                        "recursive": { "type": "boolean", "description": "List recursively (default false)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_skills",
+                "description": "List all installed skills. Returns skill names you can load with load_skill.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "load_skill",
+                "description": "Load the full SKILL.md content for a specific installed skill.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "skill": { "type": "string", "description": "Skill name/slug" }
+                    },
+                    "required": ["skill"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "save_skill",
+                "description": "Create or update an installed skill: writes SKILL.md (plus optional supporting files) into the app's skills directory and registers it, so list_skills/load_skill can use it immediately. ALWAYS use this — not write_file — when asked to generate or install a skill; write_file is jailed to the sandbox and skills written there are never loaded.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "skill_md": { "type": "string", "description": "Full SKILL.md content, starting with '---' YAML frontmatter that has 'name:' and 'description:'." },
+                        "name": { "type": "string", "description": "Skill name override (optional; default = frontmatter name)" },
+                        "files": {
+                            "type": "array",
+                            "description": "Optional supporting files, e.g. scripts the skill references.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": { "type": "string", "description": "Relative path inside the skill folder, e.g. scripts/tool.py" },
+                                    "content": { "type": "string" }
+                                },
+                                "required": ["path", "content"]
+                            }
+                        }
+                    },
+                    "required": ["skill_md"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "delete_file",
+                "description": "Delete a file or directory from disk.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File or directory path to delete" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_local_mounts",
+                "description": "List locally mounted host directories accessible outside the sandbox.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "run_react",
+                "description": "Execute React/JSX code. Compiled and rendered in the output panel. Recharts available as globals.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string", "description": "React JSX component code" },
+                        "title": { "type": "string", "description": "Title for the output (optional)" }
+                    },
+                    "required": ["code"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "remote_task",
+                "description": "Delegate a task to a TigrimOS instance on another machine.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "instance": { "type": "string", "description": "Remote instance name/id or inline JSON {url,token}" },
+                        "task": { "type": "string", "description": "Task to send to the remote instance" },
+                        "idle_timeout": { "type": "number", "description": "Idle timeout seconds (default 60)" },
+                        "max_timeout": { "type": "number", "description": "Max wait seconds (default 1800)" }
+                    },
+                    "required": ["instance", "task"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "claude_code_agent",
+                "description": "Run a task using Claude Code CLI (autonomous agent with Read/Edit/Bash tools). Requires 'claude' in PATH.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": { "type": "string", "description": "Task for Claude Code to complete" },
+                        "system_prompt": { "type": "string", "description": "Optional system context" },
+                        "timeout": { "type": "number", "description": "Timeout seconds (default 300)" },
+                        "max_turns": { "type": "number", "description": "Max tool turns (default 25)" },
+                        "model": { "type": "string", "description": "Sub-model e.g. 'sonnet'" }
+                    },
+                    "required": ["task"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "gemini_cli_agent",
+                "description": "Run a task using Gemini CLI (autonomous agent with code execution and tool use). Requires 'gemini' in PATH.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": { "type": "string", "description": "Task for Gemini CLI to complete" },
+                        "system_prompt": { "type": "string", "description": "Optional system context" },
+                        "timeout": { "type": "number", "description": "Timeout seconds (default 300)" },
+                        "model": { "type": "string", "description": "Model e.g. 'gemini-2.5-pro'" }
+                    },
+                    "required": ["task"]
+                }
+            }
+        }),
+        // Protocol: TCP
+        json!({
+            "type": "function",
+            "function": {
+                "name": "proto_tcp_send",
+                "description": "Send a message to another agent via TCP point-to-point channel.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "to": { "type": "string", "description": "Target agent ID" },
+                        "topic": { "type": "string", "description": "Message topic" },
+                        "payload": { "description": "Message content" }
+                    },
+                    "required": ["to", "topic", "payload"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "proto_tcp_read",
+                "description": "Read all messages from a TCP channel with another agent.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "peer": { "type": "string", "description": "The other agent's ID" } },
+                    "required": ["peer"]
+                }
+            }
+        }),
+        // Protocol: Bus
+        json!({
+            "type": "function",
+            "function": {
+                "name": "proto_bus_publish",
+                "description": "Publish a message to the shared event bus.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "topic": { "type": "string", "description": "Topic to publish to" },
+                        "payload": { "description": "Message content" }
+                    },
+                    "required": ["topic", "payload"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "proto_bus_history",
+                "description": "Read the event bus message history, optionally filtered by topic.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "topic": { "type": "string", "description": "Optional topic filter" } }
+                }
+            }
+        }),
+        // Protocol: Queue
+        json!({
+            "type": "function",
+            "function": {
+                "name": "proto_queue_send",
+                "description": "Enqueue a message to another agent's FIFO queue.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "to": { "type": "string", "description": "Target agent ID" },
+                        "topic": { "type": "string", "description": "Message topic" },
+                        "payload": { "description": "Message content" }
+                    },
+                    "required": ["to", "topic", "payload"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "proto_queue_receive",
+                "description": "Dequeue the next message from your queue.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "Sender agent ID to read from" },
+                        "topic": { "type": "string", "description": "Optional topic filter" }
+                    },
+                    "required": ["from"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "proto_queue_peek",
+                "description": "Peek at queue messages without consuming them.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "Sender agent ID" },
+                        "topic": { "type": "string", "description": "Optional topic filter" },
+                        "count": { "type": "number", "description": "Number to peek (default 5)" }
+                    },
+                    "required": ["from"]
+                }
+            }
+        }),
+        // Blackboard / P2P
+        json!({
+            "type": "function",
+            "function": {
+                "name": "bb_propose",
+                "description": "Propose a task on the shared blackboard for peer agents to bid on (Contract Net Protocol).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": { "type": "string", "description": "Task description" },
+                        "task_id": { "type": "string", "description": "Optional custom task ID" }
+                    },
+                    "required": ["description"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "bb_bid",
+                "description": "Submit a bid for a blackboard task with a confidence score.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "Task ID to bid on" },
+                        "confidence": { "type": "number", "description": "Confidence score 0-1" },
+                        "cost": { "type": "number", "description": "Optional estimated cost" },
+                        "reasoning": { "type": "string", "description": "Why you're suited for this task" }
+                    },
+                    "required": ["task_id", "confidence"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "bb_award",
+                "description": "Award a blackboard task to the best bidder.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "Task ID to award" },
+                        "award_to": { "type": "string", "description": "Specific agent ID (overrides scoring)" },
+                        "orchestrator_scores": {
+                            "type": "array",
+                            "description": "Your scores for each bidder: [{agent_id, score 0-1, reason}]",
+                            "items": { "type": "object" }
+                        }
+                    },
+                    "required": ["task_id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "bb_complete",
+                "description": "Mark a blackboard task as completed with a result.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "Task ID to complete" },
+                        "result": { "type": "string", "description": "Task result / output" }
+                    },
+                    "required": ["task_id", "result"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "bb_read",
+                "description": "Read the shared blackboard — see all tasks, bids, and results.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "Optional: specific task ID" },
+                        "status": { "type": "string", "description": "Optional: filter by status" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "bb_log",
+                "description": "Read the blackboard audit log of all proposals, bids, awards, and completions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": { "type": "number", "description": "Max entries (default 50)" }
+                    }
+                }
+            }
+        }),
+        // clawhub_search
+        json!({
+            "type": "function",
+            "function": {
+                "name": "clawhub_search",
+                "description": "Search the ClawHub/OpenClaw skill marketplace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query" },
+                        "limit": { "type": "integer", "description": "Max results (default 10)" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        // clawhub_install
+        json!({
+            "type": "function",
+            "function": {
+                "name": "clawhub_install",
+                "description": "Install a skill from ClawHub marketplace by slug.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "slug": { "type": "string", "description": "Skill slug to install" },
+                        "force": { "type": "boolean", "description": "Force reinstall" }
+                    },
+                    "required": ["slug"]
+                }
+            }
+        }),
+        // openrouter_web_search
+        json!({
+            "type": "function",
+            "function": {
+                "name": "openrouter_web_search",
+                "description": "Search the web using OpenRouter's Responses API with the web search plugin. Returns AI-summarized results with source citations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        // cron_create
+        json!({
+            "type": "function",
+            "function": {
+                "name": "cron_create",
+                "description": "Create a recurring cron job that runs a shell command on a schedule. The command runs with the sandbox directory as cwd. For complex jobs, first save a script with write_file, then schedule it (e.g. command: 'python3 my_script.py'). Cron format is the classic 5-field 'min hour day-of-month month day-of-week' (e.g. '0 9 * * *' = daily 09:00, '*/15 * * * *' = every 15 min), local time. The user can see, enable/disable, run, and delete jobs in the Tasks page.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Short human-readable job name (unique)" },
+                        "cron": { "type": "string", "description": "5-field cron expression, e.g. '0 9 * * *'" },
+                        "command": { "type": "string", "description": "Shell command to run on each trigger" },
+                        "enabled": { "type": "boolean", "description": "Start enabled (default true). Pass false to let the user review and enable it manually." }
+                    },
+                    "required": ["name", "cron", "command"]
+                }
+            }
+        }),
+        // cron_list
+        json!({
+            "type": "function",
+            "function": {
+                "name": "cron_list",
+                "description": "List all scheduled cron jobs with their id, schedule, command, enabled state, and last run result.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        // cron_toggle
+        json!({
+            "type": "function",
+            "function": {
+                "name": "cron_toggle",
+                "description": "Enable or disable an existing cron job.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id_or_name": { "type": "string", "description": "Job id or exact job name" },
+                        "enabled": { "type": "boolean", "description": "true to enable, false to disable" }
+                    },
+                    "required": ["id_or_name", "enabled"]
+                }
+            }
+        }),
+        // cron_delete
+        json!({
+            "type": "function",
+            "function": {
+                "name": "cron_delete",
+                "description": "Delete a cron job permanently.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id_or_name": { "type": "string", "description": "Job id or exact job name" }
+                    },
+                    "required": ["id_or_name"]
+                }
+            }
+        }),
+        // cron_run_now
+        json!({
+            "type": "function",
+            "function": {
+                "name": "cron_run_now",
+                "description": "Run a cron job immediately once (useful to test a newly created job). Returns the command output.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id_or_name": { "type": "string", "description": "Job id or exact job name" }
+                    },
+                    "required": ["id_or_name"]
+                }
+            }
+        }),
+    ]
+}
+
+/// Tool definitions with sub-agent tools added when enabled
+/// Build tool definitions for a given sub-agent config and mode.
+/// `session_activated` is true if a swarm/architecture has been created/selected this session.
+#[allow(dead_code)]
+pub fn tool_definitions_with_subagent(sub_agent: &SubAgentConfig, realtime: bool) -> Vec<Value> {
+    tool_definitions_for_mode(sub_agent, realtime, false)
+}
+
+fn realtime_tools(agent_list: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "send_task",
+                "description": format!(
+                    "Send a task to a live realtime agent. Available agents: {}. Use this to delegate work, then call wait_result to get the response.",
+                    agent_list
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "to": { "type": "string", "description": format!("ID of the target agent. Must be one of: {}", agent_list) },
+                        "task": { "type": "string", "description": "Clear description of the task for the agent" },
+                        "context": { "type": "string", "description": "Optional context or data to pass to the agent" }
+                    },
+                    "required": ["to", "task"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "wait_result",
+                "description": "Wait for a result from an agent that was previously sent a task via send_task. Blocks until the agent finishes. If it times out, the agent is STILL WORKING — just call wait_result again to keep waiting. Do NOT resend the task. NEVER wait on yourself or on the agent that delegated your current task (deadlock). Call exactly once per task sent.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": format!("ID of the agent to wait for. Must be one of: {}", agent_list) },
+                        "timeout": { "type": "integer", "description": "Timeout in seconds (default: 300). If timeout occurs, call wait_result again — do NOT resend the task." }
+                    },
+                    "required": ["from"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "check_agents",
+                "description": "Check the current status of all realtime agents (idle, working, etc.)",
+                "parameters": { "type": "object", "properties": {}, "required": [] }
+            }
+        }),
+    ]
+}
+
+fn create_architecture_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "create_architecture",
+            "description": "Analyze the user's task and create an appropriate multi-agent architecture. Generates a YAML agent config, saves it, and boots all agents in realtime mode. Call this FIRST before doing any work.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": { "type": "string", "description": "Description of the task/goal for the agent team" },
+                    "architectureType": {
+                        "type": "string",
+                        "enum": ["hierarchical", "flat", "mesh", "hybrid", "pipeline", "p2p"],
+                        "description": "Architecture type"
+                    },
+                    "agentCount": { "type": "string", "description": "Number of agents or 'auto'" }
+                },
+                "required": ["description"]
+            }
+        }
+    })
+}
+
+fn select_swarm_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "select_swarm",
+            "description": "Select the best agent swarm configuration for the current task. Review available swarms and pick the one whose description best matches the user's request.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "description": "The YAML filename to select (e.g. 'research_team.yaml')" },
+                    "reason": { "type": "string", "description": "Brief explanation of why this swarm is the best fit" }
+                },
+                "required": ["filename"]
+            }
+        }
+    })
+}
+
+fn spawn_subagent_tool(agent_list: &str) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "spawn_subagent",
+            "description": format!(
+                "Delegate a task to a sub-agent. Available agents: {}. Use this when a task is better handled by a specialist agent.",
+                agent_list
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": format!("ID of the agent to spawn. Must be one of: {}", agent_list) },
+                    "task": { "type": "string", "description": "Clear description of the task for the sub-agent" },
+                    "context": { "type": "string", "description": "Optional context or data to pass to the sub-agent" }
+                },
+                "required": ["agent_id", "task"]
+            }
+        }
+    })
+}
+
+/// Build tool list dynamically based on mode and whether a session has been activated.
+pub fn tool_definitions_for_mode(sub_agent: &SubAgentConfig, realtime: bool, session_activated: bool) -> Vec<Value> {
+    let mut tools = tool_definitions();
+    if !sub_agent.enabled || sub_agent.depth >= effective_max_spawn_depth(sub_agent) {
+        return tools;
+    }
+    // Remove CLI agent tools from swarm modes — agents should use send_task/spawn_subagent,
+    // not spawn external CLI processes that aren't part of the architecture.
+    tools.retain(|t| {
+        let name = t["function"]["name"].as_str().unwrap_or("");
+        !matches!(name, "claude_code_agent" | "gemini_cli_agent")
+    });
+    // For fully_auto/auto_swarm, agent_ids might be empty before architecture is created
+    // — that's OK, the mode logic handles it
+    if sub_agent.agent_ids.is_empty()
+        && !matches!(sub_agent.mode.as_str(), "fully_auto" | "auto_swarm" | "router")
+    {
+        return tools;
+    }
+    let agent_list = sub_agent.agent_ids.join(", ");
+    let mode = sub_agent.mode.as_str();
+
+    match mode {
+        "fully_auto" => {
+            if session_activated {
+                // Architecture created, agents running — ONLY realtime tools
+                // No base tools (web_search, read_file, etc.) — agents handle those.
+                // Only keep write_file + run_python for formatting final output.
+                let mut rt_tools = realtime_tools(&agent_list);
+                rt_tools.push(create_architecture_tool()); // allow recreation
+                // Add write_file and run_python for output formatting only
+                for t in &tools {
+                    let name = t["function"]["name"].as_str().unwrap_or("");
+                    if matches!(name, "write_file" | "run_python") {
+                        rt_tools.push(t.clone());
+                    }
+                }
+                return rt_tools;
+            } else {
+                // No architecture yet — ONLY create_architecture (forces LLM to create first)
+                return vec![create_architecture_tool()];
+            }
+        }
+        "auto_swarm" => {
+            if session_activated {
+                // Swarm selected, agents running — use realtime tools
+                tools.extend(realtime_tools(&agent_list));
+                tools.push(select_swarm_tool()); // allow switching
+            } else {
+                // No swarm selected — ONLY select_swarm
+                return vec![select_swarm_tool()];
+            }
+        }
+        "manual" => {
+            // Manual: user pre-selected YAML, agents boot immediately
+            // Only give coordination tools — agents handle research/execution.
+            // Keep write_file, run_python, read_file, list_files for output formatting.
+            let mut rt_tools = realtime_tools(&agent_list);
+            for t in &tools {
+                let name = t["function"]["name"].as_str().unwrap_or("");
+                if matches!(name, "write_file" | "run_python" | "read_file" | "list_files") {
+                    rt_tools.push(t.clone());
+                }
+            }
+            return rt_tools;
+        }
+        "router" => {
+            // Router (Fugu-style): TRIAGE first. Unlike fully_auto (which forces
+            // create_architecture before anything else), the orchestrator keeps ALL
+            // base tools so it can answer simple queries directly, AND gets
+            // create_architecture to assemble a heterogeneous team when warranted.
+            if session_activated {
+                // Team is LIVE — restrict to coordination + output formatting so the
+                // orchestrator MUST delegate via send_task/wait_result, not redo the
+                // work itself or reach for low-level proto_*/bb_* protocol tools.
+                let mut rt_tools = realtime_tools(&agent_list);
+                rt_tools.push(create_architecture_tool()); // allow re-architecting
+                for t in &tools {
+                    let name = t["function"]["name"].as_str().unwrap_or("");
+                    if matches!(name, "write_file" | "run_python" | "read_file" | "list_files") {
+                        rt_tools.push(t.clone());
+                    }
+                }
+                return rt_tools;
+            } else {
+                // No team yet — TRIAGE. The orchestrator keeps its full base toolset
+                // (web_search, fetch_url, run_python, run_shell, read_file, write_file,
+                // list_files, list_skills, load_skill) AND gets create_architecture.
+                // It decides per request: if the task is simple / single-step (a greeting,
+                // a quick lookup, plot a graph, a small calculation) it just does it
+                // itself with these tools — no team needed. Only when the task is genuinely
+                // complex / multi-step does it call create_architecture to build and
+                // orchestrate a specialist team. The system prompt enforces this split.
+                tools.push(create_architecture_tool());
+                return tools;
+            }
+        }
+        _ => {
+            // "auto" mode: spawn_subagent only — agents come from YAML config
+            if realtime {
+                tools.extend(realtime_tools(&agent_list));
+            } else {
+                tools.push(spawn_subagent_tool(&agent_list));
+            }
+        }
+    }
+    tools
+}
+
+// ---------------------------------------------------------------------------
+// Agent history JSONL logging (tiger_cowork style)
+// ---------------------------------------------------------------------------
+
+async fn write_agent_history(session_id: &str, event: &str, data: serde_json::Value) {
+    if session_id.is_empty() {
+        return;
+    }
+    let dir = crate::server::data::data_dir().join("agent_history").join(session_id);
+    if tokio::fs::create_dir_all(&dir).await.is_err() {
+        return;
+    }
+    let path = dir.join("spawn.jsonl");
+    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let entry = match serde_json::to_string(&json!({
+        "timestamp": ts,
+        "event": event,
+        "data": data
+    })) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let line = format!("{}\n", entry);
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut f) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+    {
+        let _ = f.write_all(line.as_bytes()).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool execution helpers
+// ---------------------------------------------------------------------------
+
+const MAX_CONTENT_LEN: usize = 30_000;
+const MAX_LIST_ENTRIES: usize = 200;
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...[truncated]", crate::util::truncate_utf8(s, max))
+    }
+}
+
+/// Shallow truncation of a tool result for the per-tool profile max_result_len
+/// knob: caps a bare string result, or every top-level string field of an
+/// object result, at max_len bytes (UTF-8 safe — never byte-slice). Non-string
+/// fields (arrays like output_files, numbers, nested objects) are untouched so
+/// file collection and structured data keep working.
+fn truncate_result_value(result: &mut Value, max_len: usize) {
+    let cap = |s: &str| format!("{}...[truncated by profile]", crate::util::truncate_utf8(s, max_len));
+    match result {
+        Value::String(s) if s.len() > max_len => *s = cap(s),
+        Value::Object(map) => {
+            for (_k, v) in map.iter_mut() {
+                if let Value::String(s) = v {
+                    if s.len() > max_len {
+                        *s = cap(s);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resolve a path relative to the sandbox directory. If the path is absolute
+/// it is used as-is; otherwise it is joined with `sandbox_dir`.
+fn resolve_path(sandbox_dir: &str, path: &str) -> PathBuf {
+    let sandbox = std::fs::canonicalize(sandbox_dir)
+        .unwrap_or_else(|_| PathBuf::from(sandbox_dir).canonicalize().unwrap_or_else(|_| PathBuf::from(sandbox_dir)));
+
+    let candidate = if PathBuf::from(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        sandbox.join(path)
+    };
+
+    // Resolve symlinks and ../ to get the real path, then check it's inside
+    // sandbox. canonicalize() fails for NOT-YET-EXISTING targets (every new
+    // file write); falling back to the raw path would let "../.." components
+    // slip past the component-wise starts_with check and escape the sandbox —
+    // normalize them lexically instead.
+    fn normalize_lexically(p: &std::path::Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other),
+            }
+        }
+        out
+    }
+    let resolved = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexically(&candidate));
+    if resolved.starts_with(&sandbox) {
+        resolved
+    } else {
+        // Path escapes sandbox — block the attempt
+        warn!(
+            "[SECURITY] Path traversal blocked: '{}' resolves outside sandbox '{}'",
+            path,
+            sandbox.display()
+        );
+        // Return a non-existent sentinel path so callers fail with "file not found"
+        sandbox.join(".blocked_path_traversal")
+    }
+}
+
+/// True when resolve_path rejected the path (sandbox-escape sentinel). Callers
+/// should return an explicit "outside the sandbox" error — the raw OS errors
+/// the sentinel otherwise produces ("cannot find the path", "directory name is
+/// invalid") send the model chasing phantom filesystem problems for rounds.
+fn is_blocked_path(p: &std::path::Path) -> bool {
+    p.file_name().map(|f| f == ".blocked_path_traversal").unwrap_or(false)
+}
+
+/// Standard error result for a sandbox-escape attempt.
+fn blocked_path_error(tool_hint: &str, path: &str, sandbox_dir: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": format!(
+            "Security: path '{}' is outside the sandbox ('{}'). {} Use paths relative to the sandbox root.",
+            path, sandbox_dir, tool_hint
+        )
+    })
+}
+
+/// Run a web search by driving the live browser to Google and reading the
+/// rendered results page. Used when browser control is enabled (e.g. web/mobile
+/// remote in Docker, where the browser runs headless): Google through a real
+/// browser session is far more reliable than the DuckDuckGo library, which gets
+/// rate-limited/blocked from datacenter IPs. Returns None if the browser path
+/// is unavailable or yields nothing, so the caller can fall back.
+async fn google_search_via_browser(query: &str) -> Option<Vec<Value>> {
+    let url = format!(
+        "https://www.google.com/search?q={}&hl=en&gl=us&num=10",
+        urlencoding::encode(query)
+    );
+
+    // Navigate. The Playwright MCP process stays alive across calls, so the page
+    // (and any accepted consent on the persistent profile) survives.
+    let nav = mcp::call_mcp_tool("mcp_browser_browser_navigate", &json!({ "url": url })).await;
+    if nav["ok"].as_bool() != Some(true) {
+        warn!("[web_search] browser navigate failed: {}", nav["error"].as_str().unwrap_or("?"));
+        return None;
+    }
+    // Playwright MCP reports tool-level failures as "### Error" text with ok=true.
+    if let Some(r) = nav["result"].as_str() {
+        if r.contains("### Error") {
+            warn!("[web_search] browser navigate error: {}", r.chars().take(160).collect::<String>());
+            return None;
+        }
+    }
+
+    // Extract structured results from the SERP via JS. innerText fallback keeps
+    // it working even if Google's result-container markup changes.
+    let js = r#"() => {
+  const out = [];
+  const seen = new Set();
+  document.querySelectorAll('#search a h3, #rso a h3').forEach(h3 => {
+    const a = h3.closest('a');
+    if (!a || !a.href) return;
+    const url = a.href;
+    if (seen.has(url)) return;
+    if (/^https?:\/\/(www\.)?google\./.test(url)) return;
+    seen.add(url);
+    let snippet = '';
+    const c = a.closest('div.g, div[data-hveid], div[data-sokoban-container]');
+    if (c) { const s = c.querySelector('.VwiC3b, div[data-sncf], .lEBKkf'); if (s) snippet = s.innerText; }
+    out.push({ title: h3.innerText, url, snippet: (snippet || '').slice(0, 300) });
+  });
+  // Return the array directly — Playwright MCP JSON-serializes the value, so
+  // stringifying here would double-escape and break parsing. innerText fallback
+  // is a plain string (shows up JSON-quoted) for when no result links match.
+  if (out.length) return out.slice(0, 8);
+  return 'TEXT:' + document.body.innerText.slice(0, 4000);
+}"#;
+    let eval = mcp::call_mcp_tool(
+        "mcp_browser_browser_evaluate",
+        &json!({ "function": js }),
+    )
+    .await;
+
+    // Pull the JS return value out of the MCP result text. Playwright MCP wraps
+    // it in surrounding prose, so scan for our JSON array or TEXT: marker.
+    let raw = eval["result"].as_str().unwrap_or("");
+    if let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']')) {
+        if start < end {
+            if let Ok(items) = serde_json::from_str::<Vec<Value>>(&raw[start..=end]) {
+                let results: Vec<Value> = items
+                    .iter()
+                    .filter_map(|it| {
+                        let title = it.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                        let url = it.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                        if title.is_empty() && url.is_empty() {
+                            return None;
+                        }
+                        Some(json!({
+                            "source": "google",
+                            "title": title,
+                            "url": url,
+                            "text": it.get("snippet").and_then(|s| s.as_str()).unwrap_or(""),
+                        }))
+                    })
+                    .collect();
+                if !results.is_empty() {
+                    return Some(results);
+                }
+            }
+        }
+    }
+
+    // Structured extraction failed — fall back to the page's visible text so the
+    // model still gets something to read (a consent/captcha wall shows up here).
+    let text_blob = raw.split("TEXT:").nth(1).unwrap_or(raw).trim();
+    if text_blob.is_empty() {
+        return None;
+    }
+    Some(vec![json!({
+        "source": "google",
+        "title": format!("Google results for: {}", query),
+        "url": url,
+        "text": crate::util::truncate_utf8(text_blob, 4000),
+    })])
+}
+
+/// OpenAlex ships abstracts as an inverted index (word -> positions) for
+/// copyright reasons; rebuild the plain text by position.
+fn openalex_reconstruct_abstract(inverted: &Value) -> String {
+    let Some(map) = inverted.as_object() else {
+        return String::new();
+    };
+    let mut words: Vec<(u64, &str)> = Vec::new();
+    for (word, positions) in map {
+        if let Some(arr) = positions.as_array() {
+            for p in arr {
+                if let Some(i) = p.as_u64() {
+                    words.push((i, word.as_str()));
+                }
+            }
+        }
+    }
+    words.sort_by_key(|(i, _)| *i);
+    words
+        .iter()
+        .map(|(_, w)| *w)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn exec_search_papers(args: &Value) -> Value {
+    let query = args["query"].as_str().unwrap_or("");
+    if query.is_empty() {
+        return json!({ "ok": false, "error": "query is required" });
+    }
+    let limit = args["limit"].as_u64().unwrap_or(10).clamp(1, 25);
+
+    let mut filters: Vec<String> = Vec::new();
+    if let Some(y) = args["from_year"].as_u64() {
+        filters.push(format!("from_publication_date:{y}-01-01"));
+    }
+    if let Some(y) = args["to_year"].as_u64() {
+        filters.push(format!("to_publication_date:{y}-12-31"));
+    }
+    if args["open_access_only"].as_bool() == Some(true) {
+        filters.push("is_oa:true".to_string());
+    }
+
+    let mut url = format!(
+        "https://api.openalex.org/works?search={}&per-page={}&select=id,doi,title,display_name,publication_year,cited_by_count,primary_location,open_access,authorships,abstract_inverted_index",
+        urlencoding::encode(query),
+        limit
+    );
+    if !filters.is_empty() {
+        url.push_str("&filter=");
+        url.push_str(&filters.join(","));
+    }
+    if args["sort"].as_str() == Some("citations") {
+        url.push_str("&sort=cited_by_count:desc");
+    }
+
+    let client = Client::new();
+    let resp = match timeout(
+        Duration::from_secs(20),
+        client.get(&url).header("User-Agent", "TigrimOS/1.0").send(),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return json!({ "ok": false, "error": format!("OpenAlex request failed: {e}") }),
+        Err(_) => return json!({ "ok": false, "error": "OpenAlex request timed out (20s)" }),
+    };
+    let status = resp.status();
+    let data: Value = match resp.json().await {
+        Ok(d) => d,
+        Err(e) => {
+            return json!({ "ok": false, "error": format!("OpenAlex returned invalid JSON (HTTP {status}): {e}") })
+        }
+    };
+    if !status.is_success() {
+        let msg = data["message"].as_str().unwrap_or("");
+        return json!({ "ok": false, "error": format!("OpenAlex HTTP {status}: {msg}") });
+    }
+
+    let mut results: Vec<Value> = Vec::new();
+    if let Some(works) = data["results"].as_array() {
+        for work in works {
+            let title = work["display_name"]
+                .as_str()
+                .or(work["title"].as_str())
+                .unwrap_or("");
+            let mut authors: Vec<&str> = Vec::new();
+            let mut author_total = 0;
+            if let Some(auths) = work["authorships"].as_array() {
+                author_total = auths.len();
+                for a in auths.iter().take(8) {
+                    if let Some(name) = a.pointer("/author/display_name").and_then(|n| n.as_str()) {
+                        authors.push(name);
+                    }
+                }
+            }
+            let mut author_str = authors.join(", ");
+            if author_total > 8 {
+                author_str.push_str(" et al.");
+            }
+            let abstract_text = crate::util::truncate_utf8_ellipsis(
+                &openalex_reconstruct_abstract(&work["abstract_inverted_index"]),
+                800,
+            );
+            results.push(json!({
+                "title": title,
+                "authors": author_str,
+                "year": work["publication_year"],
+                "venue": work.pointer("/primary_location/source/display_name").and_then(|v| v.as_str()).unwrap_or(""),
+                "doi": work["doi"].as_str().unwrap_or(""),
+                "cited_by_count": work["cited_by_count"],
+                "open_access_url": work.pointer("/open_access/oa_url").and_then(|u| u.as_str()).unwrap_or(""),
+                "url": work["doi"].as_str().or(work["id"].as_str()).unwrap_or(""),
+                "abstract": abstract_text,
+            }));
+        }
+    }
+
+    json!({
+        "ok": true,
+        "total_matches": data.pointer("/meta/count").cloned().unwrap_or(Value::Null),
+        "results": results,
+        "note": "Source: OpenAlex. Use fetch_url on open_access_url to read the fulltext PDF when available."
+    })
+}
+
+async fn exec_web_search(args: &Value) -> Value {
+    let query = args["query"].as_str().unwrap_or("");
+    let client = Client::new();
+    let mut all_results: Vec<Value> = Vec::new();
+
+    // When browser control is on, search Google through the live browser instead
+    // of the DuckDuckGo library (which is unreliable from Docker/datacenter IPs).
+    if mcp::is_server_connected("browser").await {
+        if let Some(results) = google_search_via_browser(query).await {
+            return json!({
+                "ok": true,
+                "results": results,
+                "note": "Results from the live browser (Google). Use fetch_url or the browser tools to open a specific link."
+            });
+        }
+        warn!("[web_search] browser/Google path yielded nothing; falling back to DDG/Wikipedia");
+    }
+
+    // Primary: DuckDuckGo Python library (same as original TigrimOS)
+    // This returns actual web search results with titles, URLs, and snippets
+    let safe_query = query.replace('\'', "\\'").replace('\\', "\\\\");
+    let py_script = format!(
+        r#"import json, sys
+try:
+    try:
+        from ddgs import DDGS
+        r = list(DDGS().text('{}', max_results=8))
+    except ImportError:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            r = list(ddgs.text('{}', max_results=8))
+    print(json.dumps(r))
+except Exception as e:
+    print(json.dumps([]))
+    print(str(e), file=sys.stderr)
+"#,
+        safe_query, safe_query
+    );
+
+    let py_result = timeout(
+        Duration::from_secs(30),
+        python_command()
+            .arg("-c")
+            .arg(&py_script)
+            .output(),
+    )
+    .await;
+
+    let mut ddg_ok = false;
+    match py_result {
+        Ok(Ok(output)) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Ok(results) = serde_json::from_str::<Vec<Value>>(stdout.trim()) {
+                for r in results {
+                    all_results.push(json!({
+                        "source": "web",
+                        "title": r.get("title").and_then(|t| t.as_str()).unwrap_or(""),
+                        "url": r.get("href").or(r.get("link")).and_then(|u| u.as_str()).unwrap_or(""),
+                        "text": r.get("body").or(r.get("snippet")).and_then(|b| b.as_str()).unwrap_or("")
+                    }));
+                }
+                ddg_ok = !all_results.is_empty();
+            }
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("[web_search] Python DDG failed: {}", stderr.chars().take(200).collect::<String>());
+        }
+        Ok(Err(e)) => {
+            warn!("[web_search] Failed to spawn python3: {e}");
+        }
+        Err(_) => {
+            warn!("[web_search] Python DDG timed out (30s)");
+        }
+    }
+
+    // Fallback: DuckDuckGo Instant Answer API (for quick facts/definitions)
+    if !ddg_ok {
+        let url = format!(
+            "https://api.duckduckgo.com/?q={}&format=json&no_html=1",
+            urlencoding::encode(query)
+        );
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(body) = resp.text().await {
+                if let Ok(ddg) = serde_json::from_str::<Value>(&body) {
+                    if let Some(abs) = ddg.get("Abstract").and_then(|a| a.as_str()) {
+                        if !abs.is_empty() {
+                            all_results.push(json!({
+                                "source": "abstract",
+                                "title": ddg.get("Heading").and_then(|h| h.as_str()).unwrap_or(""),
+                                "text": abs,
+                                "url": ddg.get("AbstractURL").and_then(|u| u.as_str()).unwrap_or("")
+                            }));
+                        }
+                    }
+                    if let Some(topics) = ddg.get("RelatedTopics").and_then(|t| t.as_array()) {
+                        for topic in topics.iter().take(5) {
+                            if let Some(text) = topic.get("Text").and_then(|t| t.as_str()) {
+                                all_results.push(json!({
+                                    "source": "related",
+                                    "text": text,
+                                    "url": topic.get("FirstURL").and_then(|u| u.as_str()).unwrap_or("")
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If Google Custom Search is configured, also try Google
+    if !ddg_ok {
+        let settings_path = crate::server::data::data_dir().join("settings.json");
+        if let Ok(settings_str) = tokio::fs::read_to_string(&settings_path).await {
+            if let Ok(settings) = serde_json::from_str::<Value>(&settings_str) {
+                let engine = settings["webSearchEngine"].as_str().unwrap_or("");
+                let api_key = settings["webSearchApiKey"].as_str().unwrap_or("");
+                let cx = settings["googleSearchCx"].as_str().unwrap_or("");
+                if engine == "google" && !api_key.is_empty() {
+                    let google_url = format!(
+                        "https://www.googleapis.com/customsearch/v1?key={}&cx={}&q={}",
+                        api_key, cx, urlencoding::encode(query)
+                    );
+                    if let Ok(resp) = client.get(&google_url).send().await {
+                        if let Ok(data) = resp.json::<Value>().await {
+                            if let Some(items) = data["items"].as_array() {
+                                for item in items.iter().take(5) {
+                                    all_results.push(json!({
+                                        "source": "google",
+                                        "title": item["title"].as_str().unwrap_or(""),
+                                        "url": item["link"].as_str().unwrap_or(""),
+                                        "text": item["snippet"].as_str().unwrap_or("")
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also try Wikipedia search (reliable for knowledge queries)
+    let wiki_url = format!(
+        "https://en.wikipedia.org/w/api.php?action=query&format=json&list=search&srsearch={}&srlimit=3",
+        urlencoding::encode(query)
+    );
+    if let Ok(resp) = client
+        .get(&wiki_url)
+        .header("User-Agent", "TigrimOS/1.0")
+        .send()
+        .await
+    {
+        if let Ok(data) = resp.json::<Value>().await {
+            if let Some(results) = data.pointer("/query/search").and_then(|s| s.as_array()) {
+                for item in results.iter().take(3) {
+                    let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                    let snippet = item
+                        .get("snippet")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .replace("<span class=\"searchmatch\">", "")
+                        .replace("</span>", "");
+                    all_results.push(json!({
+                        "source": "wikipedia",
+                        "title": title,
+                        "url": format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_")),
+                        "text": snippet
+                    }));
+                }
+            }
+        }
+    }
+
+    // If still no web results (only Wikipedia), try OpenRouter web search as last resort
+    let has_web_results = all_results.iter().any(|r| {
+        let src = r["source"].as_str().unwrap_or("");
+        src == "web" || src == "google"
+    });
+    if !has_web_results {
+        let or_result = exec_openrouter_web_search(&json!({ "query": query })).await;
+        if or_result["ok"].as_bool() == Some(true) {
+            if let Some(text) = or_result["text"].as_str() {
+                if !text.is_empty() {
+                    // Add OpenRouter citations as results
+                    if let Some(citations) = or_result["citations"].as_array() {
+                        for cite in citations.iter().take(8) {
+                            all_results.push(json!({
+                                "source": "web",
+                                "title": cite["title"].as_str().unwrap_or(""),
+                                "url": cite["url"].as_str().unwrap_or(""),
+                                "text": ""
+                            }));
+                        }
+                    }
+                    // Add summarized text as top result
+                    all_results.insert(0, json!({
+                        "source": "web_summary",
+                        "title": "AI-Summarized Web Results",
+                        "text": crate::util::truncate_utf8(&text, 3000),
+                        "url": ""
+                    }));
+                }
+            }
+        }
+    }
+
+    if all_results.is_empty() {
+        json!({ "ok": true, "results": [], "note": "No results found. Try a different query or use fetch_url to access a specific page." })
+    } else {
+        json!({ "ok": true, "results": all_results })
+    }
+}
+
+async fn exec_fetch_url(args: &Value) -> Value {
+    let url = args["url"].as_str().unwrap_or("");
+    let method = args["method"].as_str().unwrap_or("GET").to_uppercase();
+
+    // SSRF protection: block private/internal addresses
+    if let Err(reason) = validate_url_no_ssrf(url) {
+        return json!({ "ok": false, "error": reason });
+    }
+
+    let client = Client::new();
+    let req = match method.as_str() {
+        "POST" => client.post(url),
+        _ => client.get(url),
+    };
+    // Many sites (Wikipedia, etc.) reject requests without a browser-like
+    // User-Agent with a 403. Send one plus a standard Accept header.
+    let req = req
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        );
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            match resp.text().await {
+                Ok(body) => {
+                    let body = truncate(&body, MAX_CONTENT_LEN);
+                    json!({ "ok": true, "status": status, "body": body })
+                }
+                Err(e) => json!({ "ok": false, "error": format!("Failed to read body: {e}") }),
+            }
+        }
+        Err(e) => json!({ "ok": false, "error": format!("Request failed: {e}") }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Security: SSRF URL validation
+// ---------------------------------------------------------------------------
+
+/// Validate that a URL does not target private/internal addresses.
+/// Returns `Ok(())` if the URL is safe, or `Err(reason)` if it should be blocked.
+pub(crate) fn validate_url_no_ssrf(url_str: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url_str)
+        .map_err(|e| format!("Invalid URL: {e}"))?;
+
+    // 1. Only allow http and https schemes
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("URL blocked: scheme '{other}' is not allowed (only http/https)")),
+    }
+
+    let host_str = parsed.host_str().unwrap_or("");
+
+    // 2. Block localhost variants
+    if host_str.eq_ignore_ascii_case("localhost") {
+        return Err("URL blocked: cannot fetch private/internal addresses".into());
+    }
+
+    // 3. Try to parse as IP address and check ranges
+    if let Ok(ip) = host_str.parse::<std::net::IpAddr>() {
+        use std::net::IpAddr;
+        let blocked = match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()                          // 127.0.0.0/8
+                || v4.octets()[0] == 10                    // 10.0.0.0/8
+                || (v4.octets()[0] == 172                  // 172.16.0.0/12
+                    && (v4.octets()[1] >= 16 && v4.octets()[1] <= 31))
+                || (v4.octets()[0] == 192 && v4.octets()[1] == 168) // 192.168.0.0/16
+                || (v4.octets()[0] == 169 && v4.octets()[1] == 254) // 169.254.0.0/16 (link-local / AWS metadata)
+                || v4.is_unspecified()                     // 0.0.0.0
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback()                           // ::1
+                || v6.is_unspecified()                     // ::
+            }
+        };
+        if blocked {
+            return Err("URL blocked: cannot fetch private/internal addresses".into());
+        }
+    }
+
+    // 4. Also block well-known cloud metadata hostnames
+    let lower = host_str.to_ascii_lowercase();
+    if lower == "metadata.google.internal"
+        || lower == "metadata.google.internal."
+    {
+        return Err("URL blocked: cannot fetch private/internal addresses".into());
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Security: dangerous pattern detection
+// ---------------------------------------------------------------------------
+
+/// Patterns that indicate potentially dangerous code/commands
+const DANGEROUS_PATTERNS: &[&str] = &[
+    // Destructive file operations
+    "rm -rf /", "rm -rf ~", "rm -rf $HOME", "rmdir /",
+    "shutil.rmtree('/')", "shutil.rmtree(\"/\")",
+    // Privilege escalation
+    "sudo ", "su -", "doas ",
+    // Credential/key theft
+    ".ssh/", "id_rsa", "id_ed25519", ".aws/credentials", ".netrc",
+    "keychain", "login.keychain",
+    // System modification
+    "chmod 777 /", "chown root", "/etc/passwd", "/etc/shadow",
+    "launchctl", "crontab",
+    // Network exfiltration with credentials
+    "curl.*-d.*password", "wget.*password",
+    // Reverse shells
+    "bash -i >& /dev/tcp", "nc -e /bin", "python.*socket.*connect",
+    "/dev/tcp/", "mkfifo",
+    // Code injection / download-and-execute
+    "curl.*|.*sh", "curl.*|.*bash", "wget.*|.*sh", "wget.*|.*bash",
+    "eval(requests", "exec(requests",
+    // macOS specific
+    "osascript.*administrator", "security find-generic-password",
+    "defaults write", "csrutil",
+];
+
+/// Unsandboxed direct execution is opt-in: only when the user explicitly sets
+/// agentAllowUnsandboxedExec=true in settings.json. Default is to FAIL when no
+/// sandbox is available rather than silently running on the bare host.
+#[cfg(target_os = "macos")]
+fn allow_unsandboxed_exec() -> bool {
+    load_agent_settings()["agentAllowUnsandboxedExec"].as_bool().unwrap_or(false)
+}
+
+/// SBPL deny rules for secret-bearing paths. sandbox-exec allows file-read*
+/// everywhere (python needs system libs/site-packages), so explicitly deny
+/// credentials. In SBPL the LAST matching rule wins — these must come after
+/// the (allow file-read*) line.
+#[cfg(target_os = "macos")]
+fn secret_read_deny_rules() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() || home == "/" {
+        return String::new();
+    }
+    let subpaths = [".ssh", ".aws", ".gnupg", ".config/gh", "Library/Keychains"];
+    let literals = [".netrc", ".npmrc", ".pypirc"];
+    let mut rules = String::new();
+    for p in subpaths {
+        rules.push_str(&format!("(deny file-read* (subpath \"{}/{}\"))\n", home, p));
+    }
+    for p in literals {
+        rules.push_str(&format!("(deny file-read* (literal \"{}/{}\"))\n", home, p));
+    }
+    rules
+}
+
+/// The Apple `container` CLI is absent on most Macs; falling back to
+/// sandbox-exec is the normal path there — say so once, not per tool call.
+fn warn_container_fallback_once() {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        warn!(
+            "[sandbox] Apple container CLI not available — using sandbox-exec \
+             (normal on macOS without the container runtime; logged once)"
+        )
+    });
+}
+
+/// Shared matplotlib config/font-cache dir. Must be GLOBAL (data dir), not
+/// per-sandbox: the font-cache build can take >60s — longer than the
+/// run_python timeout — so a fresh cache per sandbox folder makes every
+/// first run_python in a new folder time out forever.
+pub(crate) fn mpl_config_dir() -> std::path::PathBuf {
+    let d = crate::server::data::data_dir().join(".mpl_config");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+/// Build the matplotlib font cache in the background at startup so the first
+/// run_python doesn't pay the (potentially >60s) build inside its own timeout.
+/// Runs our own fixed one-liner unsandboxed; no-op when a cache exists or
+/// matplotlib isn't installed.
+pub fn warm_matplotlib_cache() {
+    let mpl_dir = mpl_config_dir();
+    if let Ok(entries) = std::fs::read_dir(&mpl_dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("fontlist-") {
+                return; // cache already built
+            }
+        }
+    }
+    tokio::spawn(async move {
+        let _ = tokio::process::Command::new(find_python())
+            .args(["-c", "import matplotlib.font_manager"])
+            .env("MPLCONFIGDIR", &mpl_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    });
+}
+
+/// Check if code/command contains dangerous patterns
+fn check_dangerous(code: &str) -> Option<String> {
+    let lower = code.to_lowercase();
+    for pattern in DANGEROUS_PATTERNS {
+        let p = pattern.to_lowercase();
+        if lower.contains(&p) {
+            return Some(format!("Blocked dangerous pattern: {}", pattern));
+        }
+    }
+
+    // Block .env file access — but allow os.environ, os.getenv, printenv, etc.
+    // Match ".env" only when it looks like a file reference, not a Python API call
+    if lower.contains(".env") && !lower.contains(".environ") && !lower.contains(".getenv")
+        && !lower.contains("printenv") && !lower.contains(".env_")
+    {
+        return Some("Blocked dangerous pattern: .env".to_string());
+    }
+
+    // Block access to paths outside sandbox (absolute paths to sensitive dirs)
+    // But allow the app's own data/sandbox paths (e.g. ~/Library/Application Support/TigrimOS/)
+    let app_data_path = crate::server::data::data_dir().display().to_string().to_lowercase();
+    let app_support_path = app_data_path.replace("/data", "");
+    let sensitive_dirs = ["/etc/", "/var/", "/usr/", "/System/", "/Library/",
+                          "/Applications/", "/Users/*/.", "/private/"];
+    for dir in &sensitive_dirs {
+        if lower.contains(&dir.to_lowercase()) {
+            // Allow /tmp/, the sandbox itself, and app's own data directory
+            if !lower.contains("/tmp/")
+                && !lower.contains(&app_data_path)
+                && !lower.contains(&app_support_path)
+            {
+                return Some(format!("Blocked access to system path: {}", dir));
+            }
+        }
+    }
+
+    None
+}
+
+/// Scan a directory (and output_file subdirectory) for recently created output files.
+async fn scan_output_files(sandbox_dir: &str) -> Vec<String> {
+    let mut output_files = vec![];
+    let scan_dirs = [
+        std::path::PathBuf::from(sandbox_dir),
+        std::path::Path::new(sandbox_dir).join("output_file"),
+    ];
+    for scan_dir in &scan_dirs {
+        if let Ok(mut entries) = tokio::fs::read_dir(scan_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(meta) = entry.metadata().await {
+                    if !meta.is_file() { continue; }
+                    if let Ok(modified) = meta.modified() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+                        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "pdf"
+                            | "html" | "csv" | "md" | "txt" | "json" | "xlsx" | "docx"
+                            | "py" | "rs" | "js" | "ts" | "yaml" | "yml") {
+                            if modified.elapsed().unwrap_or_default().as_secs() < 120 {
+                                let rel = format!("{}/{}", scan_dir.display(), name);
+                                if !output_files.contains(&rel) {
+                                    output_files.push(rel);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    output_files
+}
+
+/// Public entry for HTTP routes: run Python through the full sandboxed tier
+/// chain (dangerous-pattern check, container/sandbox-exec, 60s timeout).
+pub async fn run_python_sandboxed(code: &str, sandbox_dir: &str) -> Value {
+    exec_run_python(&json!({"code": code}), sandbox_dir).await
+}
+
+async fn exec_run_python(args: &Value, sandbox_dir: &str) -> Value {
+    // Strict: a non-string `code` (array/object) would silently run an empty
+    // script and return ok=true, wasting tool rounds and misleading the model.
+    let code = match args.get("code").and_then(|v| v.as_str()) {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => return json!({
+            "ok": false,
+            "error": "Parameter 'code' must be a non-empty STRING of Python source code. \
+                      To run a script file with arguments, use run_shell instead, e.g. \
+                      {\"command\": \"python3 script.py arg1\"}."
+        }),
+    };
+
+    // Security check
+    if let Some(reason) = check_dangerous(code) {
+        warn!("[SECURITY] Python code blocked: {}", reason);
+        return json!({ "ok": false, "error": format!("Security: {reason}") });
+    }
+
+    // Prepend matplotlib non-interactive setup so plt.show() saves files instead of opening GUI
+    // MPLCONFIGDIR is the GLOBAL shared cache dir — see mpl_config_dir().
+    let mpl_config_dir = mpl_config_dir();
+    // CLI mode: the sandbox IS the user's folder — figures and save_output()
+    // land directly in it, no output_file/ staging subdir.
+    let cli_mode = crate::server::data::project_dir().is_some();
+    if !cli_mode {
+        let output_sub = std::path::Path::new(sandbox_dir).join("output_file");
+        let _ = std::fs::create_dir_all(&output_sub);
+    }
+    let output_dir_expr = if cli_mode { "_project_dir" } else { "os.path.join(_project_dir, 'output_file')" };
+    let matplotlib_prelude = format!(r#"
+import sys, os, uuid
+os.environ['MPLCONFIGDIR'] = '{mpl_dir}'
+os.environ['HOME'] = os.getcwd()
+_project_dir = os.getcwd()
+_output_dir = {output_dir_expr}
+os.makedirs(_output_dir, exist_ok=True)
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as _plt_orig
+    _plt_show_count = [0]
+    def _patched_show(*args, **kwargs):
+        _plt_show_count[0] += 1
+        fname = os.path.join(_output_dir, f'figure_{{_plt_show_count[0]}}.png')
+        _plt_orig.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f'[saved figure to {{fname}}]')
+        _plt_orig.close('all')
+    import matplotlib.pyplot as plt
+    plt.show = _patched_show
+except ImportError:
+    pass
+# Helper: save any file to project output_file/ directory
+def save_output(filename, content=None, mode='w'):
+    path = os.path.join(_output_dir, filename)
+    if content is not None:
+        with open(path, mode) as f:
+            f.write(content)
+    return path
+"#, mpl_dir = mpl_config_dir.display());
+    let code = &format!("{matplotlib_prelude}
+{code}");
+
+    // Try VM execution first if VM is running
+    if is_vm_running().await {
+        info!("[VM] Routing run_python to VM via SSH");
+        // Escape single quotes in code for shell
+        let escaped = code.replace('\'', "'\\''");
+        let vm_cmd = format!("cd /app && python3 -c '{}'", escaped);
+        match run_in_vm(&vm_cmd, 60).await {
+            Ok((stdout, stderr, success)) => {
+                return json!({
+                    "ok": success,
+                    "stdout": truncate(&stdout, MAX_CONTENT_LEN),
+                    "stderr": truncate(&stderr, MAX_CONTENT_LEN),
+                    "output_files": [],
+                    "vm": true,
+                });
+            }
+            Err(e) => {
+                warn!("[VM] SSH execution failed, falling back to local: {}", e);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    let abs_sandbox = std::path::Path::new(sandbox_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(sandbox_dir));
+
+    // On macOS, try sandboxed execution first; on other platforms, execute directly.
+    // Tier rules: a TIMEOUT in any tier is final (never re-run elsewhere — the
+    // code already ran for the full window inside the sandbox); only a SPAWN
+    // failure moves to the next tier. Unsandboxed direct execution is opt-in.
+    #[cfg(target_os = "macos")]
+    let result = {
+        // Primary: Apple container CLI (macOS containerization)
+        let r = run_guarded(
+            Command::new("/usr/bin/container")
+                .args([
+                    "run", "--rm",
+                    "-v", &format!("{}:/sandbox", abs_sandbox.display()),
+                    "-w", "/sandbox",
+                    "python:3.11-slim",
+                    "python3", "-c", code,
+                ]),
+            60,
+        )
+        .await;
+
+        let container_worked = matches!(&r,
+            Ok(Ok(o)) if o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty());
+
+        if container_worked || matches!(&r, Err(_)) {
+            r // container ran (or timed out inside the container) — final
+        } else {
+            // Fallback 1: sandbox-exec (macOS legacy)
+            warn_container_fallback_once();
+            let sandbox_profile = format!(
+                r#"(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow file-read*)
+{denies}(allow file-write* (subpath "{sandbox}"))
+(allow file-write* (subpath "{mpl}"))
+(allow file-write* (subpath "/tmp"))
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/dev/null"))
+(allow file-write* (subpath "/dev/tty"))
+(allow sysctl-read)
+(allow mach-lookup)
+(allow network-outbound)
+(allow network-inbound)
+(allow signal)"#,
+                denies = secret_read_deny_rules(),
+                sandbox = abs_sandbox.display(),
+                mpl = mpl_config_dir.display()
+            );
+            let r2 = run_guarded(
+                Command::new("/usr/bin/sandbox-exec")
+                    .arg("-p")
+                    .arg(&sandbox_profile)
+                    .arg(&find_python())
+                    .arg("-c")
+                    .arg(code)
+                    .current_dir(sandbox_dir)
+                    .env("MPLCONFIGDIR", &mpl_config_dir)
+                    .env("HOME", sandbox_dir),
+                60,
+            )
+            .await;
+
+            match &r2 {
+                Ok(Ok(_)) | Err(_) => r2, // ran or timed out inside the sandbox — final
+                Ok(Err(_)) if allow_unsandboxed_exec() => {
+                    // Fallback 2 (opt-in): direct unsandboxed execution
+                    warn!("[sandbox] sandbox-exec unavailable — direct execution (agentAllowUnsandboxedExec=true)");
+                    run_guarded(
+                        python_command()
+                            .arg("-c")
+                            .arg(code)
+                            .current_dir(sandbox_dir)
+                            .env("MPLCONFIGDIR", &mpl_config_dir)
+                            .env("HOME", sandbox_dir),
+                        60,
+                    )
+                    .await
+                }
+                Ok(Err(_)) => {
+                    return json!({
+                        "ok": false,
+                        "error": "No sandbox available: both the Apple container CLI and sandbox-exec \
+                                  failed to start. Unsandboxed execution is disabled \
+                                  (set agentAllowUnsandboxedExec=true in settings.json to override)."
+                    });
+                }
+            }
+        }
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let result = run_guarded(
+        python_command()
+            .arg("-c")
+            .arg(code)
+            .current_dir(sandbox_dir)
+            .env("MPLCONFIGDIR", &mpl_config_dir)
+            .env("HOME", sandbox_dir),
+        60,
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            // Windows: exit 9009 + the Store-alias message means the ONLY
+            // "python" on the machine is the fake WindowsApps stub. Return an
+            // actionable error instead of the stub text — and steer the model
+            // to tools that work without Python.
+            let all = format!("{stdout}{stderr}");
+            if output.status.code() == Some(9009) || all.contains("Microsoft Store") {
+                return json!({
+                    "ok": false,
+                    "error": "Python is not installed on this machine (only the Microsoft Store alias stub exists). \
+                              run_python will not work until the user installs Python — e.g. \
+                              `winget install -e --id Python.Python.3.12` or from python.org — and restarts TigrimOS. \
+                              Do NOT retry run_python or hunt for Python. For reading documents, use read_file \
+                              (it has built-in PDF text extraction with chunked paging via the 'offset' parameter)."
+                });
+            }
+
+            let output_files = scan_output_files(sandbox_dir).await;
+
+            json!({
+                "ok": output.status.success(),
+                "exit_code": output.status.code(),
+                "stdout": truncate(&stdout, MAX_CONTENT_LEN),
+                "stderr": truncate(&stderr, MAX_CONTENT_LEN),
+                "output_files": output_files,
+            })
+        }
+        Ok(Err(e)) => json!({ "ok": false, "error": format!("Failed to spawn python3: {e}") }),
+        Err(_) => json!({ "ok": false, "error": interrupted_reason(60) }),
+    }
+}
+
+pub(crate) async fn exec_run_shell(args: &Value, sandbox_dir: &str) -> Value {
+    // Strict: a non-string `command` would silently run an empty command and
+    // return ok=true (exit 0), wasting tool rounds and misleading the model.
+    let command = match args.get("command").and_then(|v| v.as_str()) {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => return json!({
+            "ok": false,
+            "error": "Parameter 'command' must be a non-empty STRING shell command."
+        }),
+    };
+
+    // Security check
+    if let Some(reason) = check_dangerous(command) {
+        warn!("[SECURITY] Shell command blocked: {}", reason);
+        return json!({ "ok": false, "error": format!("Security: {reason}") });
+    }
+
+    // Try VM execution first if VM is running
+    if is_vm_running().await {
+        info!("[VM] Routing run_shell to VM via SSH");
+        let vm_cmd = format!("cd /app && {}", command);
+        match run_in_vm(&vm_cmd, 30).await {
+            Ok((stdout, stderr, success)) => {
+                return json!({
+                    "ok": success,
+                    "stdout": truncate(&stdout, MAX_CONTENT_LEN),
+                    "stderr": truncate(&stderr, MAX_CONTENT_LEN),
+                    "vm": true,
+                });
+            }
+            Err(e) => {
+                warn!("[VM] SSH execution failed, falling back to local: {}", e);
+            }
+        }
+    }
+
+    let cwd = {
+        let raw_cwd = args["cwd"]
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| sandbox_dir.to_string());
+        let resolved_cwd = resolve_path(sandbox_dir, &raw_cwd);
+        // The escape sentinel is INSIDE the sandbox, so it passes the
+        // starts_with check below and then fails at spawn with the baffling
+        // "The directory name is invalid (os error 267)" — reject it here.
+        if is_blocked_path(&resolved_cwd) {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "Security: cwd '{}' is outside the sandbox ('{}'). Omit cwd or use a sandbox-relative path.",
+                    raw_cwd, sandbox_dir
+                )
+            });
+        }
+        let abs_sandbox_check = std::path::Path::new(sandbox_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(sandbox_dir));
+        if !resolved_cwd.starts_with(&abs_sandbox_check) {
+            warn!(
+                "[SECURITY] Shell cwd blocked: '{}' is outside sandbox '{}'",
+                raw_cwd, sandbox_dir
+            );
+            return json!({ "ok": false, "error": "Security: cwd path is outside the sandbox" });
+        }
+        resolved_cwd.to_string_lossy().to_string()
+    };
+
+    #[cfg(target_os = "macos")]
+    let abs_sandbox = std::path::Path::new(sandbox_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(sandbox_dir));
+
+    // On macOS, try sandboxed execution first; on other platforms, execute directly.
+    // Tier rules: a TIMEOUT in any tier is final (never re-run elsewhere); only a
+    // SPAWN failure moves to the next tier. Unsandboxed direct execution is opt-in.
+    #[cfg(target_os = "macos")]
+    let result = {
+        // Primary: Apple container CLI
+        let r = run_guarded(
+            Command::new("/usr/bin/container")
+                .args([
+                    "run", "--rm",
+                    "-v", &format!("{}:/sandbox", abs_sandbox.display()),
+                    "-w", "/sandbox",
+                    "alpine:latest",
+                    "sh", "-c", command,
+                ]),
+            30,
+        )
+        .await;
+
+        let container_worked = matches!(&r,
+            Ok(Ok(o)) if o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty());
+
+        if container_worked || matches!(&r, Err(_)) {
+            r // container ran (or timed out inside the container) — final
+        } else {
+            // Fallback 1: sandbox-exec (macOS legacy)
+            warn_container_fallback_once();
+            let sandbox_profile = format!(
+                r#"(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow file-read*)
+{denies}(allow file-write* (subpath "{sandbox}"))
+(allow file-write* (subpath "/tmp"))
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/dev/null"))
+(allow sysctl-read)
+(allow mach-lookup)
+(allow network-outbound)
+(allow signal)"#,
+                denies = secret_read_deny_rules(),
+                sandbox = abs_sandbox.display()
+            );
+            let r2 = run_guarded(
+                Command::new("/usr/bin/sandbox-exec")
+                    .arg("-p")
+                    .arg(&sandbox_profile)
+                    .arg("/bin/sh")
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(&cwd),
+                30,
+            )
+            .await;
+
+            match &r2 {
+                Ok(Ok(_)) | Err(_) => r2, // ran or timed out inside the sandbox — final
+                Ok(Err(_)) if allow_unsandboxed_exec() => {
+                    // Fallback 2 (opt-in): direct unsandboxed execution
+                    warn!("[sandbox] sandbox-exec unavailable — direct execution (agentAllowUnsandboxedExec=true)");
+                    run_guarded(
+                        shell_command()
+                            .arg("-c")
+                            .arg(command)
+                            .current_dir(&cwd),
+                        30,
+                    )
+                    .await
+                }
+                Ok(Err(_)) => {
+                    return json!({
+                        "ok": false,
+                        "error": "No sandbox available: both the Apple container CLI and sandbox-exec \
+                                  failed to start. Unsandboxed execution is disabled \
+                                  (set agentAllowUnsandboxedExec=true in settings.json to override)."
+                    });
+                }
+            }
+        }
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let result = {
+        // On Windows, cmd.exe does NOT follow the MSVC argument-quoting rules
+        // Rust's .arg() applies: embedded quotes become \" which cmd parses as
+        // literal backslash+quote, so any command containing a quoted path
+        // fails with "The filename, directory name, or volume label syntax is
+        // incorrect". Pass the command line verbatim via raw_arg using
+        // `/S /C "..."` — with /S, cmd strips the first and last quote and
+        // runs everything between them literally.
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            use std::os::windows::process::CommandExt as _;
+            ensure_full_path();
+            let mut c = std::process::Command::new("cmd.exe");
+            c.raw_arg(format!("/S /C \"{}\"", command));
+            Command::from(c)
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = shell_command();
+            c.arg("-c").arg(command);
+            c
+        };
+        run_guarded(cmd.current_dir(&cwd), 30).await
+    };
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            // Surface files the command created (heredocs, redirects, etc.) so they
+            // appear as clickable tags/links in chat — same as run_python/write_file.
+            let output_files = scan_output_files(sandbox_dir).await;
+
+            json!({
+                "ok": output.status.success(),
+                "exit_code": output.status.code(),
+                "stdout": truncate(&stdout, MAX_CONTENT_LEN),
+                "stderr": truncate(&stderr, MAX_CONTENT_LEN),
+                "output_files": output_files,
+            })
+        }
+        Ok(Err(e)) => json!({ "ok": false, "error": format!("Failed to spawn shell: {e}") }),
+        Err(_) => json!({ "ok": false, "error": interrupted_reason(30) }),
+    }
+}
+
+/// Max chars to return in a single PDF read (large enough for most PDFs in one call)
+const PDF_CHUNK_SIZE: usize = 60_000;
+
+/// Cache extracted PDF text to avoid re-extracting on every chunk read
+fn pdf_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+async fn exec_read_file(args: &Value, sandbox_dir: &str) -> Value {
+    let path = args["path"].as_str().unwrap_or("");
+    let resolved = resolve_path(sandbox_dir, path);
+    if is_blocked_path(&resolved) {
+        return blocked_path_error("", path, sandbox_dir);
+    }
+
+    // Handle PDF files — extract text, return in large chunks (cached)
+    if resolved.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("pdf")).unwrap_or(false) {
+        let key = resolved.display().to_string();
+        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+
+        // Get text from cache or extract
+        let text = {
+            let cache = pdf_cache().lock().unwrap_or_else(|e| e.into_inner());
+            cache.get(&key).cloned()
+        };
+        let text = if let Some(t) = text {
+            t
+        } else {
+            let resolved_clone = resolved.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                pdf_extract::extract_text(&resolved_clone)
+            }).await;
+            match result {
+                Ok(Ok(t)) => {
+                    compact::track_file_read(&key, &t);
+                    let mut cache = pdf_cache().lock().unwrap_or_else(|e| e.into_inner());
+                    // Memory guard: extracted PDF text accumulates forever in a
+                    // long-running server — reset the cache past 24 entries.
+                    if cache.len() >= 24 { cache.clear(); }
+                    cache.insert(key.clone(), t.clone());
+                    t
+                }
+                Ok(Err(e)) => return json!({ "ok": false, "error": format!("Failed to extract PDF text: {e}") }),
+                Err(e) => return json!({ "ok": false, "error": format!("PDF extraction task failed: {e}") }),
+            }
+        };
+
+        let total_chars = text.len();
+        // Calculate chunk boundaries
+        let char_start = offset * PDF_CHUNK_SIZE;
+        if char_start >= total_chars {
+            let total_chunks = (total_chars + PDF_CHUNK_SIZE - 1) / PDF_CHUNK_SIZE;
+            return json!({
+                "ok": false,
+                "error": format!("Chunk offset {} out of range (total_chunks: {})", offset, total_chunks),
+            });
+        }
+        let mut char_end = (char_start + PDF_CHUNK_SIZE).min(total_chars);
+        while char_end < total_chars && !text.is_char_boundary(char_end) {
+            char_end += 1;
+        }
+        let total_chunks = (total_chars + PDF_CHUNK_SIZE - 1) / PDF_CHUNK_SIZE;
+        let content = &text[char_start..char_end];
+
+        return json!({
+            "ok": true,
+            "content": content,
+            "path": &key,
+            "format": "pdf",
+            "chunk": offset,
+            "total_chunks": total_chunks,
+            "total_chars": total_chars,
+            "hint": if total_chunks > 1 && offset == 0 {
+                format!("PDF has {} chunks (~{}KB each). Use offset 1..{} to read more.", total_chunks, PDF_CHUNK_SIZE / 1000, total_chunks - 1)
+            } else {
+                String::new()
+            },
+        });
+    }
+
+    match fs::read_to_string(&resolved).await {
+        Ok(content) => {
+            // Track file read for post-compact context restoration
+            compact::track_file_read(&resolved.display().to_string(), &content);
+            json!({
+                "ok": true,
+                "content": truncate(&content, MAX_CONTENT_LEN),
+                "path": resolved.display().to_string(),
+            })
+        }
+        Err(e) => json!({ "ok": false, "error": format!("Failed to read file: {e}") }),
+    }
+}
+
+async fn exec_write_file(args: &Value, sandbox_dir: &str) -> Value {
+    let path = args["path"].as_str().unwrap_or("");
+    let content = args["content"].as_str().unwrap_or("");
+    let append = args["append"].as_bool().unwrap_or(false);
+    let resolved = resolve_path(sandbox_dir, path);
+    if is_blocked_path(&resolved) {
+        return blocked_path_error(
+            "To create or update a SKILL, use the save_skill tool instead — it writes to the app's skills directory.",
+            path,
+            sandbox_dir,
+        );
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = resolved.parent() {
+        if let Err(e) = fs::create_dir_all(parent).await {
+            return json!({ "ok": false, "error": format!("Failed to create directories: {e}") });
+        }
+    }
+
+    let result = if append {
+        use tokio::io::AsyncWriteExt;
+        let mut file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&resolved)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => return json!({ "ok": false, "error": format!("Failed to open file: {e}") }),
+        };
+        file.write_all(content.as_bytes()).await
+    } else {
+        fs::write(&resolved, content).await
+    };
+
+    match result {
+        Ok(()) => {
+            let full = resolved.display().to_string();
+            json!({
+                "ok": true,
+                "path": full,
+                "bytes_written": content.len(),
+                "output_files": [full],
+            })
+        }
+        Err(e) => json!({ "ok": false, "error": format!("Failed to write file: {e}") }),
+    }
+}
+
+async fn exec_list_files(args: &Value, sandbox_dir: &str) -> Value {
+    // Ensure sandbox directory exists
+    let _ = fs::create_dir_all(sandbox_dir).await;
+
+    let path = args["path"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| sandbox_dir.to_string());
+    let recursive = args["recursive"].as_bool().unwrap_or(false);
+    let resolved = resolve_path(sandbox_dir, &path);
+    if is_blocked_path(&resolved) {
+        return blocked_path_error("", &path, sandbox_dir);
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+
+    if recursive {
+        if let Err(e) = walk_dir_recursive(&resolved, &mut entries, MAX_LIST_ENTRIES).await {
+            return json!({ "ok": false, "error": format!("Failed to list directory: {e}") });
+        }
+    } else {
+        match fs::read_dir(&resolved).await {
+            Ok(mut dir) => {
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    if entries.len() >= MAX_LIST_ENTRIES {
+                        entries.push("...[truncated]".to_string());
+                        break;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let is_dir = entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false);
+                    entries.push(if is_dir {
+                        format!("{}/", name)
+                    } else {
+                        name
+                    });
+                }
+            }
+            Err(e) => {
+                return json!({ "ok": false, "error": format!("Failed to read directory: {e}") });
+            }
+        }
+    }
+
+    json!({ "ok": true, "entries": entries, "count": entries.len() })
+}
+
+/// Recursively walk a directory, collecting up to `limit` entries.
+async fn walk_dir_recursive(
+    dir: &PathBuf,
+    entries: &mut Vec<String>,
+    limit: usize,
+) -> Result<(), std::io::Error> {
+    let mut stack = vec![dir.clone()];
+
+    while let Some(current) = stack.pop() {
+        if entries.len() >= limit {
+            entries.push("...[truncated]".to_string());
+            break;
+        }
+
+        let mut rd = fs::read_dir(&current).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            if entries.len() >= limit {
+                entries.push("...[truncated]".to_string());
+                return Ok(());
+            }
+            let path = entry.path();
+            let display = path.display().to_string();
+            let is_dir = entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false);
+
+            if is_dir {
+                entries.push(format!("{}/", display));
+                stack.push(path);
+            } else {
+                entries.push(display);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Skill resolution helpers — mirrors TS slugifySkillName / skillCandidates / resolveSkillDir
+// ---------------------------------------------------------------------------
+
+fn slugify_skill_name(name: &str) -> String {
+    let mut slug = String::new();
+    for ch in name.to_lowercase().trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn skill_candidates(skill_name: &str, registry_entry: Option<&Value>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |v: &str| {
+        if !v.is_empty() && v.len() < 200 && seen.insert(v.to_string()) {
+            out.push(v.to_string());
+        }
+    };
+    push(skill_name);
+    if let Some(entry) = registry_entry {
+        // Only use "script" as candidate if it looks like a filename (not content)
+        if let Some(script) = entry.get("script").and_then(|s| s.as_str()) {
+            if !script.contains('\n') && script.len() < 200 {
+                push(script);
+            }
+        }
+    }
+    push(&slugify_skill_name(skill_name));
+    out
+}
+
+fn skills_search_dirs() -> Vec<(std::path::PathBuf, &'static str)> {
+    vec![
+        (crate::server::data::skills_root(), "custom"),
+        (std::path::PathBuf::from("Tiger_bot/skills"), "clawhub"),
+        (std::path::PathBuf::from("skills"), "custom"),
+    ]
+}
+
+fn read_skills_registry() -> Vec<Value> {
+    let path = crate::server::data::data_file_path("skills.json");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => vec![],
+    }
+}
+
+fn resolve_skill_dir(skill_name: &str, registry_entry: Option<&Value>) -> Option<(std::path::PathBuf, String)> {
+    for cand in skill_candidates(skill_name, registry_entry) {
+        for (dir, label) in skills_search_dirs() {
+            let base = dir.join(&cand);
+            if base.join("SKILL.md").exists() {
+                return Some((base, label.to_string()));
+            }
+        }
+    }
+    None
+}
+
+async fn exec_list_skills(_args: &Value, _sandbox_dir: &str) -> Value {
+    let registry = read_skills_registry();
+
+    // Registered skills with hasFiles check
+    let registered_skills: Vec<Value> = registry
+        .iter()
+        .map(|s| {
+            let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let source = s.get("source").and_then(|n| n.as_str()).unwrap_or("unknown");
+            let enabled = s.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
+            let resolved = resolve_skill_dir(name, Some(s));
+            json!({
+                "name": name,
+                "source": source,
+                "enabled": enabled,
+                "hasFiles": resolved.is_some(),
+            })
+        })
+        .collect();
+
+    let skill_names: Vec<String> = registered_skills
+        .iter()
+        .filter(|s| s["enabled"].as_bool().unwrap_or(true))
+        .filter_map(|s| s["name"].as_str().map(|n| n.to_string()))
+        .collect();
+
+    // Also check the skills root (folder-local in CLI mode) for SKILL.md files
+    let mut dir_skills = vec![];
+    let skills_scan_dir = crate::server::data::skills_root();
+    if let Ok(mut entries) = tokio::fs::read_dir(&skills_scan_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry
+                .file_type()
+                .await
+                .map(|t| t.is_dir())
+                .unwrap_or(false)
+            {
+                let skill_md = entry.path().join("SKILL.md");
+                if tokio::fs::metadata(&skill_md).await.is_ok() {
+                    dir_skills.push(entry.file_name().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    json!({
+        "skills": skill_names,
+        "dir_skills": dir_skills,
+        "registered_skills": registered_skills,
+        "hint": "Use load_skill with a skill name to see its SKILL.md and supporting files. Skills where hasFiles=false are registered but have no SKILL.md on disk and cannot be loaded. Use save_skill to create or update a skill."
+    })
+}
+
+/// save_skill — write a new/updated skill into the app's skills directory and
+/// register it, so it is immediately visible to list_skills / load_skill.
+/// This is the ONLY tool-level write path outside the sandbox jail: write_file
+/// cannot reach the skills dir (a generated skill saved into the sandbox is
+/// never loaded — seen in the field on Windows).
+async fn exec_save_skill(args: &Value) -> Value {
+    let skill_md = match args.get("skill_md").and_then(|v| v.as_str()) {
+        Some(c) if c.trim_start().starts_with("---") => c,
+        Some(_) => {
+            return json!({
+                "ok": false,
+                "error": "skill_md must start with '---' YAML frontmatter containing 'name:' and 'description:'."
+            })
+        }
+        None => return json!({ "ok": false, "error": "Parameter 'skill_md' (full SKILL.md content) is required." }),
+    };
+
+    let (fm_name, fm_description) = crate::server::routes::skills::parse_frontmatter(skill_md);
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fm_name);
+    if name.is_empty() {
+        return json!({
+            "ok": false,
+            "error": "No skill name: set 'name:' in the SKILL.md frontmatter or pass the 'name' parameter."
+        });
+    }
+
+    let slug = crate::server::routes::skills::slugify(&name);
+    let skill_dir = crate::server::data::skills_root().join(&slug);
+    if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
+        return json!({ "ok": false, "error": format!("Failed to create skill directory: {e}") });
+    }
+    if let Err(e) = tokio::fs::write(skill_dir.join("SKILL.md"), skill_md).await {
+        return json!({ "ok": false, "error": format!("Failed to write SKILL.md: {e}") });
+    }
+
+    // Optional supporting files — relative paths only, jailed to the skill dir.
+    let mut written = vec!["SKILL.md".to_string()];
+    if let Some(files) = args.get("files").and_then(|v| v.as_array()) {
+        for f in files {
+            let rel = f.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let rel_path = std::path::Path::new(rel);
+            let escapes = rel.is_empty()
+                || rel_path.is_absolute()
+                || rel_path.components().any(|c| {
+                    matches!(c, std::path::Component::ParentDir | std::path::Component::Prefix(_))
+                });
+            if escapes {
+                return json!({
+                    "ok": false,
+                    "error": format!("files[].path must be a relative path inside the skill folder, got '{rel}'")
+                });
+            }
+            let dest = skill_dir.join(rel_path);
+            if let Some(parent) = dest.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            if let Err(e) = tokio::fs::write(&dest, content).await {
+                return json!({ "ok": false, "error": format!("Failed to write '{rel}': {e}") });
+            }
+            written.push(rel.to_string());
+        }
+    }
+
+    // Register (or update) in skills.json so it shows up as a registered skill.
+    let mut skills = crate::server::data::get_skills().await;
+    let description = if fm_description.is_empty() {
+        format!("Custom skill '{name}'")
+    } else {
+        fm_description
+    };
+    if let Some(existing) = skills
+        .iter_mut()
+        .find(|s| s.name == name || crate::server::routes::skills::slugify(&s.name) == slug)
+    {
+        existing.description = description;
+        existing.script = slug.clone();
+        existing.enabled = true;
+    } else {
+        skills.push(crate::server::data::Skill {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.clone(),
+            description,
+            source: "custom".to_string(),
+            script: slug.clone(),
+            enabled: true,
+            installed_at: chrono::Utc::now().to_rfc3339(),
+            review_status: None,
+            auto_meta: None,
+        });
+    }
+    crate::server::data::save_skills(&skills).await;
+
+    info!("[save_skill] Saved skill '{}' to {:?} ({} file(s))", name, skill_dir, written.len());
+    json!({
+        "ok": true,
+        "name": name,
+        "slug": slug,
+        "dir": skill_dir.display().to_string(),
+        "files": written,
+        "hint": "The skill is registered and loadable now — verify with load_skill."
+    })
+}
+
+async fn exec_load_skill(args: &Value, _sandbox_dir: &str) -> Value {
+    let skill_name = args.get("skill").and_then(|s| s.as_str())
+        .or_else(|| args.get("name").and_then(|s| s.as_str()))
+        .or_else(|| args.get("skill-name").and_then(|s| s.as_str()))
+        .or_else(|| args.get("skill_name").and_then(|s| s.as_str()))
+        .unwrap_or("");
+    if skill_name.is_empty() {
+        return json!({"ok": false, "error": "Missing skill name. Use parameter 'skill' with the skill slug."});
+    }
+
+    let registry = read_skills_registry();
+    let registry_entry = registry.iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(skill_name))
+        .or_else(|| registry.iter().find(|s| {
+            s.get("name").and_then(|n| n.as_str())
+                .map(|n| slugify_skill_name(n) == slugify_skill_name(skill_name))
+                .unwrap_or(false)
+        }));
+
+    if let Some((skill_base_dir, source)) = resolve_skill_dir(skill_name, registry_entry) {
+        let skill_file = skill_base_dir.join("SKILL.md");
+        let base_dir_str = skill_base_dir.display().to_string();
+        match tokio::fs::read_to_string(&skill_file).await {
+            Ok(raw_content) => {
+                let content = raw_content.replace("{baseDir}", &base_dir_str);
+                let truncated = content.len() > 15000;
+                let content = crate::util::truncate_utf8(&content, 15000).to_string();
+
+                // Read _meta.json if present
+                let meta = match tokio::fs::read_to_string(skill_base_dir.join("_meta.json")).await {
+                    Ok(m) => serde_json::from_str::<Value>(&m).unwrap_or(json!({})),
+                    Err(_) => json!({}),
+                };
+
+                // List supporting files
+                let mut supporting_files = Vec::new();
+                fn walk_skill_dir(d: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
+                    if let Ok(entries) = std::fs::read_dir(d) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.starts_with('.') || name == "__MACOSX" { continue; }
+                            let rel = if prefix.is_empty() { name.clone() } else { format!("{}/{}", prefix, name) };
+                            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                walk_skill_dir(&entry.path(), &rel, out);
+                            } else if name != "SKILL.md" && name != "_meta.json" {
+                                out.push(rel);
+                            }
+                        }
+                    }
+                }
+                walk_skill_dir(&skill_base_dir, "", &mut supporting_files);
+
+                // Replace relative paths in content with absolute paths so agent can find files
+                let mut full_content = content;
+                if !supporting_files.is_empty() {
+                    for f in &supporting_files {
+                        // Replace ./scripts/file.py and scripts/file.py with absolute path
+                        let abs = format!("{}/{}", base_dir_str, f);
+                        let rel_dot = format!("./{}", f);
+                        full_content = full_content.replace(&rel_dot, &abs);
+                        full_content = full_content.replace(f, &abs);
+                    }
+                }
+
+                return json!({
+                    "ok": true,
+                    "skill": skill_name,
+                    "source": source,
+                    "skillDir": base_dir_str,
+                    "content": full_content,
+                    "meta": meta,
+                    "supportingFiles": supporting_files,
+                    "truncated": truncated,
+                });
+            }
+            Err(e) => return json!({"ok": false, "error": format!("Failed to read SKILL.md: {}", e)}),
+        }
+    }
+
+    // Not found — try self-healing: if script field contains SKILL.md content, write it to disk
+    if let Some(entry) = registry_entry {
+        if let Some(script) = entry.get("script").and_then(|s| s.as_str()) {
+            if script.contains('\n') && script.len() > 50 {
+                // script field contains the actual SKILL.md content — save it to disk
+                let slug = slugify_skill_name(skill_name);
+                let skill_dir = crate::server::data::skills_root().join(&slug);
+                let _ = std::fs::create_dir_all(&skill_dir);
+                let skill_file = skill_dir.join("SKILL.md");
+                if std::fs::write(&skill_file, script).is_ok() {
+                    info!("[Skills] Self-healed: wrote SKILL.md for {} to {}", skill_name, skill_file.display());
+                    // Retry the load now that the file exists
+                    let content = script.replace("{baseDir}", &skill_dir.display().to_string());
+                    let truncated = content.len() > 15000;
+                    let content = crate::util::truncate_utf8(&content, 15000).to_string();
+                    return json!({
+                        "ok": true,
+                        "skill": skill_name,
+                        "source": "self-healed",
+                        "content": content,
+                        "truncated": truncated,
+                    });
+                }
+            }
+        }
+    }
+
+    // Not found — provide helpful error
+    let tried = skill_candidates(skill_name, registry_entry);
+    let dirs_str = skills_search_dirs().iter().map(|(d, _)| d.display().to_string()).collect::<Vec<_>>().join(" and ");
+    if registry_entry.is_some() {
+        return json!({
+            "ok": false,
+            "error": format!("Skill \"{}\" is registered but no SKILL.md was found on disk. Tried folder names [{}] under {}.", skill_name, tried.join(", "), dirs_str),
+            "registered": true,
+            "triedCandidates": tried,
+        });
+    }
+    json!({
+        "ok": false,
+        "error": format!("Skill \"{}\" not found. Tried folder names [{}] under {}.", skill_name, tried.join(", "), dirs_str),
+        "registered": false,
+        "triedCandidates": tried,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// New tool exec functions (ported from tiger_cowork)
+// ---------------------------------------------------------------------------
+
+/// delete_file — port of tiger_cowork deleteFileTool
+async fn exec_delete_file(args: &Value, sandbox_dir: &str) -> Value {
+    let file_path = args["path"].as_str().unwrap_or("");
+    if file_path.is_empty() {
+        return json!({ "ok": false, "error": "No path provided" });
+    }
+    let target = resolve_path(sandbox_dir, file_path);
+    if is_blocked_path(&target) {
+        return blocked_path_error("", file_path, sandbox_dir);
+    }
+    if !target.exists() {
+        return json!({ "ok": false, "error": format!("File not found: {}", target.display()) });
+    }
+    if target.is_dir() {
+        match tokio::fs::remove_dir_all(&target).await {
+            Ok(_) => json!({ "ok": true, "deleted": target.display().to_string() }),
+            Err(e) => json!({ "ok": false, "error": format!("Delete dir failed: {e}") }),
+        }
+    } else {
+        match tokio::fs::remove_file(&target).await {
+            Ok(_) => json!({ "ok": true, "deleted": target.display().to_string() }),
+            Err(e) => json!({ "ok": false, "error": format!("Delete file failed: {e}") }),
+        }
+    }
+}
+
+/// list_local_mounts — returns configured local mount points from settings
+async fn exec_list_local_mounts(_args: &Value) -> Value {
+    let settings_path = crate::server::data::data_dir().join("settings.json");
+    let settings: Value = match tokio::fs::read_to_string(&settings_path).await {
+        Ok(s) => serde_json::from_str(&s).unwrap_or(json!({})),
+        Err(_) => json!({}),
+    };
+    let mounts = settings
+        .get("localFileMounts")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let enabled: Vec<Value> = mounts
+        .iter()
+        .filter(|m| m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
+        .map(|m| json!({
+            "id": m.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+            "label": m.get("label").and_then(|v| v.as_str()).unwrap_or(""),
+            "path": m.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+            "permissions": m.get("permissions").and_then(|v| v.as_str()).unwrap_or("readonly"),
+        }))
+        .collect();
+    if enabled.is_empty() {
+        return json!({
+            "ok": true, "mounts": [],
+            "message": "No local directories are mounted. The user can add mounts in Settings > Local Files."
+        });
+    }
+    json!({
+        "ok": true, "mounts": enabled,
+        "instructions": "Use read_file, write_file, delete_file, and list_files with the absolute paths above."
+    })
+}
+
+/// run_react — compile JSX/React code, save compiled JS for the output panel
+async fn exec_run_react(args: &Value, sandbox_dir: &str) -> Value {
+    let code = args["code"].as_str().unwrap_or("");
+    let title = args["title"].as_str().unwrap_or("React Component");
+    if code.is_empty() {
+        return json!({ "ok": false, "error": "No code provided", "output_files": [] });
+    }
+
+    // Strip import statements
+    let cleaned: String = code
+        .lines()
+        .filter(|l| !l.trim().starts_with("import "))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Detect exported component name via simple pattern matching
+    let exported_component = {
+        let mut name = String::new();
+        for line in cleaned.lines() {
+            let t = line.trim();
+            if t.starts_with("export default function ") {
+                name = t.split_whitespace().nth(3).unwrap_or("").to_string();
+                break;
+            } else if t.starts_with("export default ") {
+                name = t.split_whitespace().nth(2).unwrap_or("").trim_end_matches(';').to_string();
+                break;
+            }
+        }
+        name
+    };
+
+    // Strip export keywords
+    let cleaned = cleaned
+        .replace("export default function ", "function ")
+        .replace("export default class ", "class ")
+        .replace("export default ", "");
+    let cleaned: String = cleaned
+        .lines()
+        .map(|l| if l.trim().starts_with("export ") { l.replacen("export ", "", 1) } else { l.to_string() })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Detect component names (uppercase)
+    let component_names: Vec<String> = cleaned
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            for prefix in &["function ", "const ", "class "] {
+                if t.starts_with(prefix) {
+                    let rest = &t[prefix.len()..];
+                    let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                        return Some(name);
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    let render_target = if !exported_component.is_empty() {
+        exported_component
+    } else {
+        component_names.iter().find(|n| n.as_str() == "App")
+            .cloned()
+            .or_else(|| component_names.last().cloned())
+            .unwrap_or_default()
+    };
+
+    let wrapped = format!(
+        "const {{ useState, useEffect, useRef, useMemo, useCallback, useReducer, useContext, createContext, Fragment, memo, forwardRef, lazy, Suspense }} = React;\nconst _Recharts = typeof Recharts !== 'undefined' ? Recharts : {{}};\nconst {{ LineChart, Line, BarChart, Bar, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter }} = _Recharts;\n\n{}\n\nreturn {};",
+        cleaned,
+        if render_target.is_empty() { "null".to_string() } else { render_target.clone() }
+    );
+
+    let output_dir = PathBuf::from(sandbox_dir).join("output_file");
+    let _ = tokio::fs::create_dir_all(&output_dir).await;
+    let filename = format!("react_{}.jsx.js", chrono::Utc::now().timestamp_millis());
+    let out_path = output_dir.join(&filename);
+
+    let meta = serde_json::to_string(&json!({ "title": title, "renderTarget": render_target }))
+        .unwrap_or_default();
+    let final_output = format!("// __REACT_META__={}\n{}", meta, wrapped);
+
+    // Try compile via npx esbuild
+    ensure_full_path();
+    let jsx_tmp = std::env::temp_dir().join(format!("react_{}.jsx", chrono::Utc::now().timestamp_millis()));
+    if tokio::fs::write(&jsx_tmp, &wrapped).await.is_ok() {
+        // Find npx: check PATH, then common locations
+        let npx_bin = {
+            #[cfg(target_os = "windows")]
+            let which_cmd = "where";
+            #[cfg(not(target_os = "windows"))]
+            let which_cmd = "/usr/bin/which";
+            let found = std::process::Command::new(which_cmd).arg("npx").output().ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(|s| s.trim().to_string()));
+            if let Some(p) = found {
+                p
+            } else {
+                #[cfg(target_os = "macos")]
+                {
+                    ["/opt/homebrew/bin/npx", "/usr/local/bin/npx"]
+                        .iter()
+                        .find(|c| std::path::Path::new(c).exists())
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "npx".to_string())
+                }
+                #[cfg(not(target_os = "macos"))]
+                { "npx".to_string() }
+            }
+        };
+        let compiled = run_guarded(
+            Command::new(&npx_bin)
+                .args(["--yes", "esbuild", jsx_tmp.to_str().unwrap_or(""), "--bundle=false", "--loader=jsx"]),
+            30,
+        ).await;
+        let _ = tokio::fs::remove_file(&jsx_tmp).await;
+        if let Ok(Ok(out)) = compiled {
+            if out.status.success() {
+                let code_str = String::from_utf8_lossy(&out.stdout);
+                let content = format!("// __REACT_META__={}\n{}", meta, code_str);
+                if tokio::fs::write(&out_path, &content).await.is_ok() {
+                    let full = out_path.display().to_string();
+                    return json!({ "ok": true, "output_files": [full], "message": format!("React component compiled to {}.", full) });
+                }
+            }
+        }
+    }
+
+    // Fallback: save raw
+    match tokio::fs::write(&out_path, &final_output).await {
+        Ok(_) => {
+            let full = out_path.display().to_string();
+            json!({ "ok": true, "output_files": [full], "message": format!("React component saved to {} (raw JSX).", full) })
+        }
+        Err(e) => json!({ "ok": false, "error": format!("Write failed: {e}"), "output_files": [] }),
+    }
+}
+
+/// remote_task — delegate to another TigrimOS instance via HTTP
+async fn exec_remote_task(args: &Value) -> Value {
+    let instance_arg = args["instance"].as_str().unwrap_or("");
+    let task = args["task"].as_str().unwrap_or("");
+    let idle_timeout_secs = args["idle_timeout"].as_u64().unwrap_or(60);
+    let max_timeout_secs = args["max_timeout"].as_u64().unwrap_or(1800);
+
+    if task.is_empty() {
+        return json!({ "ok": false, "error": "task is required" });
+    }
+
+    let settings: Value = match tokio::fs::read_to_string(crate::server::data::data_dir().join("settings.json")).await {
+        Ok(s) => serde_json::from_str(&s).unwrap_or(json!({})),
+        Err(_) => json!({}),
+    };
+
+    let (url, token) = {
+        let mut found_url = String::new();
+        let mut found_token = String::new();
+        if let Some(instances) = settings.get("remoteInstances").and_then(|v| v.as_array()) {
+            if let Some(inst) = instances.iter().find(|i| {
+                i.get("id").and_then(|v| v.as_str()) == Some(instance_arg)
+                    || i.get("name").and_then(|v| v.as_str()) == Some(instance_arg)
+            }) {
+                found_url = inst.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                found_token = inst.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            }
+        }
+        if found_url.is_empty() {
+            if let Ok(parsed) = serde_json::from_str::<Value>(instance_arg) {
+                found_url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                found_token = parsed.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            }
+        }
+        (found_url, found_token)
+    };
+
+    if url.is_empty() {
+        return json!({ "ok": false, "error": format!("Remote instance \"{}\" not found", instance_arg) });
+    }
+
+    let base_url = url.trim_end_matches('/').to_string();
+    let client = Client::new();
+
+    let submit = match client
+        .post(format!("{}/api/remote/task", base_url))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({ "task": task }))
+        .send().await
+    {
+        Ok(r) => r,
+        Err(e) => return json!({ "ok": false, "error": format!("Network error: {e}") }),
+    };
+
+    if !submit.status().is_success() {
+        let status = submit.status().as_u16();
+        let body = submit.text().await.unwrap_or_default();
+        return json!({ "ok": false, "error": format!("Submit failed: {} {}", status, crate::util::truncate_utf8(&body, 500)) });
+    }
+
+    let submit_data: Value = match submit.json().await {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": format!("Parse error: {e}") }),
+    };
+
+    let task_id = match submit_data.get("taskId").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => return json!({ "ok": false, "error": "No taskId in response" }),
+    };
+
+    info!("[Remote] Task {} submitted to {}", task_id, base_url);
+
+    let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(max_timeout_secs);
+    let idle_duration = Duration::from_secs(idle_timeout_secs);
+    let mut last_activity = tokio::time::Instant::now();
+    let mut last_seq: u64 = 0;
+
+    loop {
+        if tokio::time::Instant::now() > hard_deadline {
+            return json!({ "ok": false, "error": format!("Timed out after {}s", max_timeout_secs) });
+        }
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let poll = match client
+            .get(format!("{}/api/remote/task/{}", base_url, task_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .send().await
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let data: Value = match poll.json().await { Ok(v) => v, Err(_) => continue };
+        let seq = data.get("progressSeq").and_then(|v| v.as_u64()).unwrap_or(0);
+        if seq > last_seq { last_seq = seq; last_activity = tokio::time::Instant::now(); }
+        if tokio::time::Instant::now().duration_since(last_activity) > idle_duration {
+            return json!({ "ok": false, "error": format!("Idle timeout after {}s", idle_timeout_secs) });
+        }
+        match data.get("status").and_then(|v| v.as_str()) {
+            Some("completed") => return json!({ "ok": true, "result": data.get("result").cloned().unwrap_or(json!(null)) }),
+            Some("error") => return json!({ "ok": false, "error": data.get("error").and_then(|v| v.as_str()).unwrap_or("Remote task failed") }),
+            _ => continue,
+        }
+    }
+}
+
+/// Claude Code CLI agent — spawn `claude -p` and parse stream-json output
+async fn exec_claude_code_agent(args: &Value, sandbox_dir: &str) -> Value {
+    let task = args["task"].as_str().unwrap_or("");
+    let system_prompt = args["system_prompt"].as_str().unwrap_or("");
+    let timeout_secs = args["timeout"].as_u64().unwrap_or(300);
+    let max_turns = args["max_turns"].as_u64().unwrap_or(25);
+    let model = args["model"].as_str().unwrap_or("");
+
+    if task.is_empty() {
+        return json!({ "ok": false, "error": "task is required" });
+    }
+
+    let full_prompt = if system_prompt.is_empty() {
+        task.to_string()
+    } else {
+        format!("{}\n\n---\n\nTASK:\n{}", system_prompt, task)
+    };
+
+    let mut cli_args = vec![
+        "-p".to_string(), full_prompt,
+        "--output-format".to_string(), "stream-json".to_string(),
+        "--max-turns".to_string(), max_turns.to_string(),
+        "--allowedTools".to_string(), "Read,Edit,Write,Bash,Glob,Grep".to_string(),
+        "--verbose".to_string(),
+    ];
+    if !model.is_empty() {
+        cli_args.push("--model".to_string());
+        cli_args.push(model.to_string());
+    }
+
+    info!("[ClaudeCode] Spawning in {} (timeout: {}s, maxTurns: {})", sandbox_dir, timeout_secs, max_turns);
+
+    match run_guarded(Command::new("claude").args(&cli_args).current_dir(sandbox_dir), timeout_secs).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut result_text = String::new();
+            let mut tool_calls: Vec<String> = Vec::new();
+            for line in stdout.lines() {
+                if let Ok(event) = serde_json::from_str::<Value>(line) {
+                    if event["type"] == "assistant" {
+                        if let Some(content) = event["message"]["content"].as_array() {
+                            for block in content {
+                                if block["type"] == "text" { result_text.push_str(block["text"].as_str().unwrap_or("")); }
+                                if block["type"] == "tool_use" { if let Some(n) = block["name"].as_str() { tool_calls.push(n.to_string()); } }
+                            }
+                        }
+                    } else if event["type"] == "result" {
+                        if let Some(r) = event["result"].as_str() { result_text = r.to_string(); }
+                    }
+                }
+            }
+            if result_text.is_empty() && !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return json!({ "ok": false, "error": format!("claude exited {:?}: {}", output.status.code(), crate::util::truncate_utf8(&stderr, 1000)) });
+            }
+            let output_files = scan_output_files(sandbox_dir).await;
+            json!({ "ok": true, "content": if result_text.is_empty() { "(no output)".to_string() } else { result_text }, "tool_calls": tool_calls, "output_files": output_files })
+        }
+        Ok(Err(e)) => json!({ "ok": false, "error": format!("Failed to spawn claude: {e}. Is 'claude' in PATH?") }),
+        Err(_) => json!({ "ok": false, "error": interrupted_reason(timeout_secs) }),
+    }
+}
+
+/// Gemini CLI agent — spawn `gemini -p` and parse stream-json output
+async fn exec_gemini_cli_agent(args: &Value, sandbox_dir: &str) -> Value {
+    let task = args["task"].as_str().unwrap_or("");
+    let system_prompt = args["system_prompt"].as_str().unwrap_or("");
+    let timeout_secs = args["timeout"].as_u64().unwrap_or(300);
+    let model = args["model"].as_str().unwrap_or("");
+
+    if task.is_empty() {
+        return json!({ "ok": false, "error": "task is required" });
+    }
+
+    let full_prompt = if system_prompt.is_empty() {
+        task.to_string()
+    } else {
+        format!("{}\n\n---\n\nTASK:\n{}", system_prompt, task)
+    };
+
+    let mut cli_args = vec![
+        "-p".to_string(), full_prompt,
+        "-o".to_string(), "stream-json".to_string(),
+        "--yolo".to_string(),
+    ];
+    if !model.is_empty() {
+        cli_args.push("-m".to_string());
+        cli_args.push(model.to_string());
+    }
+
+    let home = resolve_home();
+    info!("[GeminiCLI] Spawning agent in {} (timeout: {}s)", sandbox_dir, timeout_secs);
+
+    match run_guarded(
+        Command::new("gemini")
+            .args(&cli_args)
+            .current_dir(sandbox_dir)
+            .env("PATH", cli_env_path())
+            .env("HOME", &home),
+        timeout_secs,
+    ).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut result_text = String::new();
+            let mut tool_calls: Vec<String> = Vec::new();
+            for line in stdout.lines() {
+                if let Ok(event) = serde_json::from_str::<Value>(line) {
+                    // Gemini CLI stream-json events
+                    let etype = event["type"].as_str().unwrap_or("");
+                    if etype == "message" || etype == "assistant" {
+                        if let Some(content) = event["message"]["content"].as_array()
+                            .or_else(|| event["content"].as_array()) {
+                            for block in content {
+                                if block["type"] == "text" {
+                                    result_text.push_str(block["text"].as_str().unwrap_or(""));
+                                }
+                                if block["type"] == "tool_use" || block["type"] == "functionCall" {
+                                    if let Some(n) = block["name"].as_str() { tool_calls.push(n.to_string()); }
+                                }
+                            }
+                        }
+                    } else if etype == "result" {
+                        if let Some(r) = event["result"].as_str() { result_text = r.to_string(); }
+                    } else if etype == "text" {
+                        if let Some(t) = event["text"].as_str() { result_text.push_str(t); }
+                    }
+                }
+            }
+            // Fallback: if stream-json didn't parse, use raw stdout
+            if result_text.is_empty() {
+                result_text = stdout.trim().to_string();
+            }
+            if result_text.is_empty() && !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return json!({ "ok": false, "error": format!("gemini exited {:?}: {}", output.status.code(), crate::util::truncate_utf8(&stderr, 1000)) });
+            }
+            let output_files = scan_output_files(sandbox_dir).await;
+            json!({ "ok": true, "content": if result_text.is_empty() { "(no output)".to_string() } else { result_text }, "tool_calls": tool_calls, "output_files": output_files })
+        }
+        Ok(Err(e)) => json!({ "ok": false, "error": format!("Failed to spawn gemini: {e}. Is 'gemini' in PATH?") }),
+        Err(_) => json!({ "ok": false, "error": interrupted_reason(timeout_secs) }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Protocol tool exec functions (TCP / Bus / Queue / Blackboard)
+// ---------------------------------------------------------------------------
+
+async fn exec_proto_tcp_send(args: &Value, session_id: &str, agent_id: &str) -> Value {
+    let to = args["to"].as_str().unwrap_or("");
+    let topic = args["topic"].as_str().unwrap_or("");
+    let payload = args["payload"].clone();
+    let _ = protocols::tcp_open(agent_id, to, Some(session_id)).await;
+    let sent = protocols::tcp_send(agent_id, to, topic, payload).await;
+    json!({ "ok": sent, "protocol": "tcp", "from": agent_id, "to": to, "topic": topic })
+}
+
+async fn exec_proto_tcp_read(args: &Value, agent_id: &str) -> Value {
+    let peer = args["peer"].as_str().unwrap_or("");
+    let messages = protocols::tcp_read(agent_id, peer).await;
+    let msgs: Vec<Value> = messages.iter().map(|m| serde_json::to_value(m).unwrap_or(json!({}))).collect();
+    json!({ "ok": true, "protocol": "tcp", "peer": peer, "messages": msgs, "count": msgs.len() })
+}
+
+async fn exec_proto_bus_publish(args: &Value, session_id: &str, agent_id: &str) -> Value {
+    let topic = args["topic"].as_str().unwrap_or("");
+    let payload = args["payload"].clone();
+    protocols::bus_publish(session_id, agent_id, topic, payload).await;
+    json!({ "ok": true, "protocol": "bus", "from": agent_id, "topic": topic })
+}
+
+async fn exec_proto_bus_history(args: &Value, session_id: &str) -> Value {
+    let topic = args["topic"].as_str();
+    let messages = protocols::bus_history(session_id, topic).await;
+    let msgs: Vec<Value> = messages.iter().map(|m| serde_json::to_value(m).unwrap_or(json!({}))).collect();
+    json!({ "ok": true, "protocol": "bus", "topic": topic.unwrap_or("all"), "messages": msgs, "count": msgs.len() })
+}
+
+async fn exec_proto_queue_send(args: &Value, session_id: &str, agent_id: &str) -> Value {
+    let to = args["to"].as_str().unwrap_or("");
+    let topic = args["topic"].as_str().unwrap_or("");
+    let payload = args["payload"].clone();
+    let depth = protocols::queue_enqueue(agent_id, to, topic, payload, Some(session_id)).await;
+    json!({ "ok": true, "protocol": "queue", "from": agent_id, "to": to, "topic": topic, "queue_depth": depth })
+}
+
+async fn exec_proto_queue_receive(args: &Value, agent_id: &str) -> Value {
+    let from = args["from"].as_str().unwrap_or("");
+    let topic = args["topic"].as_str();
+    match protocols::queue_dequeue(from, agent_id, topic).await {
+        Some(msg) => json!({ "ok": true, "protocol": "queue", "message": serde_json::to_value(&msg).unwrap_or(json!({})) }),
+        None => json!({ "ok": true, "protocol": "queue", "message": null, "note": "Queue empty" }),
+    }
+}
+
+async fn exec_proto_queue_peek(args: &Value, agent_id: &str) -> Value {
+    let from = args["from"].as_str().unwrap_or("");
+    let topic = args["topic"].as_str();
+    let count = args["count"].as_u64().unwrap_or(5) as usize;
+    let msgs = protocols::queue_peek(from, agent_id, topic, count).await;
+    let msgs: Vec<Value> = msgs.iter().map(|m| serde_json::to_value(m).unwrap_or(json!({}))).collect();
+    json!({ "ok": true, "protocol": "queue", "messages": msgs, "count": msgs.len() })
+}
+
+async fn exec_bb_propose(args: &Value, session_id: &str, agent_id: &str) -> Value {
+    let description = args["description"].as_str().unwrap_or("");
+    if description.is_empty() { return json!({ "ok": false, "error": "description is required" }); }
+    let (task, skipped) = protocols::blackboard_propose(session_id, agent_id, description, args["task_id"].as_str()).await;
+    let task_json = serde_json::to_value(&task).unwrap_or(json!({}));
+    if skipped {
+        return json!({ "ok": true, "protocol": "blackboard", "action": "propose", "task": task_json, "skipped": true });
+    }
+    protocols::bus_publish(session_id, agent_id, "bb:proposal", json!({ "task_id": task.task_id, "description": description, "proposed_by": agent_id })).await;
+
+    // In P2P modes, send bid request tasks to all eligible agents via their task channels
+    // so the realtime_agent_loop can evaluate and bid automatically.
+    {
+        let map = realtime_sessions().lock().await;
+        if let Some(session_arc) = map.get(session_id) {
+            let session = session_arc.lock().await;
+            let orch_mode = session.system_config["system"]["orchestration_mode"]
+                .as_str().unwrap_or("hierarchical");
+            if matches!(orch_mode, "p2p" | "p2p_orchestrator") {
+                let task_id = &task.task_id;
+                for (aid, handle) in &session.agents {
+                    if aid == agent_id { continue; } // don't bid on own task
+                    let role = handle.agent_def.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if role == "human" || role == "orchestrator" { continue; }
+                    let _ = handle.task_tx.send(AgentTask {
+                        from: format!("bid_request:{}", task_id),
+                        task: format!(
+                            "BID REQUEST: Evaluate this task and decide if you should bid.\n\
+                             Task ID: {}\nDescription: {}\n\
+                             Use bb_bid tool with your confidence score if you want to bid, \
+                             or do nothing if this task is outside your expertise.",
+                            task_id, description
+                        ),
+                        context: None,
+                    }).await;
+                }
+            }
+        }
+    }
+
+    json!({ "ok": true, "protocol": "blackboard", "action": "propose", "task": task_json, "hint": format!("Task \"{}\" posted. Bidders notified via bus.", task.task_id) })
+}
+
+async fn exec_bb_bid(args: &Value, session_id: &str, agent_id: &str) -> Value {
+    let task_id = args["task_id"].as_str().unwrap_or("");
+    let confidence = args["confidence"].as_f64().unwrap_or(0.5);
+    match protocols::blackboard_bid(session_id, agent_id, task_id, confidence, args["cost"].as_f64(), args["reasoning"].as_str()).await {
+        Ok(_) => {
+            protocols::bus_publish(session_id, agent_id, "bb:bid_received", json!({ "task_id": task_id, "bidder": agent_id, "confidence": confidence })).await;
+            json!({ "ok": true, "protocol": "blackboard", "action": "bid" })
+        }
+        Err(e) => json!({ "ok": false, "protocol": "blackboard", "action": "bid", "error": e }),
+    }
+}
+
+async fn exec_bb_award(args: &Value, session_id: &str, agent_id: &str) -> Value {
+    let task_id = args["task_id"].as_str().unwrap_or("");
+    let award_to = args["award_to"].as_str();
+    let computed = if award_to.is_none() {
+        if let Some(scores) = args["orchestrator_scores"].as_array() {
+            if let Some(task) = protocols::blackboard_get_task(session_id, task_id).await {
+                let best = task.bids.iter().map(|bid| {
+                    let orch = scores.iter().find(|s| s["agent_id"].as_str() == Some(&bid.agent_id))
+                        .and_then(|s| s["score"].as_f64()).unwrap_or(0.5);
+                    (bid.agent_id.clone(), bid.confidence * 0.5 + orch * 0.5)
+                }).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                best.map(|(id, _)| id)
+            } else { None }
+        } else { None }
+    } else { award_to.map(|s| s.to_string()) };
+    match protocols::blackboard_award(session_id, task_id, computed.as_deref(), None).await {
+        Ok(winner) => {
+            let _ = protocols::blackboard_start_task(session_id, &winner, task_id).await;
+            protocols::bus_publish(session_id, agent_id, "bb:task_awarded", json!({ "task_id": task_id, "awarded_to": winner })).await;
+            json!({ "ok": true, "protocol": "blackboard", "action": "award", "awarded_to": winner, "next_step": format!("Task awarded to \"{winner}\". Use wait_result({{\"from\": \"{winner}\"}}) to collect result.") })
+        }
+        Err(e) => json!({ "ok": false, "protocol": "blackboard", "action": "award", "error": e }),
+    }
+}
+
+async fn exec_bb_complete(args: &Value, session_id: &str, agent_id: &str) -> Value {
+    let task_id = args["task_id"].as_str().unwrap_or("");
+    let result = args["result"].clone();
+    match protocols::blackboard_complete_task(session_id, agent_id, task_id, result).await {
+        Ok(_) => json!({ "ok": true, "protocol": "blackboard", "action": "complete" }),
+        Err(e) => json!({ "ok": false, "protocol": "blackboard", "action": "complete", "error": e }),
+    }
+}
+
+async fn exec_bb_read(args: &Value, session_id: &str) -> Value {
+    if let Some(task_id) = args["task_id"].as_str() {
+        let task = protocols::blackboard_get_task(session_id, task_id).await;
+        json!({ "ok": true, "protocol": "blackboard", "action": "read", "task": task.map(|t| serde_json::to_value(&t).unwrap_or(json!(null))) })
+    } else {
+        let tasks = protocols::blackboard_get_tasks(session_id, args["status"].as_str()).await;
+        let tasks: Vec<Value> = tasks.iter().map(|t| serde_json::to_value(t).unwrap_or(json!({}))).collect();
+        json!({ "ok": true, "protocol": "blackboard", "action": "read", "tasks": tasks, "count": tasks.len() })
+    }
+}
+
+async fn exec_bb_log(args: &Value, session_id: &str) -> Value {
+    let limit = args["limit"].as_u64().map(|n| n as usize).or(Some(50));
+    let log = protocols::blackboard_get_log(session_id, limit).await;
+    let log: Vec<Value> = log.iter().map(|e| serde_json::to_value(e).unwrap_or(json!({}))).collect();
+    json!({ "ok": true, "protocol": "blackboard", "action": "log", "entries": log, "count": log.len() })
+}
+
+// ---------------------------------------------------------------------------
+// ClawHub marketplace tools
+// ---------------------------------------------------------------------------
+
+async fn exec_clawhub_search(args: &Value) -> Value {
+    let query = args["query"].as_str().unwrap_or("");
+    let limit = args["limit"].as_u64().unwrap_or(10).min(50).max(1) as usize;
+
+    // Try to find clawhub binary
+    let candidates = ["Tiger_bot/node_modules/.bin/clawhub", "clawhub"];
+    let mut bin = String::new();
+    for candidate in &candidates {
+        if Command::new(candidate)
+            .arg("--cli-version")
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            bin = candidate.to_string();
+            break;
+        }
+    }
+    if bin.is_empty() {
+        return json!({ "ok": false, "error": "clawhub CLI not found" });
+    }
+
+    let workdir = std::path::Path::new("Tiger_bot")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("Tiger_bot"));
+
+    match Command::new(&bin)
+        .args([
+            "search", query,
+            "--limit", &limit.to_string(),
+            "--no-input",
+            "--workdir", &workdir.display().to_string(),
+            "--dir", "skills",
+        ])
+        .output()
+        .await
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            json!({ "ok": output.status.success(), "output": stdout.trim(), "warning": stderr.trim() })
+        }
+        Err(e) => json!({ "ok": false, "error": format!("Failed to run clawhub: {e}") }),
+    }
+}
+
+async fn exec_clawhub_install(args: &Value) -> Value {
+    let slug = args["slug"].as_str().unwrap_or("");
+    let force = args["force"].as_bool().unwrap_or(false);
+
+    // Validate slug format
+    if !regex::Regex::new(r"^[a-z0-9][a-z0-9-]*$").unwrap().is_match(slug) {
+        return json!({ "ok": false, "error": "Invalid slug format" });
+    }
+
+    let candidates = ["Tiger_bot/node_modules/.bin/clawhub", "clawhub"];
+    let mut bin = String::new();
+    for candidate in &candidates {
+        if Command::new(candidate)
+            .arg("--cli-version")
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            bin = candidate.to_string();
+            break;
+        }
+    }
+    if bin.is_empty() {
+        return json!({ "ok": false, "error": "clawhub CLI not found" });
+    }
+
+    let workdir = std::path::Path::new("Tiger_bot")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("Tiger_bot"));
+    let workdir_str = workdir.display().to_string();
+
+    let mut argv = vec![
+        "install", slug, "--no-input",
+        "--workdir", &workdir_str,
+        "--dir", "skills",
+    ];
+    if force {
+        argv.push("--force");
+    }
+
+    match timeout(
+        Duration::from_secs(120),
+        Command::new(&bin).args(&argv).output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            json!({
+                "ok": output.status.success(),
+                "slug": slug,
+                "output": stdout.trim(),
+                "warning": stderr.trim()
+            })
+        }
+        Ok(Err(e)) => json!({ "ok": false, "error": format!("Failed to run clawhub: {e}") }),
+        Err(_) => json!({ "ok": false, "error": "clawhub install timed out (120s)" }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter web search
+// ---------------------------------------------------------------------------
+
+async fn exec_openrouter_web_search(args: &Value) -> Value {
+    let query = args["query"].as_str().unwrap_or("");
+
+    // Load settings to get API key
+    let settings_path = crate::server::data::data_dir().join("settings.json");
+    let settings: Value = match tokio::fs::read_to_string(&settings_path).await {
+        Ok(s) => serde_json::from_str(&s).unwrap_or(json!({})),
+        Err(_) => return json!({ "ok": false, "error": "Could not read settings.json" }),
+    };
+
+    let api_key = match settings["openRouterSearchApiKey"].as_str() {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => return json!({ "ok": false, "error": "OpenRouter API key not configured" }),
+    };
+
+    let model = settings["openRouterSearchModel"]
+        .as_str()
+        .unwrap_or("openai/gpt-4.1-mini")
+        .to_string();
+    let max_tokens = settings["openRouterSearchMaxTokens"]
+        .as_u64()
+        .unwrap_or(4096);
+    let max_results = settings["openRouterSearchMaxResults"]
+        .as_u64()
+        .unwrap_or(5)
+        .min(10)
+        .max(1);
+
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": model,
+        "input": query,
+        "max_output_tokens": max_tokens,
+        "tools": [{ "type": "web_search_preview", "search_context_size": "medium" }],
+        "plugins": [{ "id": "web", "max_results": max_results }],
+    });
+
+    let resp = match client
+        .post("https://openrouter.ai/api/v1/responses")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return json!({ "ok": false, "error": format!("Request failed: {e}") }),
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let err_text = resp.text().await.unwrap_or_default();
+        return json!({ "ok": false, "error": format!("OpenRouter API error {status}: {err_text}") });
+    }
+
+    let data: Value = match resp.json().await {
+        Ok(d) => d,
+        Err(e) => return json!({ "ok": false, "error": format!("Failed to parse response: {e}") }),
+    };
+
+    // Extract text and citations
+    let mut text = String::new();
+    let mut citations: Vec<Value> = Vec::new();
+
+    if let Some(output) = data["output"].as_array() {
+        for item in output {
+            if item["type"].as_str() == Some("message") {
+                if let Some(content) = item["content"].as_array() {
+                    for block in content {
+                        if block["type"].as_str() == Some("output_text") {
+                            if let Some(t) = block["text"].as_str() {
+                                text.push_str(t);
+                            }
+                            if let Some(annotations) = block["annotations"].as_array() {
+                                for ann in annotations {
+                                    if ann["type"].as_str() == Some("url_citation") {
+                                        if let Some(url) = ann["url"].as_str() {
+                                            citations.push(json!({
+                                                "url": url,
+                                                "title": ann["title"].as_str().unwrap_or("")
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    json!({
+        "ok": true,
+        "text": truncate(&text, 15000),
+        "citations": &citations[..citations.len().min(20)],
+        "model": model,
+        "usage": data["usage"],
+    })
+}
+
+// ---------------------------------------------------------------------------
+// create_architecture — generate multi-agent YAML via LLM
+// ---------------------------------------------------------------------------
+
+async fn exec_create_architecture(
+    args: &Value,
+    sub_agent: &SubAgentConfig,
+) -> Value {
+    let description = args["description"].as_str().unwrap_or("");
+    if description.is_empty() {
+        return json!({ "ok": false, "error": "description is required" });
+    }
+
+    let mut arch_type = args["architectureType"]
+        .as_str()
+        .unwrap_or("hierarchical")
+        .to_string();
+    // Router fans out to all workers in parallel then merges — a sequential
+    // pipeline defeats that, so coerce it to a flat team the orchestrator can
+    // dispatch to directly and concurrently.
+    if sub_agent.mode == "router" && arch_type == "pipeline" {
+        arch_type = "flat".to_string();
+    }
+    let count = args["agentCount"]
+        .as_str()
+        .unwrap_or("auto")
+        .to_string();
+    let session_id = if sub_agent.session_id.is_empty() {
+        "default".to_string()
+    } else {
+        sub_agent.session_id.clone()
+    };
+
+    // Load base template if available
+    let mut base_template_prompt = String::new();
+    if !sub_agent.config_file.is_empty() {
+        if let Some((cfg, _)) = load_agent_yaml(&sub_agent.config_file) {
+            if let Some(agents) = cfg["agents"].as_array() {
+                let non_human: Vec<&Value> = agents.iter()
+                    .filter(|a| a["role"].as_str() != Some("human"))
+                    .collect();
+                let agent_lines: Vec<String> = non_human.iter()
+                    .map(|a| format!("- {} ({}): {}",
+                        a["id"].as_str().unwrap_or("?"),
+                        a["role"].as_str().unwrap_or("?"),
+                        a["persona"].as_str().unwrap_or(a["name"].as_str().unwrap_or("?"))))
+                    .collect();
+                base_template_prompt = format!(
+                    "\n\nBASE TEMPLATE (from \"{}\"):\nSystem: {}, Mode: {}\nAgents:\n{}\n\nUse this as a starting point.",
+                    sub_agent.config_file,
+                    cfg["system"]["name"].as_str().unwrap_or("Unknown"),
+                    cfg["system"]["orchestration_mode"].as_str().unwrap_or("hierarchical"),
+                    agent_lines.join("\n"),
+                );
+            }
+        }
+    }
+
+    // Router mode: expose the model pool + tier so the designer LLM can assign
+    // each agent a best-fit model. Empty in every other mode (no behavior change).
+    let is_router = sub_agent.mode == "router";
+    let pool_block = if is_router && !sub_agent.model_pool.is_empty() {
+        let lines: Vec<String> = sub_agent.model_pool.iter().map(|e| format!(
+            "- model \"{}\" [{} tier]: {}",
+            e["model"].as_str().unwrap_or("?"),
+            e["tier"].as_str().unwrap_or("balanced"),
+            e["strengths"].as_str().unwrap_or(""),
+        )).collect();
+        format!(
+            "\n\nAVAILABLE MODEL POOL — assign each non-human agent a best-fit \"model\" from this list (match the agent's role to the model's tier/strengths):\n{}",
+            lines.join("\n"),
+        )
+    } else {
+        String::new()
+    };
+    let tier_guidance = match sub_agent.router_tier.as_str() {
+        "ultra" if is_router => "\nROUTER ULTRA: maximize accuracy. Prefer 'deep' tier models for reasoning/verification roles; you may use up to 6 worker agents and add a dedicated checker/verifier agent.",
+        _ if is_router => "\nROUTER (fast): minimize latency. Prefer 'fast'/'balanced' tier models; keep the team small (2-3 workers); only add a checker if the task is high-stakes.",
+        _ => "",
+    };
+    // Router runs agents in PARALLEL (fan-out then merge), so the team must be
+    // independent workers under one orchestrator — never a sequential pipeline.
+    let parallel_guidance = if is_router {
+        "\nPARALLEL TEAM (flat fan-out): Use orchestration_mode 'flat'. Do NOT use 'pipeline'. \
+CRITICAL: Do NOT create any agent with role 'orchestrator' or 'reporter' — the CALLER is the sole orchestrator and merges results itself. Every non-human agent must be a self-contained WORKER (role 'worker' or 'researcher') that completes its INDEPENDENT sub-task and returns its findings directly to the caller. \
+Workers must NOT depend on, wait for, or send tasks to each other. Give NO connections between workers. Split the request into independent sub-tasks, one per worker, so the caller can dispatch them all at once and run them concurrently."
+    } else {
+        ""
+    };
+
+    // Use LLM to generate architecture
+    let prompt = format!(
+        r#"Based on this description, generate a complete multi-agent system configuration as a JSON object.
+
+User Request: {description}
+{base_template_prompt}
+Architecture Type: {arch_type}
+Number of Agents: {count}
+Connection Protocol: tcp
+{pool_block}
+{tier_guidance}
+{parallel_guidance}
+
+Return ONLY a valid JSON object (no markdown, no code fences) with this structure:
+{{
+  "system": {{
+    "name": "System Name",
+    "orchestration_mode": "{arch_type}",
+    "communication_protocol": "structured_handoff",
+    "context_passing": "full_chain"
+  }},
+  "agents": [
+    {{
+      "id": "unique_snake_case_id",
+      "name": "Agent Display Name",
+      "role": "one of: human, orchestrator, worker, checker, reporter, researcher, peer",
+      "persona": "Detailed 2-3 sentence persona description",
+      "responsibilities": ["r1", "r2", "r3"],
+      "model": "(router mode only) one of the AVAILABLE MODEL POOL model ids, chosen by tier+strengths; omit entirely to use the default model",
+      "bus": {{ "enabled": true, "topics": ["topic1"] }},
+      "mesh": {{ "enabled": false }}
+    }}
+  ],
+  "connections": [
+    {{ "from": "source_id", "to": "target_id", "label": "label", "protocol": "tcp", "topics": ["topic1"] }}
+  ],
+  "workflow": {{
+    "sequence": [
+      {{ "step": 1, "agent": "agent_id", "action": "what this agent does", "outputs_to": ["next_agent_id"] }}
+    ]
+  }}
+}}
+
+RULES:
+- Always include ONE agent with role "human" and id "human"
+- For hierarchical: human → orchestrator → workers. Use role "orchestrator" for the coordinator.
+- For flat: human → all agents directly
+- For mesh: no connections (mesh mode bypasses access control)
+- For hybrid: human → orchestrator → workers (workers have mesh.enabled: true)
+- For pipeline: agents form a LINEAR SEQUENTIAL CHAIN. human → agent1 → agent2 → agent3 → ... → final_agent. Each agent connects to exactly ONE next agent. Do NOT use an orchestrator role. Do NOT create star topology (one agent connecting to many). Connections MUST form a strict linear chain. The workflow.sequence MUST list agents in order with outputs_to pointing to the next agent. The last agent has outputs_to: [].
+- For p2p: all non-human agents use role "peer", no connections
+- Agent IDs must be snake_case
+- Generate 3-8 agents including human
+- Always include workflow.sequence listing the processing order
+- If an AVAILABLE MODEL POOL is provided, set each non-human agent's "model" to a model from that pool, matching the agent's role to the model's strengths. The orchestrator should use a fast/balanced model; verifier/checker agents should use a deep model. Omit "model" only to fall back to the default."#
+    );
+
+    // Call the LLM to generate the architecture (routes through claude-code if needed)
+    let client = reqwest::Client::new();
+    let messages = vec![
+        json!({ "role": "system", "content": "You are an expert multi-agent system architect. Generate complete, well-structured agent system configurations as JSON. Return ONLY valid JSON, nothing else." }),
+        json!({ "role": "user", "content": prompt }),
+    ];
+
+    let resp_body = match llm_call(
+        &client, &sub_agent.api_key, &sub_agent.api_url, &sub_agent.model,
+        &messages, None, 0.7, 16384,
+    ).await {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": format!("API request failed: {e}") }),
+    };
+
+    let content_text = resp_body["choices"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|c| {
+            let msg = &c["message"];
+            msg["content"].as_str().filter(|s| !s.is_empty())
+                .or_else(|| msg["reasoning_content"].as_str())
+        })
+        .unwrap_or("");
+
+    if content_text.is_empty() {
+        return json!({ "ok": false, "error": "No response from LLM" });
+    }
+
+    // Extract JSON from response
+    let json_str = if let Some(m) = regex::Regex::new(r"\{[\s\S]*\}").unwrap().find(content_text) {
+        m.as_str()
+    } else {
+        content_text
+    };
+
+    let mut parsed: Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return json!({ "ok": false, "error": "Failed to parse generated architecture" }),
+    };
+
+    if parsed["system"].is_null() || !parsed["agents"].is_array() {
+        return json!({ "ok": false, "error": "Generated architecture has invalid structure" });
+    }
+
+    // Router mode post-processing: persist the pool into the config (failover
+    // reads it from system.model_pool) and resolve each agent's chosen model to
+    // its provider endpoint. Auto-assignment with MANUAL OVERRIDE — a "model"
+    // already present on an agent is kept; we only fill provider details and
+    // never overwrite a model the designer/user set.
+    if is_router && !sub_agent.model_pool.is_empty() {
+        parsed["system"]["model_pool"] = json!(sub_agent.model_pool);
+        if let Some(agents) = parsed["agents"].as_array_mut() {
+            for agent in agents.iter_mut() {
+                let chosen = agent.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if chosen.is_empty() {
+                    continue; // no per-agent model → falls back to session model
+                }
+                // Find the pool entry whose model id matches and graft its
+                // non-empty api_url/api_key onto the agent so the agent loop can
+                // reach a different provider.
+                if let Some(entry) = sub_agent.model_pool.iter()
+                    .find(|e| e["model"].as_str() == Some(chosen.as_str()))
+                {
+                    if let Some(u) = entry["api_url"].as_str().filter(|s| !s.is_empty()) {
+                        agent["api_url"] = json!(u);
+                    }
+                    if let Some(k) = entry["api_key"].as_str().filter(|s| !s.is_empty()) {
+                        agent["api_key"] = json!(k);
+                    }
+                    if let Some(t) = entry["tier"].as_str().filter(|s| !s.is_empty()) {
+                        agent["tier"] = json!(t); // used to order failover candidates
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert to YAML and save
+    let yaml_content = match serde_yaml::to_string(&parsed) {
+        Ok(y) => y,
+        Err(e) => return json!({ "ok": false, "error": format!("Failed to serialize YAML: {e}") }),
+    };
+
+    let safe_name = parsed["system"]["name"]
+        .as_str()
+        .unwrap_or("auto_created")
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>();
+    let safe_name = safe_name.trim_matches('_');
+    let filename = format!("{}_auto.yaml", safe_name);
+
+    let agents_dir = crate::server::data::data_dir().join("agents");
+    let _ = tokio::fs::create_dir_all(&agents_dir).await;
+    if let Err(e) = tokio::fs::write(agents_dir.join(&filename), &yaml_content).await {
+        return json!({ "ok": false, "error": format!("Failed to save YAML: {e}") });
+    }
+
+    // Track creation
+    auto_created_architectures().lock().await.insert(session_id.clone(), filename.clone());
+    auto_swarm_selections().lock().await.insert(session_id.clone(), filename.clone());
+
+    // NOTE: realtime session boot is handled by the caller (chat.rs)
+    // to avoid double-booting and race conditions.
+
+    let all_agents: Vec<Value> = parsed["agents"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter(|a| a["role"].as_str() != Some("human"))
+        .map(|a| json!({
+            "id": a["id"], "name": a["name"], "role": a["role"],
+            "persona": a["persona"], "responsibilities": a["responsibilities"],
+        }))
+        .collect();
+
+    let mode = parsed["system"]["orchestration_mode"]
+        .as_str()
+        .unwrap_or(&arch_type);
+
+    let orchestrator = parsed["agents"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|a| a["role"].as_str() == Some("orchestrator")));
+
+    let delegation = if let Some(orch) = orchestrator {
+        let orch_id = orch["id"].as_str().unwrap_or("orchestrator");
+        format!("Orchestrator \"{}\" manages the team. Use send_task({{to: \"{}\", task: \"...\"}}) then wait_result.", orch_id, orch_id)
+    } else {
+        let ids: Vec<&str> = all_agents.iter().filter_map(|a| a["id"].as_str()).collect();
+        format!("Send tasks directly to agents. Available: {}.", ids.join(", "))
+    };
+
+    json!({
+        "ok": true,
+        "created": true,
+        "filename": filename,
+        "systemName": parsed["system"]["name"],
+        "mode": mode,
+        "agents": all_agents,
+        "realtimeMode": true,
+        "yamlContent": yaml_content,
+        "message": format!("Architecture \"{}\" created and saved. All agents are LIVE. {} Do NOT do work yourself — delegate via send_task/wait_result.",
+            parsed["system"]["name"].as_str().unwrap_or(&filename), delegation),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// select_swarm — pick an existing agent YAML and boot it
+// ---------------------------------------------------------------------------
+
+async fn exec_select_swarm(
+    args: &Value,
+    sub_agent: &SubAgentConfig,
+    sandbox_dir: &str,
+) -> Value {
+    let filename = args["filename"].as_str().unwrap_or("");
+    let reason = args["reason"].as_str().unwrap_or("");
+    if filename.is_empty() {
+        return json!({ "ok": false, "error": "filename is required" });
+    }
+
+    let (config, _ids) = match load_agent_yaml(filename) {
+        Some(v) => v,
+        None => return json!({ "ok": false, "error": format!("Config file \"{}\" not found or invalid", filename) }),
+    };
+
+    let all_agents: Vec<Value> = config["agents"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter(|a| a["role"].as_str() != Some("human"))
+        .collect::<Vec<_>>()
+        .iter()
+        .map(|a| json!({
+            "id": a["id"], "name": a["name"], "role": a["role"],
+            "persona": a["persona"], "responsibilities": a["responsibilities"],
+        }))
+        .collect();
+
+    if all_agents.is_empty() {
+        return json!({ "ok": false, "error": "Selected config has no usable agents" });
+    }
+
+    let session_id = if sub_agent.session_id.is_empty() {
+        "default".to_string()
+    } else {
+        sub_agent.session_id.clone()
+    };
+
+    auto_swarm_selections().lock().await.insert(session_id.clone(), filename.to_string());
+
+    // Boot the realtime session (fire-and-forget to avoid recursive type cycle)
+    boot_realtime_session_deferred(
+        session_id.clone(), filename.to_string(),
+        sub_agent.api_key.clone(), sub_agent.api_url.clone(),
+        sub_agent.model.clone(),
+        sandbox_dir.to_string(),
+    );
+
+    let mode = config["system"]["orchestration_mode"]
+        .as_str()
+        .unwrap_or("hierarchical");
+
+    let orchestrator = config["agents"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|a| a["role"].as_str() == Some("orchestrator")));
+
+    let delegation = if let Some(orch) = orchestrator {
+        let orch_id = orch["id"].as_str().unwrap_or("orchestrator");
+        format!("Orchestrator \"{}\" manages the team. Use send_task({{to: \"{}\", task: \"...\"}}) then wait_result.", orch_id, orch_id)
+    } else {
+        let ids: Vec<&str> = all_agents.iter().filter_map(|a| a["id"].as_str()).collect();
+        format!("Send tasks directly. Available agents: {}.", ids.join(", "))
+    };
+
+    json!({
+        "ok": true,
+        "selected": filename,
+        "systemName": config["system"]["name"],
+        "mode": mode,
+        "reason": reason,
+        "agents": all_agents,
+        "realtimeMode": true,
+        "message": format!("Swarm \"{}\" selected ({}). All agents are LIVE. {} Delegate via send_task/wait_result.",
+            config["system"]["name"].as_str().unwrap_or(filename), mode, delegation),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tool dispatch
+// ---------------------------------------------------------------------------
+
+/// Execute spawn_subagent: loads agent config, builds persona prompt, calls LLM recursively
+fn exec_spawn_subagent(
+    args: &Value,
+    sub_agent: &SubAgentConfig,
+    sandbox_dir: &str,
+    on_update: std::sync::Arc<dyn Fn(ToolUpdate) + Send + Sync + 'static>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> {
+    let args = args.clone();
+    let sub_agent = sub_agent.clone();
+    let sandbox_dir = sandbox_dir.to_string();
+
+    Box::pin(async move {
+    let args = &args;
+    let sub_agent = &sub_agent;
+    let sandbox_dir = &sandbox_dir;
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+    let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
+
+    if agent_id.is_empty() || task.is_empty() {
+        return json!({"ok": false, "error": "agent_id and task are required"});
+    }
+
+    if !sub_agent.agent_ids.contains(&agent_id.to_string()) {
+        return json!({"ok": false, "error": format!("Unknown agent: {}. Available: {:?}", agent_id, sub_agent.agent_ids)});
+    }
+
+    let max_spawn_depth = effective_max_spawn_depth(sub_agent);
+    if sub_agent.depth >= max_spawn_depth {
+        return json!({"ok": false, "error": format!("Max sub-agent recursion depth reached ({})", max_spawn_depth)});
+    }
+
+    info!("[SubAgent] Spawning agent '{}' (depth={}) for task: {}", agent_id, sub_agent.depth, crate::util::truncate_utf8(&task, 80));
+
+    // Load YAML config
+    let (yaml_val, _) = match load_agent_yaml(&sub_agent.config_file) {
+        Some(v) => v,
+        None => return json!({"ok": false, "error": "Failed to load agent config"}),
+    };
+
+    // Find agent definition
+    let agent_def = yaml_val
+        .get("agents")
+        .and_then(|a| a.as_array())
+        .and_then(|arr| arr.iter().find(|a| a.get("id").and_then(|v| v.as_str()) == Some(agent_id)));
+
+    let agent_def = match agent_def {
+        Some(d) => d.clone(),
+        None => return json!({"ok": false, "error": format!("Agent '{}' not found in config", agent_id)}),
+    };
+
+    let agent_name = agent_def.get("name").and_then(|v| v.as_str()).unwrap_or(agent_id);
+    let agent_role = agent_def.get("role").and_then(|v| v.as_str()).unwrap_or("worker");
+
+    // Log SUBAGENT_SPAWN to history JSONL
+    write_agent_history(&sub_agent.session_id, "SUBAGENT_SPAWN", json!({
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "role": agent_role,
+        "depth": sub_agent.depth,
+        "task": task,
+        "context": context,
+        "config_file": sub_agent.config_file,
+    })).await;
+
+    // Find which agents this agent can delegate to (from connections)
+    let targets: Vec<String> = yaml_val
+        .get("connections")
+        .and_then(|c| c.as_array())
+        .map(|conns| {
+            conns
+                .iter()
+                .filter(|c| c.get("from").and_then(|v| v.as_str()) == Some(agent_id))
+                .filter_map(|c| c.get("to").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .filter(|id| id != "human")
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Check if mesh mode — all agents accessible
+    let orch_mode = yaml_val
+        .get("system")
+        .and_then(|s| s.get("orchestration_mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let agent_mesh = agent_def
+        .get("mesh")
+        .and_then(|m| m.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let available_targets = if orch_mode == "mesh" || agent_mesh {
+        sub_agent.agent_ids.iter().filter(|id| id.as_str() != agent_id).cloned().collect()
+    } else {
+        targets
+    };
+
+    // Build system prompt for this agent
+    let mut system_prompt = build_agent_system_prompt(&agent_def, &yaml_val, &available_targets);
+
+    // Per-agent loop profile from the YAML definition (tools/mcp_servers/loop/
+    // system_prompt); falls back to inheriting the parent's profile.
+    let agent_profile = crate::server::services::agent_loop::profile_from_agent_def(&agent_def);
+    if let Some(sp) = agent_profile.as_ref().and_then(|p| p.system_prompt.as_ref()) {
+        if !sp.text.trim().is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&sp.text);
+        }
+    }
+    let child_profile = agent_profile.map(Arc::new).or_else(|| sub_agent.loop_profile.clone());
+
+    // Advertise enabled skills so sub-agents can discover them without calling list_skills.
+    match build_enabled_skills_block(Some(SUBAGENT_SKILLS_PERSONA), None).await {
+        block if !block.is_empty() => system_prompt.push_str(&block),
+        _ => {}
+    }
+
+    // Build message with task
+    let user_msg = if context.is_empty() {
+        format!("Task: {}", task)
+    } else {
+        format!("Task: {}\n\nContext:\n{}", task, context)
+    };
+
+    let messages = vec![json!({"role": "user", "content": user_msg})];
+
+    // Create sub-agent config with incremented depth
+    let child_config = SubAgentConfig {
+        enabled: !available_targets.is_empty(),
+        config_file: sub_agent.config_file.clone(),
+        agent_ids: available_targets,
+        api_key: sub_agent.api_key.clone(),
+        api_url: sub_agent.api_url.clone(),
+        model: sub_agent.model.clone(),
+        depth: sub_agent.depth + 1,
+        session_id: sub_agent.session_id.clone(),
+        agent_id: agent_id.to_string(),
+        mode: sub_agent.mode.clone(),
+        agent_role: agent_role.to_string(),
+        cancel_flag: sub_agent.cancel_flag.clone(),
+        model_pool: sub_agent.model_pool.clone(),
+        router_tier: sub_agent.router_tier.clone(),
+        loop_profile: child_profile,
+        // The graph gate only fires at top level (depth 0, agent "main");
+        // children never carry it.
+        graph_profile: None,
+    };
+
+    // Recursive call — propagate ToolCall/ToolResult to parent UI (drop TextChunk to avoid mangling main text)
+    let on_update_child = on_update.clone();
+    let result = call_with_tools(
+        &sub_agent.api_key,
+        &sub_agent.api_url,
+        &sub_agent.model,
+        messages,
+        Some(system_prompt),
+        sandbox_dir,
+        move |update| {
+            match &update {
+                ToolUpdate::TextChunk(_) => {}, // don't merge sub-agent text into parent stream
+                _ => on_update_child(update),
+            }
+        },
+        child_config,
+    )
+    .await;
+
+    let result_preview = crate::util::truncate_utf8_ellipsis(&result.content, 200);
+
+    info!("[SubAgent] Agent '{}' completed. Result length: {} chars", agent_id, result.content.len());
+
+    // Log SUBAGENT_DONE to history JSONL
+    write_agent_history(&sub_agent.session_id, "SUBAGENT_DONE", json!({
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "depth": sub_agent.depth,
+        "result_length": result.content.len(),
+        "tool_calls": result.tool_results.len(),
+        "files_generated": result.files.len(),
+        "result_preview": result_preview,
+    })).await;
+
+    json!({
+        "ok": true,
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "role": agent_role,
+        "result": result.content,
+        "tool_calls_count": result.tool_results.len(),
+        "output_files": result.files,
+    })
+    }) // end Box::pin(async move)
+}
+
+// ---------------------------------------------------------------------------
+// Cron job tools (scheduled tasks, shared with the Tasks page UI)
+// ---------------------------------------------------------------------------
+
+fn cron_find_task<'a>(
+    tasks: &'a mut [crate::server::data::ScheduledTask],
+    id_or_name: &str,
+) -> Option<&'a mut crate::server::data::ScheduledTask> {
+    tasks
+        .iter_mut()
+        .find(|t| t.id == id_or_name || t.name == id_or_name)
+}
+
+async fn exec_cron_create(args: &Value) -> Value {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => return json!({ "ok": false, "error": "Parameter 'name' must be a non-empty string." }),
+    };
+    let cron_expr = match args.get("cron").and_then(|v| v.as_str()) {
+        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+        _ => return json!({ "ok": false, "error": "Parameter 'cron' must be a non-empty string." }),
+    };
+    let command = match args.get("command").and_then(|v| v.as_str()) {
+        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+        _ => return json!({ "ok": false, "error": "Parameter 'command' must be a non-empty string." }),
+    };
+    let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    if let Some(reason) = check_dangerous(&command) {
+        warn!("[SECURITY] cron_create command blocked: {}", reason);
+        return json!({ "ok": false, "error": format!("Security: {reason}") });
+    }
+    if let Err(e) = crate::server::services::scheduler::validate_cron(&cron_expr) {
+        return json!({ "ok": false, "error": e });
+    }
+
+    let mut tasks = crate::server::data::get_tasks().await;
+    if tasks.iter().any(|t| t.name == name) {
+        return json!({
+            "ok": false,
+            "error": format!("A cron job named '{name}' already exists. Use cron_toggle/cron_delete or pick another name.")
+        });
+    }
+
+    let task = crate::server::data::ScheduledTask {
+        id: format!("{:x}-{:04x}", chrono::Utc::now().timestamp_millis(), rand::random::<u16>()),
+        name: name.clone(),
+        cron: cron_expr.clone(),
+        command,
+        enabled,
+        last_run: None,
+        last_result: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        source: Some("chat".to_string()),
+    };
+    let id = task.id.clone();
+    tasks.push(task);
+    crate::server::data::save_tasks(&tasks).await;
+
+    json!({
+        "ok": true,
+        "id": id,
+        "name": name,
+        "cron": cron_expr,
+        "enabled": enabled,
+        "message": "Cron job created. The user can enable/disable, run, or delete it in the Tasks page."
+    })
+}
+
+async fn exec_cron_list(_args: &Value) -> Value {
+    let tasks = crate::server::data::get_tasks().await;
+    let jobs: Vec<Value> = tasks
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "name": t.name,
+                "cron": t.cron,
+                "command": t.command,
+                "enabled": t.enabled,
+                "last_run": t.last_run,
+                "last_result": t.last_result,
+                "source": t.source,
+            })
+        })
+        .collect();
+    json!({ "ok": true, "count": jobs.len(), "jobs": jobs })
+}
+
+async fn exec_cron_toggle(args: &Value) -> Value {
+    let id_or_name = match args.get("id_or_name").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return json!({ "ok": false, "error": "Parameter 'id_or_name' must be a non-empty string." }),
+    };
+    let enabled = match args.get("enabled").and_then(|v| v.as_bool()) {
+        Some(e) => e,
+        None => return json!({ "ok": false, "error": "Parameter 'enabled' must be a boolean." }),
+    };
+
+    let mut tasks = crate::server::data::get_tasks().await;
+    let Some(task) = cron_find_task(&mut tasks, id_or_name) else {
+        return json!({ "ok": false, "error": format!("No cron job found with id or name '{id_or_name}'.") });
+    };
+    task.enabled = enabled;
+    let (id, name) = (task.id.clone(), task.name.clone());
+    crate::server::data::save_tasks(&tasks).await;
+    json!({ "ok": true, "id": id, "name": name, "enabled": enabled })
+}
+
+async fn exec_cron_delete(args: &Value) -> Value {
+    let id_or_name = match args.get("id_or_name").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return json!({ "ok": false, "error": "Parameter 'id_or_name' must be a non-empty string." }),
+    };
+
+    let tasks = crate::server::data::get_tasks().await;
+    let before = tasks.len();
+    let tasks: Vec<_> = tasks
+        .into_iter()
+        .filter(|t| t.id != id_or_name && t.name != id_or_name)
+        .collect();
+    if tasks.len() == before {
+        return json!({ "ok": false, "error": format!("No cron job found with id or name '{id_or_name}'.") });
+    }
+    crate::server::data::save_tasks(&tasks).await;
+    json!({ "ok": true, "deleted": id_or_name })
+}
+
+async fn exec_cron_run_now(args: &Value) -> Value {
+    let id_or_name = match args.get("id_or_name").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return json!({ "ok": false, "error": "Parameter 'id_or_name' must be a non-empty string." }),
+    };
+
+    let mut tasks = crate::server::data::get_tasks().await;
+    let Some(task) = cron_find_task(&mut tasks, id_or_name) else {
+        return json!({ "ok": false, "error": format!("No cron job found with id or name '{id_or_name}'.") });
+    };
+    let id = task.id.clone();
+    match crate::server::services::scheduler::run_task_now(&id).await {
+        Ok(output) => json!({ "ok": true, "id": id, "output": output }),
+        Err(e) => json!({ "ok": false, "id": id, "error": e }),
+    }
+}
+
+#[allow(dead_code)]
+async fn execute_tool(name: &str, args: &Value, sandbox_dir: &str) -> Value {
+    execute_tool_with_context(name, args, sandbox_dir, "default", "main").await
+}
+
+async fn execute_tool_with_context(
+    name: &str,
+    args: &Value,
+    sandbox_dir: &str,
+    session_id: &str,
+    agent_id: &str,
+) -> Value {
+    // YAML tools dispatch first so a data/tools/<name>.yaml with
+    // `override: true` REPLACES the built-in implementation of that name.
+    if crate::server::services::custom_tools::is_custom_tool(name) {
+        return crate::server::services::custom_tools::execute(name, args, sandbox_dir).await;
+    }
+    match name {
+        "web_search" => exec_web_search(args).await,
+        "search_papers" => exec_search_papers(args).await,
+        "fetch_url" => exec_fetch_url(args).await,
+        "run_python" => exec_run_python(args, sandbox_dir).await,
+        "run_shell" => exec_run_shell(args, sandbox_dir).await,
+        "read_file" => exec_read_file(args, sandbox_dir).await,
+        "write_file" => exec_write_file(args, sandbox_dir).await,
+        "list_files" => exec_list_files(args, sandbox_dir).await,
+        "delete_file" => exec_delete_file(args, sandbox_dir).await,
+        "list_local_mounts" => exec_list_local_mounts(args).await,
+        "run_react" => exec_run_react(args, sandbox_dir).await,
+        "list_skills" => exec_list_skills(args, sandbox_dir).await,
+        "load_skill" => exec_load_skill(args, sandbox_dir).await,
+        "save_skill" => exec_save_skill(args).await,
+        "remote_task" => exec_remote_task(args).await,
+        "claude_code_agent" => exec_claude_code_agent(args, sandbox_dir).await,
+        "gemini_cli_agent" => exec_gemini_cli_agent(args, sandbox_dir).await,
+        "proto_tcp_send" => exec_proto_tcp_send(args, session_id, agent_id).await,
+        "proto_tcp_read" => exec_proto_tcp_read(args, agent_id).await,
+        "proto_bus_publish" => exec_proto_bus_publish(args, session_id, agent_id).await,
+        "proto_bus_history" => exec_proto_bus_history(args, session_id).await,
+        "proto_queue_send" => exec_proto_queue_send(args, session_id, agent_id).await,
+        "proto_queue_receive" => exec_proto_queue_receive(args, agent_id).await,
+        "proto_queue_peek" => exec_proto_queue_peek(args, agent_id).await,
+        "bb_propose" => exec_bb_propose(args, session_id, agent_id).await,
+        "bb_bid" => exec_bb_bid(args, session_id, agent_id).await,
+        "bb_award" => exec_bb_award(args, session_id, agent_id).await,
+        "bb_complete" => exec_bb_complete(args, session_id, agent_id).await,
+        "bb_read" => exec_bb_read(args, session_id).await,
+        "bb_log" => exec_bb_log(args, session_id).await,
+        "clawhub_search" => exec_clawhub_search(args).await,
+        "clawhub_install" => exec_clawhub_install(args).await,
+        "openrouter_web_search" => exec_openrouter_web_search(args).await,
+        "cron_create" => exec_cron_create(args).await,
+        "cron_list" => exec_cron_list(args).await,
+        "cron_toggle" => exec_cron_toggle(args).await,
+        "cron_delete" => exec_cron_delete(args).await,
+        "cron_run_now" => exec_cron_run_now(args).await,
+        _ if mcp::is_mcp_tool(name) => {
+            // In a parallel swarm each sub-agent drives its OWN isolated browser
+            // window so concurrent agents don't clobber a shared Chrome page.
+            // The main orchestrator keeps the shared browser.
+            if name.starts_with("mcp_browser_") && agent_id != "main" && !session_id.is_empty() {
+                info!("[execute_tool] Routing browser call to agent '{}' own window: {name}", agent_id);
+                mcp::call_browser_tool_for_agent(session_id, agent_id, name, args).await
+            } else {
+                info!("[execute_tool] Routing MCP tool call: {name}");
+                mcp::call_mcp_tool(name, args).await
+            }
+        }
+        _ => json!({ "ok": false, "error": format!("Unknown tool: {name}") }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// URL encoding helper (inline, avoids extra crate)
+// ---------------------------------------------------------------------------
+
+mod urlencoding {
+    pub fn encode(input: &str) -> String {
+        let mut result = String::with_capacity(input.len() * 3);
+        for byte in input.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    result.push(byte as char);
+                }
+                _ => {
+                    result.push('%');
+                    result.push_str(&format!("{:02X}", byte));
+                }
+            }
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool-calling loop — faithful port of tiger_cowork tigerbot.ts
+// ---------------------------------------------------------------------------
+
+// Default constants — overridden by settings when available
+const DEFAULT_MAX_ROUNDS: usize = 15;
+const DEFAULT_MAX_TOOL_CALLS: usize = 25;
+const MAX_LOOP_REPEATS: usize = 3;
+const DEFAULT_MAX_CONSECUTIVE_ERRORS: usize = 3;
+const DEFAULT_MAX_ERROR_RECOVERIES: usize = 5; // tiger_cowork: 5 for resilience
+const DEFAULT_COMPRESSION_INTERVAL: usize = 5;
+const DEFAULT_COMPRESSION_WINDOW: usize = 10;
+const DEFAULT_MAX_CONTEXT_TOKENS: usize = 100_000;
+const OVERLOAD_MAX_RETRIES: usize = 4;
+const LLM_MAX_RETRIES: usize = 3;
+const ARG_TRUNCATE_THRESHOLD: usize = 4000;
+const ARG_VALUE_TRUNCATE: usize = 500;
+const CHECKPOINT_INTERVAL: usize = 5;
+
+/// Load agent loop settings from settings.json (cached per call)
+fn load_agent_settings() -> Value {
+    std::fs::read_to_string(crate::server::data::data_dir().join("settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(json!({}))
+}
+
+pub async fn call_with_tools(
+    api_key: &str,
+    api_url: &str,
+    model: &str,
+    messages: Vec<Value>,
+    system_prompt: Option<String>,
+    sandbox_dir: &str,
+    on_update: impl Fn(ToolUpdate) + Send + Sync + 'static,
+    sub_agent: SubAgentConfig,
+) -> ToolLoopResult {
+    // Bind the session exec context for the WHOLE loop so that even processes
+    // spawned outside tool dispatch — CLI model backends in llm_call
+    // (claude-code/gemini-cli/codex-cli) — are tracked and killed on cancel.
+    let ctx = ExecCtx { session_id: sub_agent.session_id.clone(), cancel: sub_agent.cancel_flag.clone() };
+    EXEC_CTX.scope(
+        ctx,
+        call_with_tools_inner(api_key, api_url, model, messages, system_prompt, sandbox_dir, on_update, sub_agent, false),
+    ).await
+}
+
+pub async fn call_with_tools_realtime(
+    api_key: &str,
+    api_url: &str,
+    model: &str,
+    messages: Vec<Value>,
+    system_prompt: Option<String>,
+    sandbox_dir: &str,
+    on_update: impl Fn(ToolUpdate) + Send + Sync + 'static,
+    sub_agent: SubAgentConfig,
+) -> ToolLoopResult {
+    let ctx = ExecCtx { session_id: sub_agent.session_id.clone(), cancel: sub_agent.cancel_flag.clone() };
+    EXEC_CTX.scope(
+        ctx,
+        call_with_tools_inner(api_key, api_url, model, messages, system_prompt, sandbox_dir, on_update, sub_agent, true),
+    ).await
+}
+
+// ---------------------------------------------------------------------------
+// LLM call with Anthropic + OpenAI dual format support
+// ---------------------------------------------------------------------------
+
+/// Detect if the API URL is Anthropic native
+fn is_anthropic_api(api_url: &str) -> bool {
+    api_url.contains("anthropic.com")
+}
+
+/// Convert OpenAI-format messages to Anthropic format (extract system, transform messages)
+// ---------------------------------------------------------------------------
+// Vision / multimodal image input
+// ---------------------------------------------------------------------------
+
+/// Image file extensions we will inline as vision content.
+const VISION_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// Max size of a single image we will base64-inline (after this the model
+/// payload gets unwieldy and most APIs reject it). 12 MB raw.
+const MAX_VISION_IMAGE_BYTES: usize = 12 * 1024 * 1024;
+
+/// True if the model/endpoint can accept inline images (vision input).
+/// Conservative on purpose: a false negative just leaves the image as a text
+/// path reference (graceful), while a false positive makes the API reject the
+/// whole request. Start with MiniMax-M3; extend as other vision models land.
+fn model_supports_vision(api_url: &str, model: &str) -> bool {
+    // A caller that knows the model's input modalities (e.g. from the provider's
+    // model list) overrides the name heuristic with TIGRIMOS_VISION=1 or 0.
+    match std::env::var("TIGRIMOS_VISION").as_deref() {
+        Ok("1") | Ok("true") => return true,
+        Ok("0") | Ok("false") => return false,
+        _ => {}
+    }
+    let m = model.to_lowercase();
+    let u = api_url.to_lowercase();
+    (u.contains("minimax") && m.contains("m3"))
+        || m.contains("gpt-4o")
+        || m.contains("gpt-4.1")
+        || m.contains("gpt-5")
+        || m.contains("chatgpt-4o")
+        || m.contains("claude")
+        || m.contains("gemini")
+        || m.contains("-vl")
+        || m.contains("vl-")
+        || m.contains("vision")
+        || m.contains("pixtral")
+        || m.contains("llava")
+        || m.contains("internvl")
+}
+
+/// Extract plain text from message content that may be a bare string or an
+/// OpenAI multimodal content array (text + image_url parts). Used wherever we
+/// need the user's words after images have been folded into the content array.
+pub(crate) fn content_to_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|p| p["type"].as_str() == Some("text"))
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+/// Read an image file under the sandbox and return a `data:<mime>;base64,...`
+/// URI, or None if it is missing, outside the sandbox, empty, or too large.
+fn image_to_data_uri(path: &str, sandbox_dir: &str) -> Option<String> {
+    use base64::Engine;
+    let resolved = resolve_path(sandbox_dir, path);
+    let abs = resolved.canonicalize().ok()?;
+    // Stay inside the sandbox — never inline arbitrary host files.
+    let abs_sandbox = std::path::Path::new(sandbox_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(sandbox_dir));
+    if !abs.starts_with(&abs_sandbox) {
+        return None;
+    }
+    let ext = abs
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())?;
+    if !VISION_IMAGE_EXTS.contains(&ext.as_str()) {
+        return None;
+    }
+    let bytes = std::fs::read(&abs).ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_VISION_IMAGE_BYTES {
+        return None;
+    }
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(format!("data:{};base64,{}", mime, b64))
+}
+
+/// Scan a user message for sandbox image-file references and, if any resolve to
+/// readable images, return an OpenAI multimodal content array (the original
+/// text followed by one `image_url` part per image). None if no images found.
+///
+/// Paths must be allowed to contain spaces — the macOS sandbox lives under
+/// `~/Library/Application Support/...`. So instead of splitting on whitespace we
+/// pull candidates from the exact note formats the two UIs emit, plus a
+/// whitespace-free fallback for bare inline paths.
+fn build_image_content(text: &str, sandbox_dir: &str) -> Option<Value> {
+    let candidates = extract_attachment_paths(text);
+
+    let mut seen_resolved = std::collections::HashSet::new();
+    let mut image_parts: Vec<Value> = Vec::new();
+    for path in candidates {
+        let lower = path.to_lowercase();
+        if !VISION_IMAGE_EXTS
+            .iter()
+            .any(|e| lower.ends_with(&format!(".{e}")))
+        {
+            continue;
+        }
+        // Dedupe by resolved path so the bare name and the full path of the
+        // same upload don't get inlined twice.
+        let key = resolve_path(sandbox_dir, &path).to_string_lossy().to_string();
+        if !seen_resolved.insert(key) {
+            continue;
+        }
+        if let Some(uri) = image_to_data_uri(&path, sandbox_dir) {
+            image_parts.push(json!({ "type": "image_url", "image_url": { "url": uri } }));
+        }
+    }
+    if image_parts.is_empty() {
+        return None;
+    }
+    // Strip the attachment-note boilerplate ("Use the read_file tool…") so the
+    // vision model just looks at the inlined image instead of reaching for tools.
+    let clean_text = clean_attachment_note(text);
+    let mut parts = vec![json!({ "type": "text", "text": clean_text })];
+    parts.extend(image_parts);
+    Some(Value::Array(parts))
+}
+
+/// Drop the "[Attached file…]" / "[Attached files…]" note (and everything after
+/// it) from the message, leaving just the user's actual words. Falls back to a
+/// generic prompt when the message was only an attachment.
+fn clean_attachment_note(text: &str) -> String {
+    let cut = text
+        .find("[Attached file")
+        .or_else(|| text.find("[Attached files"))
+        .unwrap_or(text.len());
+    let cleaned = text[..cut].trim();
+    if cleaned.is_empty() {
+        "Please look at the attached image(s) and respond to the request.".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// Pull candidate file paths out of a chat message. Handles the two attachment
+/// note formats the UIs produce (whose paths may contain spaces) and a
+/// whitespace-free fallback for paths typed inline.
+fn extract_attachment_paths(text: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+
+    // Desktop UI: "[Attached file: NAME — saved at: <PATH>]" — capture up to ']'.
+    if let Ok(re) = regex::Regex::new(r"saved at:\s*([^\]\n]+)") {
+        for cap in re.captures_iter(text) {
+            paths.push(cap[1].trim().to_string());
+        }
+    }
+    // Web UI: lines like "- <PATH> (NAME)" — capture the path before " (NAME)".
+    if let Ok(re) = regex::Regex::new(r"(?m)^\s*-\s+(.+?)\s+\([^)]*\)\s*$") {
+        for cap in re.captures_iter(text) {
+            paths.push(cap[1].trim().to_string());
+        }
+    }
+    // Fallback: bare whitespace-free tokens (paths typed directly with no note).
+    for raw in text.split(|c: char| {
+        c.is_whitespace() || matches!(c, '(' | ')' | ',' | '"' | '\'' | '`' | '[' | ']' | '<' | '>')
+    }) {
+        let tok = raw.trim().trim_matches('-');
+        if !tok.is_empty() {
+            paths.push(tok.to_string());
+        }
+    }
+    paths
+}
+
+/// For vision-capable models, rewrite the most recent user message so that any
+/// images it references become real inline vision content. Only the latest user
+/// turn is processed — older history stays as text to keep the payload small.
+fn embed_images_for_vision(mut messages: Vec<Value>, sandbox_dir: &str) -> Vec<Value> {
+    if let Some(idx) = messages
+        .iter()
+        .rposition(|m| m["role"].as_str() == Some("user"))
+    {
+        if let Some(text) = messages[idx]["content"].as_str() {
+            if let Some(multimodal) = build_image_content(text, sandbox_dir) {
+                info!("[Vision] Inlined image(s) into user message for vision model");
+                messages[idx]["content"] = multimodal;
+            }
+        }
+    }
+    messages
+}
+
+/// Convert OpenAI-style message content (string or multimodal array) into the
+/// Anthropic content shape. image_url data-URIs become base64 image blocks.
+fn openai_content_to_anthropic(content: &Value) -> Value {
+    let Value::Array(parts) = content else {
+        return content.clone();
+    };
+    let mut blocks: Vec<Value> = Vec::new();
+    for p in parts {
+        match p["type"].as_str() {
+            Some("text") => {
+                blocks.push(json!({ "type": "text", "text": p["text"].as_str().unwrap_or("") }));
+            }
+            Some("image_url") => {
+                if let Some(url) = p["image_url"]["url"].as_str() {
+                    if let Some((media, data)) = parse_data_uri(url) {
+                        blocks.push(json!({
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": media, "data": data }
+                        }));
+                    } else {
+                        blocks.push(json!({
+                            "type": "image",
+                            "source": { "type": "url", "url": url }
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Value::Array(blocks)
+}
+
+/// Split a `data:<media>;base64,<data>` URI into (media_type, base64_data).
+fn parse_data_uri(uri: &str) -> Option<(String, String)> {
+    let rest = uri.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let media = meta.strip_suffix(";base64")?;
+    Some((media.to_string(), data.to_string()))
+}
+
+fn to_anthropic_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut anthropic_msgs: Vec<Value> = Vec::new();
+
+    for m in messages {
+        let role = m["role"].as_str().unwrap_or("");
+        match role {
+            "system" => {
+                if let Some(s) = m["content"].as_str() {
+                    system_parts.push(s.to_string());
+                }
+            }
+            "assistant" => {
+                // Convert tool_calls to Anthropic content blocks
+                let mut content_blocks: Vec<Value> = Vec::new();
+                if let Some(text) = m["content"].as_str() {
+                    if !text.is_empty() {
+                        content_blocks.push(json!({"type": "text", "text": text}));
+                    }
+                }
+                if let Some(tool_calls) = m["tool_calls"].as_array() {
+                    for tc in tool_calls {
+                        let name = tc["function"]["name"].as_str().unwrap_or("");
+                        let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                        let args_val: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                        content_blocks.push(json!({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": name,
+                            "input": args_val,
+                        }));
+                    }
+                }
+                if content_blocks.is_empty() {
+                    content_blocks.push(json!({"type": "text", "text": ""}));
+                }
+                anthropic_msgs.push(json!({"role": "assistant", "content": content_blocks}));
+            }
+            "tool" => {
+                // Convert tool result to Anthropic tool_result block
+                anthropic_msgs.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": m["tool_call_id"],
+                        "content": m["content"],
+                    }],
+                }));
+            }
+            "user" => {
+                anthropic_msgs.push(json!({"role": "user", "content": openai_content_to_anthropic(&m["content"])}));
+            }
+            _ => {
+                anthropic_msgs.push(m.clone());
+            }
+        }
+    }
+
+    let system = if system_parts.is_empty() { None } else { Some(system_parts.join("\n\n")) };
+    (system, anthropic_msgs)
+}
+
+/// Convert OpenAI tool definitions to Anthropic format
+fn to_anthropic_tools(tools: &[Value]) -> Vec<Value> {
+    tools.iter().filter_map(|t| {
+        let func = t.get("function")?;
+        Some(json!({
+            "name": func["name"],
+            "description": func["description"],
+            "input_schema": func["parameters"],
+        }))
+    }).collect()
+}
+
+/// Recursively rewrite a JSON Schema node so it satisfies strict validators
+/// (Moonshot/Kimi). These reject a node that carries a combinator
+/// (`anyOf`/`oneOf`/`allOf`) alongside sibling validation keywords such as
+/// `type` or `items` — "conflicting keywords found in anyOf with parent". When
+/// a combinator is present we push the parent `type` into every branch that
+/// lacks one (so nothing is lost), then drop ALL validation keywords from the
+/// parent, keeping only the combinator(s) and annotation keywords. Finally we
+/// recurse into every nested schema location. This surfaces mainly from MCP
+/// tool schemas (e.g. Gmail's `add_label_ids`) whose Pydantic-generated
+/// nullable `anyOf` pairs with redundant parent `type`/`items` keywords.
+fn sanitize_schema_for_moonshot(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        let has_combinator = ["anyOf", "oneOf", "allOf"]
+            .iter()
+            .any(|k| obj.contains_key(*k));
+        if has_combinator {
+            // Preserve parent `type` by seeding it into branches that omit one.
+            if let Some(parent_type) = obj.get("type").cloned() {
+                for combinator in ["anyOf", "oneOf", "allOf"] {
+                    if let Some(branches) = obj.get_mut(combinator).and_then(|v| v.as_array_mut()) {
+                        for branch in branches.iter_mut() {
+                            if let Some(bobj) = branch.as_object_mut() {
+                                bobj.entry("type").or_insert_with(|| parent_type.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // Keep only the combinator(s) and annotation keywords; every
+            // validation keyword must live inside the branches, not the parent.
+            const KEEP: [&str; 8] = [
+                "anyOf", "oneOf", "allOf",
+                "description", "title", "default", "examples", "deprecated",
+            ];
+            obj.retain(|k, _| KEEP.contains(&k.as_str()));
+        }
+        // Recurse into keyed sub-schema maps.
+        for key in ["properties", "$defs", "definitions", "patternProperties"] {
+            if let Some(map) = obj.get_mut(key).and_then(|v| v.as_object_mut()) {
+                for v in map.values_mut() {
+                    sanitize_schema_for_moonshot(v);
+                }
+            }
+        }
+        // Recurse into single sub-schemas.
+        for key in ["items", "additionalProperties", "not", "if", "then", "else"] {
+            if let Some(v) = obj.get_mut(key) {
+                sanitize_schema_for_moonshot(v);
+            }
+        }
+        // Recurse into combinator branches.
+        for combinator in ["anyOf", "oneOf", "allOf"] {
+            if let Some(arr) = obj.get_mut(combinator).and_then(|v| v.as_array_mut()) {
+                for v in arr.iter_mut() {
+                    sanitize_schema_for_moonshot(v);
+                }
+            }
+        }
+    } else if let Some(arr) = schema.as_array_mut() {
+        // `items` may be an array (tuple schema).
+        for v in arr.iter_mut() {
+            sanitize_schema_for_moonshot(v);
+        }
+    }
+}
+
+/// Sanitize OpenAI-format tool definitions in place for strict validators
+/// (Moonshot/Kimi). Rewrites each tool's `function.parameters` schema.
+fn sanitize_tools_for_openai(tools: &[Value]) -> Vec<Value> {
+    tools.iter().map(|t| {
+        let mut t = t.clone();
+        if let Some(params) = t.pointer_mut("/function/parameters") {
+            sanitize_schema_for_moonshot(params);
+        }
+        t
+    }).collect()
+}
+
+/// Unified LLM call supporting both Anthropic and OpenAI formats
+/// Find the `codex` CLI binary.
+/// Build a PATH string that includes common node/bun/homebrew bin dirs.
+/// Needed because .app bundles launch with minimal PATH (/usr/bin:/bin).
+pub fn cli_env_path() -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USER").map(|u| format!("/Users/{}", u)))
+        .unwrap_or_else(|_| "/Users/sompoteyouwai".to_string());
+    let extra_dirs = [
+        format!("{}/.nvm/versions/node/v22.16.0/bin", home),
+        format!("{}/.bun/bin", home),
+        format!("{}/.npm/bin", home),
+        format!("{}/.local/bin", home),
+        format!("{}/.cargo/bin", home),
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+    ];
+    let system_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    let mut parts: Vec<String> = Vec::new();
+    for d in &extra_dirs {
+        if std::path::Path::new(d).is_dir() && !system_path.contains(d.as_str()) {
+            parts.push(d.clone());
+        }
+    }
+    parts.push(system_path);
+    parts.join(":")
+}
+
+/// Resolve the home directory (works even when launched from .app bundle).
+pub fn resolve_home() -> String {
+    // Cross-platform: dirs::home_dir() handles %USERPROFILE% on Windows,
+    // $HOME on macOS/Linux.
+    if let Some(h) = dirs::home_dir() {
+        let s = h.to_string_lossy().to_string();
+        if !s.is_empty() { return s; }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() { return h; }
+    }
+    #[cfg(target_os = "windows")]
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        if !h.is_empty() { return h; }
+    }
+    ".".to_string()
+}
+
+/// Find a node binary.
+fn find_node() -> String {
+    // Look it up in PATH first (cross-platform): `where` on Windows, `which` on Unix.
+    #[cfg(target_os = "windows")]
+    let which_cmd = "where";
+    #[cfg(not(target_os = "windows"))]
+    let which_cmd = "which";
+    let node_name = if cfg!(target_os = "windows") { "node.exe" } else { "node" };
+    if let Ok(out) = std::process::Command::new(which_cmd).arg(node_name).output() {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").trim().to_string();
+            if !path.is_empty() && std::path::Path::new(&path).exists() {
+                return path;
+            }
+        }
+    }
+
+    let home = resolve_home();
+    #[cfg(target_os = "windows")]
+    let candidates: Vec<String> = {
+        let mut v = vec![
+            r"C:\Program Files\nodejs\node.exe".to_string(),
+            r"C:\Program Files (x86)\nodejs\node.exe".to_string(),
+        ];
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            v.push(format!(r"{}\npm\node.exe", appdata));
+        }
+        v
+    };
+    #[cfg(not(target_os = "windows"))]
+    let candidates: Vec<String> = vec![
+        format!("{}/.nvm/versions/node/v22.16.0/bin/node", home),
+        "/usr/local/bin/node".to_string(),
+        "/opt/homebrew/bin/node".to_string(),
+    ];
+    let _ = &home;
+    for c in &candidates {
+        if std::path::Path::new(c).exists() {
+            return c.to_string();
+        }
+    }
+    node_name.to_string()
+}
+
+/// Resolve a symlink to its real JS script path.
+fn resolve_script(symlink: &str) -> Option<String> {
+    let p = std::path::Path::new(symlink);
+    if !p.exists() { return None; }
+    // Try to canonicalize (follows symlinks AND resolves ..)
+    if let Ok(canon) = p.canonicalize() {
+        return Some(canon.to_string_lossy().to_string());
+    }
+    // Fallback: manual symlink resolve
+    if let Ok(target) = std::fs::read_link(p) {
+        let resolved = if target.is_relative() {
+            p.parent().unwrap_or(std::path::Path::new("/")).join(&target)
+        } else {
+            target
+        };
+        if resolved.exists() {
+            return Some(resolved.to_string_lossy().to_string());
+        }
+    }
+    Some(symlink.to_string())
+}
+
+/// Check leading bytes against known native-executable magic numbers.
+/// ELF (Linux/BSD), PE/MS-DOS (Windows .exe), and Mach-O (macOS, thin or fat,
+/// either endianness) are recognized. Anything else (e.g. a `#!` shebang JS
+/// script) is treated as non-native.
+fn is_native_magic(bytes: &[u8]) -> bool {
+    // ELF (Linux/BSD): 0x7F 'E' 'L' 'F'
+    if bytes.len() >= 4 && bytes[..4] == [0x7F, b'E', b'L', b'F'] {
+        return true;
+    }
+    // PE / MS-DOS (Windows .exe): 'M' 'Z'
+    if bytes.len() >= 2 && bytes[..2] == [b'M', b'Z'] {
+        return true;
+    }
+    // Mach-O (macOS), thin or fat/universal, either endianness.
+    if bytes.len() >= 4 {
+        return matches!(
+            [bytes[0], bytes[1], bytes[2], bytes[3]],
+            [0xFE, 0xED, 0xFA, 0xCE] | [0xCE, 0xFA, 0xED, 0xFE] | // Mach-O 32-bit
+            [0xFE, 0xED, 0xFA, 0xCF] | [0xCF, 0xFA, 0xED, 0xFE] | // Mach-O 64-bit
+            [0xCA, 0xFE, 0xBA, 0xBE] | [0xBE, 0xBA, 0xFE, 0xCA]   // universal/fat
+        );
+    }
+    false
+}
+
+/// Detect whether a file is a native executable (as opposed to a JS/text
+/// script) by inspecting its leading magic bytes. Claude Code 2.1+ ships as a
+/// native binary; older installs are a Node.js script that must be run via
+/// `node <script>`.
+fn is_native_executable(path: &str) -> bool {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 4];
+    match file.read(&mut magic) {
+        Ok(n) => is_native_magic(&magic[..n]),
+        Err(_) => false,
+    }
+}
+
+/// Find codex CLI. Returns (node_path, script_path) for direct node invocation.
+/// Falls back to ("codex", "") if not found (uses shebang).
+pub fn find_codex_cli() -> (String, String) {
+    let home = resolve_home();
+    let candidates = [
+        format!("{}/.nvm/versions/node/v22.16.0/bin/codex", home),
+        format!("{}/.npm/bin/codex", home),
+        format!("{}/.local/bin/codex", home),
+        "/usr/local/bin/codex".to_string(),
+        "/opt/homebrew/bin/codex".to_string(),
+    ];
+    let node = find_node();
+    for c in &candidates {
+        if let Some(script) = resolve_script(c) {
+            return (node.clone(), script);
+        }
+    }
+    ("codex".to_string(), String::new())
+}
+
+/// Find claude CLI. Returns (program, script_path).
+///
+/// Claude Code 2.1+ ships as a native binary (ELF on Linux, Mach-O on macOS,
+/// PE on Windows): in that case `program` is the binary itself and
+/// `script_path` is empty, so the caller executes it directly. Older installs
+/// are a JS bundle run via node: `program` is the node binary and `script_path`
+/// is the script. When `script_path` is empty the caller runs `program` alone.
+pub fn find_claude_cli() -> (String, String) {
+    let home = resolve_home();
+    let candidates = [
+        format!("{}/.bun/bin/claude", home),
+        format!("{}/.npm/bin/claude", home),
+        format!("{}/.nvm/versions/node/v22.16.0/bin/claude", home),
+        format!("{}/.local/bin/claude", home),
+        "/usr/local/bin/claude".to_string(),
+        "/opt/homebrew/bin/claude".to_string(),
+    ];
+    let node = find_node();
+    for c in &candidates {
+        if let Some(script) = resolve_script(c) {
+            // Native binary → execute directly (no node). JS bundle → run via node.
+            if is_native_executable(&script) {
+                return (script, String::new());
+            }
+            return (node.clone(), script);
+        }
+    }
+    ("claude".to_string(), String::new())
+}
+
+/// Call Claude Code CLI instead of HTTP API.
+async fn llm_call_claude_code(
+    model: &str,
+    messages: &[Value],
+    tools: Option<&[Value]>,
+    max_tokens: u64,
+) -> Result<Value, String> {
+    // Build the prompt from messages
+    let mut prompt_parts: Vec<String> = Vec::new();
+    let mut system_text = String::new();
+    for msg in messages {
+        let role = msg["role"].as_str().unwrap_or("user");
+        let content = msg["content"].as_str().unwrap_or("");
+        if role == "system" {
+            system_text.push_str(content);
+            system_text.push('\n');
+        } else if role == "user" {
+            prompt_parts.push(content.to_string());
+        } else if role == "assistant" {
+            // Include assistant context
+            if !content.is_empty() {
+                prompt_parts.push(format!("[Previous assistant response: {}]", crate::util::truncate_utf8(&content, 500)));
+            }
+        }
+    }
+
+    let prompt = prompt_parts.join("\n\n");
+    if prompt.is_empty() {
+        return Err("No user message found".to_string());
+    }
+
+    // Build tool descriptions for Claude Code
+    let mut tool_desc = String::new();
+    if let Some(t) = tools {
+        if !t.is_empty() {
+            tool_desc.push_str("\n\n[TOOL CALLING INSTRUCTIONS]\nYou have these tools. You MUST call a tool when the task requires action.\nTo call a tool, output EXACTLY this JSON on its own line (no markdown, no backticks):\n");
+            tool_desc.push_str("{\"tool_call\":{\"name\":\"TOOL_NAME\",\"arguments\":{...}}}\n\n");
+            tool_desc.push_str("Available tools:\n");
+            for tool in t {
+                let name = tool["function"]["name"].as_str().unwrap_or("");
+                let desc = tool["function"]["description"].as_str().unwrap_or("");
+                let params = &tool["function"]["parameters"]["properties"];
+                tool_desc.push_str(&format!("- {} : {} ", name, desc));
+                if let Some(props) = params.as_object() {
+                    let param_names: Vec<&str> = props.keys().map(|k| k.as_str()).collect();
+                    tool_desc.push_str(&format!("(params: {})", param_names.join(", ")));
+                }
+                tool_desc.push('\n');
+            }
+            tool_desc.push_str("\nIMPORTANT: If the task requires using a tool, you MUST output the JSON tool_call. Do NOT describe what you would do — actually call the tool.\n");
+            tool_desc.push_str("Example: {\"tool_call\":{\"name\":\"web_search\",\"arguments\":{\"query\":\"TigrimOS market analysis\"}}}\n");
+        }
+    }
+
+    let full_prompt = if system_text.is_empty() {
+        format!("{}{}", prompt, tool_desc)
+    } else {
+        format!("{}\n\n{}{}", system_text, prompt, tool_desc)
+    };
+
+    let (node_bin, script_path) = find_claude_cli();
+    // Empty script_path means node_bin is the CLI itself (native binary run directly).
+    let invocation = if script_path.is_empty() {
+        format!("native binary: {}", node_bin)
+    } else {
+        format!("node: {}, script: {}", node_bin, script_path)
+    };
+    info!("[ClaudeCode] LLM call via CLI ({}, model: {}, prompt: {}chars)", invocation, model, full_prompt.len());
+
+    // Build args: if we have a script path, run `node script.js <args>`, else run `claude <args>`
+    let mut cli_args: Vec<String> = Vec::new();
+    if !script_path.is_empty() {
+        cli_args.push(script_path);
+    }
+    cli_args.extend_from_slice(&[
+        "-p".to_string(), full_prompt,
+        "--output-format".to_string(), "text".to_string(),
+    ]);
+    if !model.is_empty() {
+        cli_args.push("--model".to_string());
+        cli_args.push(model.to_string());
+    }
+
+    let home = resolve_home();
+    let result = run_guarded(
+        Command::new(&node_bin)
+            .args(&cli_args)
+            .env("PATH", cli_env_path())
+            .env("HOME", &home)
+            .env("CLAUDE_MAX_OUTPUT_TOKENS", max_tokens.to_string()),
+        120,
+    ).await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            if !output.status.success() && stdout.is_empty() {
+                return Err(format!("Claude Code CLI failed: {}", crate::util::truncate_utf8(&stderr, 500)));
+            }
+
+            // Try to extract tool calls from the response
+            // Look for {"tool_call": ...} pattern anywhere in the text
+            for line in stdout.lines() {
+                let trimmed = line.trim().trim_start_matches("```json").trim_start_matches("```").trim();
+                if trimmed.contains("\"tool_call\"") {
+                    // Try to parse as JSON
+                    if let Ok(tc_val) = serde_json::from_str::<Value>(trimmed) {
+                        if let (Some(name), Some(args)) = (tc_val["tool_call"]["name"].as_str(), tc_val["tool_call"].get("arguments")) {
+                            info!("[ClaudeCode] Extracted tool call: {}", name);
+                            return Ok(json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": format!("call_{}", chrono::Utc::now().timestamp_millis()),
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": serde_json::to_string(args).unwrap_or_default(),
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }]
+                            }));
+                        }
+                    }
+                }
+            }
+            // Also try to find tool_call JSON embedded in text (with surrounding content)
+            if let Some(tc_start) = stdout.find("{\"tool_call\"") {
+                let remaining = &stdout[tc_start..];
+                // Find matching closing brace
+                let mut depth = 0;
+                let mut end_idx = 0;
+                for (i, ch) in remaining.char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 { end_idx = i + 1; break; }
+                        }
+                        _ => {}
+                    }
+                }
+                if end_idx > 0 {
+                    let tc_json = &remaining[..end_idx];
+                    if let Ok(tc_val) = serde_json::from_str::<Value>(tc_json) {
+                        if let (Some(name), Some(args)) = (tc_val["tool_call"]["name"].as_str(), tc_val["tool_call"].get("arguments")) {
+                            info!("[ClaudeCode] Extracted embedded tool call: {}", name);
+                            return Ok(json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": format!("call_{}", chrono::Utc::now().timestamp_millis()),
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": serde_json::to_string(args).unwrap_or_default(),
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }]
+                            }));
+                        }
+                    }
+                }
+            }
+
+            // Regular text response
+            Ok(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": stdout.trim(),
+                    },
+                    "finish_reason": "stop"
+                }]
+            }))
+        }
+        Ok(Err(e)) => Err(format!("Failed to spawn claude CLI: {e}. Is 'claude' installed?")),
+        Err(_) => Err(interrupted_reason(120)),
+    }
+}
+
+/// Gemini CLI (Local) — spawn `gemini -p` and parse output
+async fn llm_call_gemini_cli(
+    model: &str,
+    messages: &[Value],
+    tools: Option<&[Value]>,
+    _max_tokens: u64,
+) -> Result<Value, String> {
+    // Build prompt from messages
+    let mut prompt_parts: Vec<String> = Vec::new();
+    let mut system_text = String::new();
+    for msg in messages {
+        let role = msg["role"].as_str().unwrap_or("user");
+        let content = msg["content"].as_str().unwrap_or("");
+        if role == "system" {
+            system_text.push_str(content);
+            system_text.push('\n');
+        } else if role == "user" {
+            prompt_parts.push(content.to_string());
+        } else if role == "assistant" && !content.is_empty() {
+            prompt_parts.push(format!("[Previous assistant response: {}]", crate::util::truncate_utf8(&content, 500)));
+        }
+    }
+
+    let prompt = prompt_parts.join("\n\n");
+    if prompt.is_empty() {
+        return Err("No user message found".to_string());
+    }
+
+    // Build tool descriptions for prompt-based tool calling
+    let mut tool_desc = String::new();
+    if let Some(t) = tools {
+        if !t.is_empty() {
+            tool_desc.push_str("\n\n[TOOL CALLING INSTRUCTIONS]\nYou have these tools. You MUST call a tool when the task requires action.\nTo call a tool, output EXACTLY this JSON on its own line (no markdown, no backticks):\n");
+            tool_desc.push_str("{\"tool_call\":{\"name\":\"TOOL_NAME\",\"arguments\":{...}}}\n\n");
+            tool_desc.push_str("Available tools:\n");
+            for tool in t {
+                let name = tool["function"]["name"].as_str().unwrap_or("");
+                let desc = tool["function"]["description"].as_str().unwrap_or("");
+                let params = &tool["function"]["parameters"]["properties"];
+                tool_desc.push_str(&format!("- {} : {} ", name, desc));
+                if let Some(props) = params.as_object() {
+                    let param_names: Vec<&str> = props.keys().map(|k| k.as_str()).collect();
+                    tool_desc.push_str(&format!("(params: {})", param_names.join(", ")));
+                }
+                tool_desc.push('\n');
+            }
+            tool_desc.push_str("\nIMPORTANT: If the task requires using a tool, you MUST output the JSON tool_call. Do NOT describe what you would do — actually call the tool.\n");
+            tool_desc.push_str("Example: {\"tool_call\":{\"name\":\"web_search\",\"arguments\":{\"query\":\"TigrimOS market analysis\"}}}\n");
+        }
+    }
+
+    let full_prompt = if system_text.is_empty() {
+        format!("{}{}", prompt, tool_desc)
+    } else {
+        format!("{}\n\n{}{}", system_text, prompt, tool_desc)
+    };
+
+    info!("[GeminiCLI] LLM call via CLI (model: {}, prompt: {}chars)", model, full_prompt.len());
+
+    let mut cli_args = vec![
+        "-p".to_string(), full_prompt,
+        "-o".to_string(), "text".to_string(),
+        "--approval-mode".to_string(), "plan".to_string(), // read-only, no tool execution
+    ];
+    if !model.is_empty() {
+        cli_args.push("-m".to_string());
+        cli_args.push(model.to_string());
+    }
+
+    let home = resolve_home();
+    let result = run_guarded(
+        Command::new("gemini")
+            .args(&cli_args)
+            .env("PATH", cli_env_path())
+            .env("HOME", &home),
+        180,
+    ).await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let combined = format!("{}\n{}", stdout, stderr);
+
+            // Check for quota/API errors in output
+            if combined.contains("QuotaError") || combined.contains("QUOTA_EXHAUSTED") || combined.contains("exhausted your capacity") {
+                let msg = if let Some(pos) = combined.find("You have exhausted") {
+                    let end = combined[pos..].find('\n').unwrap_or(combined.len() - pos);
+                    &combined[pos..pos+end]
+                } else { "Gemini API quota exhausted" };
+                return Err(format!("Gemini: {}", msg));
+            }
+            if combined.contains("Error when talking to Gemini API") && stdout.trim().is_empty() {
+                let err_line = combined.lines()
+                    .find(|l| l.contains("Error") || l.contains("message:"))
+                    .unwrap_or("Unknown Gemini API error");
+                return Err(format!("Gemini API error: {}", crate::util::truncate_utf8(&err_line, 300)));
+            }
+
+            if !output.status.success() && stdout.trim().is_empty() {
+                return Err(format!("Gemini CLI failed: {}", crate::util::truncate_utf8(&stderr, 500)));
+            }
+
+            // Filter out skill conflict warnings from stdout
+            let clean_stdout: String = stdout.lines()
+                .filter(|l| !l.contains("Skill conflict detected") && !l.contains("Loaded cached credentials"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Try to extract tool calls from the response
+            let stdout = clean_stdout;
+            for line in stdout.lines() {
+                let trimmed = line.trim().trim_start_matches("```json").trim_start_matches("```").trim();
+                if trimmed.contains("\"tool_call\"") {
+                    if let Ok(tc_val) = serde_json::from_str::<Value>(trimmed) {
+                        if let (Some(name), Some(args)) = (tc_val["tool_call"]["name"].as_str(), tc_val["tool_call"].get("arguments")) {
+                            info!("[GeminiCLI] Extracted tool call: {}", name);
+                            return Ok(json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": format!("call_{}", chrono::Utc::now().timestamp_millis()),
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": serde_json::to_string(args).unwrap_or_default(),
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }]
+                            }));
+                        }
+                    }
+                }
+            }
+            // Also try embedded tool_call JSON
+            if let Some(tc_start) = stdout.find("{\"tool_call\"") {
+                let remaining = &stdout[tc_start..];
+                let mut depth = 0;
+                let mut end_idx = 0;
+                for (i, ch) in remaining.char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => { depth -= 1; if depth == 0 { end_idx = i + 1; break; } }
+                        _ => {}
+                    }
+                }
+                if end_idx > 0 {
+                    if let Ok(tc_val) = serde_json::from_str::<Value>(&remaining[..end_idx]) {
+                        if let (Some(name), Some(args)) = (tc_val["tool_call"]["name"].as_str(), tc_val["tool_call"].get("arguments")) {
+                            info!("[GeminiCLI] Extracted embedded tool call: {}", name);
+                            return Ok(json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": format!("call_{}", chrono::Utc::now().timestamp_millis()),
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": serde_json::to_string(args).unwrap_or_default(),
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }]
+                            }));
+                        }
+                    }
+                }
+            }
+
+            // Regular text response
+            Ok(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": stdout.trim(),
+                    },
+                    "finish_reason": "stop"
+                }]
+            }))
+        }
+        Ok(Err(e)) => Err(format!("Failed to spawn gemini CLI: {e}. Is 'gemini' in PATH?")),
+        Err(_) => Err(interrupted_reason(180)),
+    }
+}
+
+/// Call Codex CLI instead of HTTP API.
+async fn llm_call_codex_cli(
+    model: &str,
+    messages: &[Value],
+    tools: Option<&[Value]>,
+    _max_tokens: u64,
+) -> Result<Value, String> {
+    // Build prompt from messages (system + user combined)
+    let mut prompt_parts: Vec<String> = Vec::new();
+    let mut system_text = String::new();
+    for msg in messages {
+        let role = msg["role"].as_str().unwrap_or("user");
+        let content = msg["content"].as_str().unwrap_or("");
+        if role == "system" {
+            system_text.push_str(content);
+            system_text.push('\n');
+        } else if role == "user" {
+            prompt_parts.push(content.to_string());
+        }
+    }
+
+    let task = prompt_parts.join("\n\n");
+    if task.is_empty() {
+        return Err("No user message found".to_string());
+    }
+
+    // Build tool descriptions for the prompt
+    let mut tool_desc = String::new();
+    if let Some(t) = tools {
+        if !t.is_empty() {
+            tool_desc.push_str("\n\n[TOOL CALLING INSTRUCTIONS]\nYou have these tools. You MUST call a tool when the task requires action.\nTo call a tool, output EXACTLY this JSON on its own line:\n");
+            tool_desc.push_str("{\"tool_call\":{\"name\":\"TOOL_NAME\",\"arguments\":{...}}}\n\n");
+            tool_desc.push_str("Available tools:\n");
+            for tool in t {
+                let name = tool["function"]["name"].as_str().unwrap_or("");
+                let desc = tool["function"]["description"].as_str().unwrap_or("");
+                tool_desc.push_str(&format!("- {}: {}\n", name, desc));
+            }
+            tool_desc.push_str("\nIMPORTANT: Output the JSON tool_call to use a tool. Do NOT just describe — actually call it.\n");
+        }
+    }
+
+    // Combine: system prompt + task + tool instructions
+    let full_prompt = if system_text.is_empty() {
+        format!("{}{}", task, tool_desc)
+    } else {
+        format!("{}\n\n---\n\nTASK:\n{}{}", system_text.trim(), task, tool_desc)
+    };
+
+    let (node_bin, script_path) = find_codex_cli();
+    let sandbox_dir = {
+        let s = load_agent_settings();
+        let sd = s["sandboxDir"].as_str().unwrap_or("./sandbox");
+        let raw = if sd.is_empty() { "./sandbox" } else { sd };
+        // Make absolute relative to data dir
+        let p = std::path::Path::new(raw);
+        if p.is_relative() {
+            crate::server::data::data_dir().join(raw).to_string_lossy().to_string()
+        } else {
+            raw.to_string()
+        }
+    };
+    // Ensure sandbox dir exists
+    let _ = std::fs::create_dir_all(&sandbox_dir);
+    let home = resolve_home();
+    info!("[Codex] LLM call via CLI (node: {}, script: {}, model: {}, prompt: {}chars, cwd: {})", node_bin, script_path, model, full_prompt.len(), sandbox_dir);
+
+    // Build args: `node codex.js exec "<prompt>" --json --full-auto [-m <model>]`
+    let mut cli_args: Vec<String> = Vec::new();
+    if !script_path.is_empty() {
+        cli_args.push(script_path.clone());
+    }
+    cli_args.extend_from_slice(&[
+        "exec".to_string(),
+        full_prompt.clone(),
+        "--json".to_string(),
+        "--full-auto".to_string(),
+    ]);
+    if !model.is_empty() {
+        cli_args.push("-m".to_string());
+        cli_args.push(model.to_string());
+    }
+
+    let result = run_guarded(
+        Command::new(&node_bin)
+            .args(&cli_args)
+            .current_dir(&sandbox_dir)
+            .env("PATH", cli_env_path())
+            .env("HOME", &home),
+        180,
+    ).await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            if !output.status.success() && stdout.trim().is_empty() {
+                return Err(format!("Codex CLI failed: {}", crate::util::truncate_utf8(&stderr, 500)));
+            }
+
+            // Parse JSONL events from codex --json output
+            let mut result_text = String::new();
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+
+                // First check for our tool_call format in the text
+                if trimmed.contains("\"tool_call\"") {
+                    let clean = trimmed.trim_start_matches("```json").trim_start_matches("```").trim();
+                    if let Ok(tc_val) = serde_json::from_str::<Value>(clean) {
+                        if let (Some(name), Some(args)) = (tc_val["tool_call"]["name"].as_str(), tc_val["tool_call"].get("arguments")) {
+                            info!("[Codex] Extracted tool call: {}", name);
+                            return Ok(json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": format!("call_{}", chrono::Utc::now().timestamp_millis()),
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": serde_json::to_string(args).unwrap_or_default(),
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }]
+                            }));
+                        }
+                    }
+                }
+
+                // Parse codex JSONL events
+                if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+                    let event_type = event["type"].as_str().unwrap_or("");
+
+                    if event_type == "item.completed" {
+                        let item = &event["item"];
+                        let item_type = item["type"].as_str().unwrap_or("");
+
+                        if item_type == "agent_message" {
+                            if let Some(text) = item["text"].as_str() {
+                                result_text.push_str(text);
+                            }
+                        } else if item_type == "command_execution" {
+                            if let Some(out) = item["aggregated_output"].as_str() {
+                                result_text.push_str(out);
+                            }
+                        } else if item_type == "message" {
+                            // Handle content array or string
+                            if let Some(content) = item["content"].as_array() {
+                                for block in content {
+                                    if let Some(text) = block["text"].as_str().or(block["output"].as_str()) {
+                                        result_text.push_str(text);
+                                    } else if let Some(s) = block.as_str() {
+                                        result_text.push_str(s);
+                                    }
+                                }
+                            }
+                        }
+                    } else if event_type == "message" {
+                        if let Some(c) = event["content"].as_str() {
+                            result_text.push_str(c);
+                        }
+                    }
+                } else if !trimmed.starts_with('{') {
+                    // Plain text line (not JSON)
+                    result_text.push_str(trimmed);
+                    result_text.push('\n');
+                }
+            }
+
+            // Also check result_text for embedded tool calls
+            for line in result_text.lines() {
+                let clean = line.trim().trim_start_matches("```json").trim_start_matches("```").trim();
+                if clean.contains("\"tool_call\"") {
+                    if let Ok(tc_val) = serde_json::from_str::<Value>(clean) {
+                        if let (Some(name), Some(args)) = (tc_val["tool_call"]["name"].as_str(), tc_val["tool_call"].get("arguments")) {
+                            info!("[Codex] Extracted tool call from result text: {}", name);
+                            return Ok(json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": format!("call_{}", chrono::Utc::now().timestamp_millis()),
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": serde_json::to_string(args).unwrap_or_default(),
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }]
+                            }));
+                        }
+                    }
+                }
+            }
+
+            let final_text = result_text.trim();
+            let content = if final_text.is_empty() { stdout.trim() } else { final_text };
+
+            Ok(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                    },
+                    "finish_reason": "stop"
+                }]
+            }))
+        }
+        Ok(Err(e)) => Err(format!("Failed to spawn codex CLI (node={}, script={}, cwd={}): {e}", node_bin, script_path, sandbox_dir)),
+        Err(_) => Err(interrupted_reason(180)),
+    }
+}
+
+/// Sanitize messages before sending to LLM API (ported from tiger_cowork sanitizeMessages).
+/// Handles: null content, orphaned tool pairs, mid-conversation system messages,
+/// consecutive user messages, missing user before assistant, reasoning_content stripping.
+fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
+    // 1. Collect valid tool_call IDs and tool result IDs
+    let mut valid_tc_ids = std::collections::HashSet::new();
+    let mut tool_result_ids = std::collections::HashSet::new();
+    for msg in messages {
+        if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tcs {
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    valid_tc_ids.insert(id.to_string());
+                }
+            }
+        }
+        if msg["role"].as_str() == Some("tool") {
+            if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                tool_result_ids.insert(id.to_string());
+            }
+        }
+    }
+
+    // 2. Filter and fix messages
+    let mut filtered: Vec<Value> = Vec::new();
+    for msg in messages {
+        let mut m = msg.clone();
+        let role = m["role"].as_str().unwrap_or("").to_string();
+
+        // Remove tool results referencing non-existent tool calls
+        if role == "tool" {
+            if let Some(id) = m.get("tool_call_id").and_then(|v| v.as_str()) {
+                if !valid_tc_ids.contains(id) { continue; }
+            }
+        }
+
+        // Remove orphaned assistant tool_calls (no matching results)
+        if role == "assistant" {
+            if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                if !tcs.is_empty() {
+                    let tc_ids: Vec<String> = tcs.iter()
+                        .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                        .collect();
+                    let has_any_result = tc_ids.iter().any(|id| tool_result_ids.contains(id));
+                    if !tc_ids.is_empty() && !has_any_result {
+                        // Strip tool_calls, keep as plain assistant message
+                        m.as_object_mut().map(|o| o.remove("tool_calls"));
+                    } else {
+                        // Ensure every tool_call has type: "function"
+                        if let Some(tcs) = m.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+                            for tc in tcs {
+                                if tc.get("type").is_none() {
+                                    tc["type"] = json!("function");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ensure content is never null/empty for assistant messages
+        if role == "assistant" {
+            let content_empty = match &m["content"] {
+                Value::Null => true,
+                Value::String(s) => s.is_empty(),
+                _ => false,
+            };
+            if content_empty {
+                m["content"] = json!("(thinking...)");
+            }
+        }
+
+        // Ensure content is never null for other roles
+        if m["content"].is_null() && role != "assistant" {
+            m["content"] = json!("");
+        }
+
+        filtered.push(m);
+    }
+
+    // 3. Merge consecutive system messages
+    let mut merged: Vec<Value> = Vec::new();
+    for msg in filtered {
+        if msg["role"].as_str() == Some("system") {
+            if let Some(last) = merged.last_mut() {
+                if last["role"].as_str() == Some("system") {
+                    let prev = last["content"].as_str().unwrap_or("");
+                    let cur = msg["content"].as_str().unwrap_or("");
+                    last["content"] = json!(format!("{}\n\n{}", prev, cur));
+                    continue;
+                }
+            }
+        }
+        merged.push(msg);
+    }
+
+    // 4. Convert mid-conversation system messages to user role
+    let mut seen_first_system = false;
+    for msg in merged.iter_mut() {
+        if msg["role"].as_str() == Some("system") {
+            if seen_first_system {
+                msg["role"] = json!("user");
+                let content = msg["content"].as_str().unwrap_or("").to_string();
+                msg["content"] = json!(format!("[System Instructions]\n{}", content));
+            }
+            seen_first_system = true;
+        }
+    }
+
+    // 5. Merge consecutive user messages
+    let mut deduped: Vec<Value> = Vec::new();
+    for msg in merged {
+        if msg["role"].as_str() == Some("user") {
+            if let Some(last) = deduped.last_mut() {
+                if last["role"].as_str() == Some("user")
+                    && last["content"].is_string()
+                    && msg["content"].is_string()
+                {
+                    let prev = last["content"].as_str().unwrap_or("");
+                    let cur = msg["content"].as_str().unwrap_or("");
+                    last["content"] = json!(format!("{}\n\n{}", prev, cur));
+                    continue;
+                }
+            }
+        }
+        deduped.push(msg);
+    }
+
+    // 6. Ensure a user message exists before the first assistant message
+    let first_non_system = deduped.iter().position(|m| m["role"].as_str() != Some("system"));
+    if let Some(idx) = first_non_system {
+        if deduped[idx]["role"].as_str() != Some("user") {
+            deduped.insert(idx, json!({"role": "user", "content": "Continue with the task."}));
+        }
+    }
+
+    deduped
+}
+
+/// Heuristic: did a `call_with_tools*` result terminate on a provider failure
+/// rather than real work? `call_with_tools` returns its outcome as text (no
+/// Result), so a dead/overloaded provider surfaces as an error string or an
+/// empty final answer. Router mode uses this to fail over to the next pool model.
+fn is_terminal_llm_error(content: &str) -> bool {
+    let c = content.to_ascii_lowercase();
+    content.trim().is_empty()
+        || c.contains("api request failed")
+        || c.contains("request failed")
+        || c.contains("rate limit")
+        || c.contains(" 429")
+        || c.contains(" 500")
+        || c.contains(" 502")
+        || c.contains(" 503")
+        || c.contains("overloaded")
+        || c.contains("upstream error")
+}
+
+/// Build the failover candidate list for a router agent: its own resolved model
+/// first, then the remaining pool entries (same-tier preferred) read from the
+/// session config's `system.model_pool`. Outside router mode the pool is empty,
+/// so the list is just `[self]` and behavior is identical to today.
+fn build_failover_candidates(
+    agent_def: &Value,
+    system_config: &Value,
+    self_model: &str,
+    self_url: &str,
+    self_key: &str,
+) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> =
+        vec![(self_model.to_string(), self_url.to_string(), self_key.to_string())];
+
+    let pool = match system_config["system"]["model_pool"].as_array() {
+        Some(p) => p,
+        None => return out,
+    };
+
+    // Prefer entries sharing the agent's tier (if the agent recorded one).
+    let self_tier = agent_def.get("tier").and_then(|v| v.as_str()).unwrap_or("");
+    let mut ordered: Vec<&Value> = pool.iter().collect();
+    if !self_tier.is_empty() {
+        ordered.sort_by_key(|e| {
+            if e["tier"].as_str().unwrap_or("") == self_tier { 0 } else { 1 }
+        });
+    }
+
+    for e in ordered {
+        let m = e["model"].as_str().unwrap_or("");
+        if m.is_empty() || m == self_model {
+            continue; // skip empties and the model we already lead with
+        }
+        let url = match e["api_url"].as_str() {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => self_url.to_string(),
+        };
+        let key = match e["api_key"].as_str() {
+            Some(k) if !k.is_empty() => k.to_string(),
+            _ => self_key.to_string(),
+        };
+        out.push((m.to_string(), url, key));
+    }
+    out
+}
+
+/// Models that only accept the default temperature of 1 and 400 on anything
+/// else (Kimi K2 "thinking" and similar reasoning models). For these we must
+/// pin temperature to 1.0 instead of the configured agent temperature.
+pub fn model_requires_default_temperature(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("thinking")
+        || m.contains("kimi-k2")   // kimi-k2.x-code etc. enforce temperature=1
+        || m.contains("kimi_k2")
+        || m.contains("minimax-m2")
+        || m.contains("minimax-m3")
+}
+
+/// Does this API error payload complain about the temperature parameter?
+/// Providers phrase it differently ("only 1 is allowed for this model",
+/// "invalid temperature", "temperature must be ...") so we just look for the
+/// word in the message, on both top-level and nested `error` shapes.
+fn is_temperature_error(resp: &Value) -> bool {
+    let msg = resp.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+        .or_else(|| resp.get("message").and_then(|m| m.as_str()))
+        .unwrap_or("");
+    msg.to_ascii_lowercase().contains("temperature")
+}
+
+async fn llm_call(
+    client: &Client,
+    api_key: &str,
+    api_url: &str,
+    model: &str,
+    messages: &[Value],
+    tools: Option<&[Value]>,
+    temperature: f64,
+    max_tokens: u64,
+) -> Result<Value, String> {
+    // Route to local CLI providers
+    if api_url.starts_with("claude-code") {
+        return llm_call_claude_code(model, messages, tools, max_tokens).await;
+    }
+    if api_url.starts_with("gemini-cli") {
+        return llm_call_gemini_cli(model, messages, tools, max_tokens).await;
+    }
+    if api_url.starts_with("codex-cli") {
+        return llm_call_codex_cli(model, messages, tools, max_tokens).await;
+    }
+
+    // Some models (Kimi K2 / kimi-k2.x-code, MiniMax-M2/M3, other reasoning
+    // models) reject any temperature other than the default 1 — sending 0.7
+    // fails with "invalid temperature: only 1 is allowed for this model".
+    // Proactively pin to 1.0 for known cases; a reactive retry below catches
+    // anything this misses.
+    let temperature = if model_requires_default_temperature(model)
+        || api_url.contains("api.kimi.com")
+    {
+        1.0
+    } else {
+        temperature
+    };
+
+    // Sanitize messages before sending (tiger_cowork: sanitizeMessages)
+    let messages = sanitize_messages(messages);
+
+    let is_anthropic = is_anthropic_api(api_url);
+
+    let (body, url, headers) = if is_anthropic {
+        let (system, anthropic_msgs) = to_anthropic_messages(&messages);
+        let mut body = json!({
+            "model": model,
+            "messages": anthropic_msgs,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        });
+        if let Some(sys) = system {
+            body["system"] = json!(sys);
+        }
+        if let Some(t) = tools {
+            if !t.is_empty() {
+                body["tools"] = json!(to_anthropic_tools(t));
+                body["tool_choice"] = json!({"type": "auto"});
+            }
+        }
+        let mut hdrs = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("x-api-key".to_string(), api_key.to_string()),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ];
+        // Support beta features if needed
+        let _ = &mut hdrs;
+        (body, api_url.to_string(), hdrs)
+    } else {
+        let mut body = json!({
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        });
+        if let Some(t) = tools {
+            if !t.is_empty() {
+                body["tools"] = json!(sanitize_tools_for_openai(t));
+                body["tool_choice"] = json!("auto");
+            }
+        }
+        let mut hdrs = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Authorization".to_string(), format!("Bearer {}", api_key)),
+        ];
+        // Kimi Code API requires Claude Code identity headers
+        if api_url.contains("api.kimi.com") {
+            hdrs.push(("User-Agent".to_string(), "claude-code/1.0.6".to_string()));
+            hdrs.push(("X-Client-Name".to_string(), "claude-code".to_string()));
+            hdrs.push(("X-Client-Version".to_string(), "1.0.6".to_string()));
+            hdrs.push(("HTTP-Referer".to_string(), "https://claude.ai".to_string()));
+            hdrs.push(("X-Traffic-Source".to_string(), "claude-code".to_string()));
+        }
+        (body, api_url.to_string(), hdrs)
+    };
+
+    // Send, with a single automatic retry if the provider rejects our
+    // temperature (e.g. Kimi/MiniMax reasoning models that only allow 1).
+    // This catches any model the proactive pin above missed.
+    let mut body = body;
+    let mut retried_temp = false;
+    let resp_json: Value = loop {
+        let mut req = client.post(&url);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let response = req.json(&body).send().await.map_err(|e| format!("API request failed: {e}"))?;
+        let rj: Value = response.json().await.map_err(|e| format!("Failed to parse API response: {e}"))?;
+
+        if !retried_temp
+            && is_temperature_error(&rj)
+            && body.get("temperature").and_then(|t| t.as_f64()) != Some(1.0)
+        {
+            warn!("[llm_call] model '{}' rejected temperature; retrying with temperature=1", model);
+            body["temperature"] = json!(1.0);
+            retried_temp = true;
+            continue;
+        }
+        break rj;
+    };
+
+    // Normalize Anthropic response to OpenAI format
+    if is_anthropic {
+        return Ok(normalize_anthropic_response(&resp_json));
+    }
+
+    Ok(resp_json)
+}
+
+/// Convert Anthropic response format to OpenAI format for unified processing
+fn normalize_anthropic_response(resp: &Value) -> Value {
+    // Check for Anthropic error
+    if let Some(err) = resp.get("error") {
+        return json!({"error": err});
+    }
+
+    let content_blocks = resp["content"].as_array();
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+
+    if let Some(blocks) = content_blocks {
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("text") => {
+                    if let Some(t) = block["text"].as_str() {
+                        text_parts.push(t.to_string());
+                    }
+                }
+                Some("tool_use") => {
+                    tool_calls.push(json!({
+                        "id": block["id"],
+                        "type": "function",
+                        "function": {
+                            "name": block["name"],
+                            "arguments": serde_json::to_string(&block["input"]).unwrap_or_else(|_| "{}".to_string()),
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let stop_reason = resp["stop_reason"].as_str().unwrap_or("stop");
+    let finish_reason = if stop_reason == "tool_use" { "tool_calls" } else { "stop" };
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": text_parts.join(""),
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+
+    json!({
+        "choices": [{
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": resp.get("usage").cloned().unwrap_or(json!({})),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tool argument truncation (tiger_cowork: truncate >4000 char args)
+// ---------------------------------------------------------------------------
+
+fn truncate_tool_call_args(tool_calls: &[Value]) -> Vec<Value> {
+    tool_calls.iter().map(|tc| {
+        let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+        if args_str.len() <= ARG_TRUNCATE_THRESHOLD {
+            return tc.clone();
+        }
+        // Build valid JSON summary instead of slicing mid-string
+        let truncated_args = match serde_json::from_str::<Value>(args_str) {
+            Ok(parsed) => {
+                if let Some(obj) = parsed.as_object() {
+                    let mut summary = serde_json::Map::new();
+                    for (key, val) in obj {
+                        if let Some(s) = val.as_str() {
+                            if s.len() > ARG_VALUE_TRUNCATE {
+                                summary.insert(key.clone(), json!(format!("{}...(truncated)", crate::util::truncate_utf8(s, ARG_VALUE_TRUNCATE))));
+                            } else {
+                                summary.insert(key.clone(), val.clone());
+                            }
+                        } else {
+                            summary.insert(key.clone(), val.clone());
+                        }
+                    }
+                    serde_json::to_string(&Value::Object(summary)).unwrap_or_else(|_| args_str.to_string())
+                } else {
+                    crate::util::truncate_utf8(args_str, ARG_TRUNCATE_THRESHOLD).to_string()
+                }
+            }
+            Err(_) => {
+                serde_json::to_string(&json!({"_truncated": crate::util::truncate_utf8(args_str, 3000)})).unwrap_or_default()
+            }
+        };
+        let mut tc = tc.clone();
+        tc["function"]["arguments"] = json!(truncated_args);
+        tc
+    }).collect()
+}
+
+// ---------------------------------------------------------------------------
+// JSON parse recovery for malformed tool args (tiger_cowork)
+// ---------------------------------------------------------------------------
+
+fn recover_tool_args(tool_name: &str, raw_args: &str) -> Option<Value> {
+    if !matches!(tool_name, "run_python" | "run_react" | "run_shell") {
+        return None;
+    }
+    // Try to extract "code" value via regex
+    let code_re = regex::Regex::new(r#""code"\s*:\s*"((?:[^"\\]|\\.)*)""#).ok()?;
+    if let Some(cap) = code_re.captures(raw_args) {
+        let code = cap[1].replace("\\n", "\n").replace("\\\"", "\"").replace("\\\\", "\\");
+        let mut args = serde_json::Map::new();
+        args.insert("code".to_string(), json!(code));
+        // Try to recover title
+        let title_re = regex::Regex::new(r#""title"\s*:\s*"((?:[^"\\]|\\.)*)""#).ok()?;
+        if let Some(tcap) = title_re.captures(raw_args) {
+            args.insert("title".to_string(), json!(&tcap[1]));
+        }
+        return Some(Value::Object(args));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Pending work check (tiger_cowork: prevent premature stop)
+// ---------------------------------------------------------------------------
+
+async fn check_pending_work(session_id: &str) -> (Vec<String>, Vec<(String, AgentResult)>, Vec<String>) {
+    let mut working_agents = Vec::new();
+    let mut pending_results = Vec::new();
+    let mut pending_bb_tasks = Vec::new();
+
+    // Check realtime session for working agents
+    let map = realtime_sessions().lock().await;
+    if let Some(session_arc) = map.get(session_id) {
+        let session = session_arc.lock().await;
+        for (id, handle) in &session.agents {
+            let status = handle.status.lock().await.clone();
+            if status == "working" {
+                working_agents.push(id.clone());
+            }
+        }
+        // Collect pending results (each agent may have several queued)
+        let results = session.results.lock().await;
+        for (id, queue) in results.iter() {
+            for result in queue {
+                pending_results.push((id.clone(), result.clone()));
+            }
+        }
+    }
+    drop(map);
+
+    // Check blackboard for unfinished tasks
+    let bb_tasks = protocols::blackboard_get_tasks(session_id, Some("awarded")).await;
+    for t in &bb_tasks {
+        pending_bb_tasks.push(t.task_id.clone());
+    }
+    let bb_open = protocols::blackboard_get_tasks(session_id, Some("open")).await;
+    for t in &bb_open {
+        pending_bb_tasks.push(t.task_id.clone());
+    }
+
+    (working_agents, pending_results, pending_bb_tasks)
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint save/load (tiger_cowork: save every 5 rounds)
+// ---------------------------------------------------------------------------
+
+async fn save_checkpoint(
+    session_id: &str,
+    round: usize,
+    all_messages: &[Value],
+    tool_records: &[ToolCallRecord],
+    total_tool_calls: usize,
+    collected_files: &[String],
+    tool_call_history: &[String],
+    consecutive_errors: usize,
+    early_content: &str,
+    conversation_key: &str,
+    profile_key: &str,
+) {
+    if session_id.is_empty() { return; }
+    let dir = crate::server::data::data_dir().join("checkpoints");
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let fp = dir.join(format!("{}.json", session_id));
+
+    // Compress checkpoint: only keep last 20 messages fully
+    let compact_messages = if all_messages.len() > 30 {
+        let mut msgs = Vec::new();
+        msgs.extend_from_slice(&all_messages[..2.min(all_messages.len())]);
+        msgs.push(json!({"role": "system", "content": format!("[Checkpoint: {} earlier messages omitted]", all_messages.len().saturating_sub(22))}));
+        msgs.extend_from_slice(&all_messages[all_messages.len().saturating_sub(20)..]);
+        msgs
+    } else {
+        all_messages.to_vec()
+    };
+
+    // Compact tool results
+    let compact_records: Vec<Value> = tool_records.iter().map(|tr| {
+        json!({
+            "tool": tr.tool,
+            "result": {
+                "ok": tr.result.get("ok"),
+                "exitCode": tr.result.get("exit_code"),
+                "outputFiles": tr.result.get("output_files"),
+                "stdout": tr.result.get("stdout").and_then(|v| v.as_str()).map(|s| crate::util::truncate_utf8(&s, 2000)),
+                "stderr": tr.result.get("stderr").and_then(|v| v.as_str()).map(|s| crate::util::truncate_utf8(&s, 1000)),
+                "error": tr.result.get("error"),
+            }
+        })
+    }).collect();
+
+    let checkpoint = json!({
+        "round": round,
+        "totalToolCalls": total_tool_calls,
+        "messages": compact_messages,
+        "toolRecords": compact_records,
+        "files": collected_files,
+        "toolCallHistory": tool_call_history,
+        "consecutiveErrors": consecutive_errors,
+        "earlyContent": if early_content.is_empty() { Value::Null } else { json!(early_content) },
+        "conversationKey": conversation_key,
+        "profile": profile_key,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let _ = tokio::fs::write(&fp, serde_json::to_string_pretty(&checkpoint).unwrap_or_default()).await;
+}
+
+/// Local checkpoint data matching what save_checkpoint writes
+struct LocalCheckpoint {
+    round: usize,
+    messages: Vec<Value>,
+    total_tool_calls: usize,
+    files: Vec<String>,
+    tool_call_history: Vec<String>,
+    consecutive_errors: usize,
+    early_content: Option<String>,
+    conversation_key: String,
+    profile_key: String,
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+async fn load_checkpoint(session_id: &str) -> Option<LocalCheckpoint> {
+    if session_id.is_empty() { return None; }
+    let fp = crate::server::data::data_dir().join("checkpoints").join(format!("{}.json", session_id));
+    let content = tokio::fs::read_to_string(&fp).await.ok()?;
+    let v: Value = serde_json::from_str(&content).ok()?;
+    Some(LocalCheckpoint {
+        round: v["round"].as_u64().unwrap_or(0) as usize,
+        messages: v["messages"].as_array().cloned().unwrap_or_default(),
+        total_tool_calls: v["totalToolCalls"].as_u64().unwrap_or(0) as usize,
+        files: v["files"].as_array()
+            .map(|arr| arr.iter().filter_map(|f| f.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
+        tool_call_history: v["toolCallHistory"].as_array()
+            .map(|arr| arr.iter().filter_map(|f| f.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
+        consecutive_errors: v["consecutiveErrors"].as_u64().unwrap_or(0) as usize,
+        early_content: v["earlyContent"].as_str().map(|s| s.to_string()),
+        conversation_key: v["conversationKey"].as_str().unwrap_or("").to_string(),
+        profile_key: v["profile"].as_str().unwrap_or("").to_string(),
+        timestamp: v["timestamp"].as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc)),
+    })
+}
+
+async fn clear_checkpoint(session_id: &str) {
+    if session_id.is_empty() { return; }
+    let fp = crate::server::data::data_dir().join("checkpoints").join(format!("{}.json", session_id));
+    let _ = tokio::fs::remove_file(&fp).await;
+}
+
+// ---------------------------------------------------------------------------
+// Main tool loop — faithful port of tiger_cowork callTigerBotWithTools()
+// ---------------------------------------------------------------------------
+
+async fn call_with_tools_inner(
+    api_key: &str,
+    api_url: &str,
+    model: &str,
+    messages: Vec<Value>,
+    system_prompt: Option<String>,
+    sandbox_dir: &str,
+    on_update: impl Fn(ToolUpdate) + Send + Sync + 'static,
+    sub_agent: SubAgentConfig,
+    realtime: bool,
+) -> ToolLoopResult {
+    let on_update = std::sync::Arc::new(on_update);
+    let client = Client::new();
+
+    // Vision: if the target model accepts images, fold any image files the user
+    // referenced (e.g. uploads/foo.png) into the current message as real inline
+    // vision content. Non-vision models keep the plain text path reference.
+    let messages = if model_supports_vision(api_url, model) {
+        embed_images_for_vision(messages, sandbox_dir)
+    } else {
+        messages
+    };
+
+    // Track whether a swarm/architecture has been activated this session
+    let mut session_activated = realtime; // realtime mode is pre-activated
+
+    // Manual mode: load agent_ids from config_file and boot realtime session up-front.
+    // Without this, agent_ids is empty and tool_definitions_for_mode returns early.
+    let mut sub_agent = sub_agent;
+    if sub_agent.enabled && sub_agent.mode == "manual" && !sub_agent.config_file.is_empty() && sub_agent.agent_ids.is_empty() {
+        if let Some((_yaml, ids)) = load_agent_yaml(&sub_agent.config_file) {
+            sub_agent.agent_ids = ids;
+            boot_realtime_session_deferred(
+                sub_agent.session_id.clone(),
+                sub_agent.config_file.clone(),
+                sub_agent.api_key.clone(),
+                sub_agent.api_url.clone(),
+                sub_agent.model.clone(),
+                sandbox_dir.to_string(),
+            );
+            session_activated = true;
+            info!("[call_with_tools] manual mode: booted realtime session, agents={:?}", sub_agent.agent_ids);
+        }
+    }
+
+    let mut tools = if sub_agent.enabled {
+        let t = tool_definitions_for_mode(&sub_agent, realtime, session_activated);
+        info!("[call_with_tools] mode={}, enabled={}, agents={:?}, tools={}", sub_agent.mode, sub_agent.enabled, sub_agent.agent_ids, t.iter().filter_map(|td| td["function"]["name"].as_str()).collect::<Vec<_>>().join(", "));
+        t
+    } else {
+        info!("[call_with_tools] sub_agent disabled, using default tools");
+        tool_definitions()
+    };
+
+    // Profile tool filter: intersect AFTER the mode-based list so swarm/router
+    // invariants hold. Protected coordination tools are never removed.
+    if let Some(tf) = sub_agent.loop_profile.as_deref().and_then(|p| p.tools.as_ref()) {
+        let before = tools.len();
+        tools.retain(|t| {
+            let name = t["function"]["name"].as_str().unwrap_or("");
+            is_protected_tool(name, &sub_agent) || tf.allows(name)
+        });
+        if tools.len() != before {
+            info!("[call_with_tools] profile tool filter ({}): {} -> {} tools: {}",
+                tf.mode, before, tools.len(),
+                tools.iter().filter_map(|td| td["function"]["name"].as_str()).collect::<Vec<_>>().join(", "));
+        }
+    }
+
+    // Inject MCP tools from connected servers — filtered by the profile's MCP
+    // server selection (all / selected / none).
+    let mcp_tools = match sub_agent.loop_profile.as_deref().and_then(|p| p.mcp.as_ref()) {
+        Some(m) if m.mode == "none" => Vec::new(),
+        Some(m) if m.mode == "selected" => mcp::get_mcp_tools_filtered(Some(&m.servers)).await,
+        _ => mcp::get_mcp_tools().await,
+    };
+    if !mcp_tools.is_empty() {
+        info!("[call_with_tools] Adding {} MCP tool(s): {}", mcp_tools.len(),
+            mcp_tools.iter().filter_map(|t| t["function"]["name"].as_str()).collect::<Vec<_>>().join(", "));
+        tools.extend(mcp_tools);
+    }
+
+    // YAML tool files (data/tools/*.yaml): first rewrite/hide/shadow built-in
+    // specs per kind:builtin and override:true records, then add the
+    // executable custom tools. Before the per-tool override pass so
+    // tools.config.<name> applies to them too.
+    crate::server::services::custom_tools::apply_builtin_overrides(&mut tools);
+    let custom_tools = crate::server::services::custom_tools::definitions();
+    if !custom_tools.is_empty() {
+        info!("[call_with_tools] Adding {} custom YAML tool(s): {}", custom_tools.len(),
+            custom_tools.iter().filter_map(|t| t["function"]["name"].as_str()).collect::<Vec<_>>().join(", "));
+        // A shadow (override: true) replaced the built-in spec above; guard
+        // against any residual duplicate names.
+        let existing: std::collections::HashSet<String> = tools
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        tools.extend(
+            custom_tools
+                .into_iter()
+                .filter(|t| !existing.contains(t["function"]["name"].as_str().unwrap_or(""))),
+        );
+    }
+
+    // Per-tool profile config: enabled:false removal + description overrides.
+    // After the MCP extend so it covers built-in AND MCP tool specs.
+    apply_profile_tool_overrides(&mut tools, &sub_agent);
+
+    // Orchestrators have the same tools as workers — they decide when to delegate vs do directly.
+
+    // Load settings — realtime agents get higher limits since orchestrators need many rounds.
+    // Knob precedence: agent-loop profile > settings.json keys > compiled defaults.
+    let settings = load_agent_settings();
+    let knobs = sub_agent.loop_profile.as_deref().and_then(|p| p.loop_.clone()).unwrap_or_default();
+    let compaction = sub_agent.loop_profile.as_deref().and_then(|p| p.compaction.clone()).unwrap_or_default();
+    let base_max_rounds = knobs.max_rounds.map(|v| v as usize)
+        .unwrap_or_else(|| settings["agentMaxToolRounds"].as_u64().unwrap_or(DEFAULT_MAX_ROUNDS as u64) as usize);
+    let base_max_tool_calls = knobs.max_tool_calls.map(|v| v as usize)
+        .unwrap_or_else(|| settings["agentMaxToolCalls"].as_u64().unwrap_or(DEFAULT_MAX_TOOL_CALLS as u64) as usize);
+    let is_multi_agent_coordinator = !realtime && sub_agent.enabled && !sub_agent.agent_ids.is_empty();
+    let is_realtime_delegator = realtime && sub_agent.enabled && !sub_agent.agent_ids.is_empty();
+    // Coordinator floors stay on top of profile values: a profile can raise
+    // rounds but cannot starve an active orchestrator.
+    let max_rounds = if is_realtime_delegator { base_max_rounds.max(50) }
+        else if realtime { base_max_rounds.max(30) }
+        else if is_multi_agent_coordinator { base_max_rounds.max(40) }
+        else { base_max_rounds };
+    let max_tool_calls = if is_realtime_delegator { base_max_tool_calls.max(100) }
+        else if realtime { base_max_tool_calls.max(60) }
+        else if is_multi_agent_coordinator { base_max_tool_calls.max(80) }
+        else { base_max_tool_calls };
+    let max_consecutive_errors = knobs.max_consecutive_errors.map(|v| v as usize)
+        .unwrap_or_else(|| settings["agentMaxConsecutiveErrors"].as_u64().unwrap_or(DEFAULT_MAX_CONSECUTIVE_ERRORS as u64) as usize);
+    let max_error_recoveries = knobs.max_error_recoveries.map(|v| v as usize)
+        .unwrap_or_else(|| settings["agentMaxErrorRecoveries"].as_u64().unwrap_or(DEFAULT_MAX_ERROR_RECOVERIES as u64) as usize);
+    let compression_interval = compaction.interval.map(|v| v as usize)
+        .unwrap_or_else(|| settings["agentCompressionInterval"].as_u64().unwrap_or(DEFAULT_COMPRESSION_INTERVAL as u64) as usize)
+        .max(1);
+    let compression_window = compaction.window.map(|v| v as usize)
+        .unwrap_or_else(|| settings["agentCompressionWindow"].as_u64().unwrap_or(DEFAULT_COMPRESSION_WINDOW as u64) as usize);
+    let max_context_tokens = compaction.max_context_tokens.map(|v| v as usize)
+        .unwrap_or_else(|| settings["agentMaxContextTokens"].as_u64().unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS as u64) as usize);
+    // false disables PERIODIC compression only — proactive over-budget and
+    // emergency overflow compaction stay always-on so long sessions recover.
+    let periodic_compaction_enabled = compaction.enabled.unwrap_or(true);
+    let temperature = knobs.temperature
+        .unwrap_or_else(|| settings["agentTemperature"].as_f64().unwrap_or(0.7));
+    let max_tokens = knobs.max_tokens
+        .unwrap_or_else(|| settings["agentMaxTokens"].as_u64().unwrap_or(81920));
+    let reflection_enabled = knobs.reflection_enabled
+        .unwrap_or_else(|| settings["agentReflectionEnabled"].as_bool().unwrap_or(false));
+    let eval_threshold = knobs.reflection_threshold
+        .unwrap_or_else(|| settings["agentReflectionThreshold"].as_f64().unwrap_or(0.7));
+    let max_reflection_retries = knobs.max_reflection_retries.map(|v| v as usize)
+        .unwrap_or_else(|| settings["agentMaxReflectionRetries"].as_u64().unwrap_or(2) as usize);
+    let tool_result_max_len = compaction.tool_result_max_len
+        .unwrap_or_else(|| settings["agentToolResultMaxLen"].as_u64().unwrap_or(6000))
+        .min(100_000) as usize;
+    let checkpoint_enabled = knobs.checkpoint_enabled
+        .unwrap_or_else(|| settings["agentCheckpointEnabled"].as_bool().unwrap_or(true));
+    // Dedicated summarization model: profile > settings > session model.
+    let compression_model: Option<String> = compaction.model.clone().filter(|m| !m.trim().is_empty())
+        .or_else(|| settings["agentCompressionModel"].as_str().filter(|m| !m.trim().is_empty()).map(|m| m.to_string()));
+    let compression_model_ref: &str = compression_model.as_deref().unwrap_or(model);
+
+    // --- Outer evaluation loop config (tool-using job-level judge) ---
+    // At top level an enabled `evaluation` profile section wins (exactly one
+    // eval per job, tool-using judge). Otherwise the legacy reflection knobs
+    // drive the same engine with the text-only judge, at any depth, unchanged.
+    // The tool-judge NEVER runs for sub-agents: spawn_subagent children run at
+    // depth+1 under their own agent_id, so the gate below excludes them.
+    let eval_knobs = sub_agent.loop_profile.as_deref().and_then(|p| p.evaluation.clone()).unwrap_or_default();
+    let evaluation_enabled = eval_knobs.enabled
+        .unwrap_or_else(|| settings["agentEvaluationEnabled"].as_bool().unwrap_or(false));
+    let is_top_level = sub_agent.depth == 0 && sub_agent.agent_id == "main";
+    // Graph mode: a judge panel from the graph profile gates the final answer.
+    // Takes precedence over the profile `evaluation` section at top level; a
+    // profile without judges degrades to the legacy branches below.
+    let graph_eval_config: Option<EvalConfig> = if is_top_level {
+        sub_agent.graph_profile.as_deref().and_then(|gp| {
+            if gp.judges.is_empty() {
+                warn!("[Graph] Profile '{}' has no judges — gate disabled", gp.name);
+                return None;
+            }
+            let agg = gp.aggregation.clone().unwrap_or_default();
+            let policy = match agg.policy.trim() {
+                "" => "all_pass".to_string(),
+                p => p.to_string(),
+            };
+            let agg_threshold = agg.threshold.unwrap_or(0.75).clamp(0.0, 1.0);
+            let knobs = gp.loop_.clone().unwrap_or_default();
+            let judges: Vec<ResolvedJudge> = gp.judges.iter().enumerate().map(|(i, j)| {
+                ResolvedJudge {
+                    name: if j.name.trim().is_empty() { format!("judge-{}", i + 1) } else { j.name.clone() },
+                    model: if j.model.trim().is_empty() { model.to_string() } else { j.model.clone() },
+                    api_url: if j.api_url.trim().is_empty() { api_url.to_string() } else { j.api_url.clone() },
+                    api_key: if j.api_key.trim().is_empty() { api_key.to_string() } else { j.api_key.clone() },
+                    rules: crate::server::services::graph::resolve_judge_rules(j),
+                    weight: j.weight.unwrap_or(1.0),
+                    threshold: j.threshold.map(|t| t.clamp(0.0, 1.0)),
+                    use_tools: j.use_tools.unwrap_or(true),
+                    allow_execute: j.allow_execute.unwrap_or(false),
+                    max_judge_rounds: j.max_judge_rounds.unwrap_or(3).clamp(1, 6) as usize,
+                }
+            }).collect();
+            info!("[Graph] Gate active: {} judge(s), policy {}, threshold {:.2}", judges.len(), policy, agg_threshold);
+            Some(EvalConfig {
+                tool_judge: true,
+                threshold: agg_threshold,
+                max_retries: knobs.max_iterations.unwrap_or(2).clamp(1, 5) as usize,
+                max_fix_rounds: knobs.max_fix_rounds.unwrap_or(5).clamp(1, 10) as usize,
+                max_judge_rounds: 3, // per-judge values are used instead
+                judge_model: model.to_string(),
+                judge_api_url: api_url.to_string(),
+                judge_api_key: api_key.to_string(),
+                rubric: String::new(),
+                allow_execute: false,
+                graph: Some(GraphEvalConfig {
+                    judges,
+                    policy,
+                    agg_threshold,
+                    judge_plain_answers: knobs.judge_plain_answers.unwrap_or(true),
+                }),
+            })
+        })
+    } else {
+        None
+    };
+    let effective_eval_config: Option<EvalConfig> = if graph_eval_config.is_some() {
+        graph_eval_config
+    } else if is_top_level && evaluation_enabled {
+        Some(EvalConfig {
+            tool_judge: true,
+            threshold: eval_knobs.threshold
+                .unwrap_or_else(|| settings["agentEvaluationThreshold"].as_f64().unwrap_or(0.75))
+                .clamp(0.0, 1.0),
+            max_retries: eval_knobs.max_retries
+                .unwrap_or_else(|| settings["agentEvaluationMaxRetries"].as_u64().unwrap_or(2))
+                .clamp(1, 5) as usize,
+            max_fix_rounds: eval_knobs.max_fix_rounds.unwrap_or(5).clamp(1, 10) as usize,
+            max_judge_rounds: eval_knobs.max_judge_rounds
+                .unwrap_or_else(|| settings["agentEvaluationMaxJudgeRounds"].as_u64().unwrap_or(3))
+                .clamp(1, 6) as usize,
+            judge_model: eval_knobs.model.clone().filter(|m| !m.trim().is_empty())
+                .or_else(|| settings["agentEvaluationModel"].as_str().filter(|m| !m.trim().is_empty()).map(|m| m.to_string()))
+                .unwrap_or_else(|| model.to_string()),
+            judge_api_url: eval_knobs.api_url.clone().filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| api_url.to_string()),
+            judge_api_key: eval_knobs.api_key.clone().filter(|k| !k.trim().is_empty())
+                .unwrap_or_else(|| api_key.to_string()),
+            rubric: eval_knobs.rubric.clone().unwrap_or_default(),
+            allow_execute: eval_knobs.allow_execute.unwrap_or(false),
+            graph: None,
+        })
+    } else if reflection_enabled {
+        // Byte-for-byte legacy reflection: text-only judge on the session model.
+        Some(EvalConfig {
+            tool_judge: false,
+            threshold: eval_threshold,
+            max_retries: max_reflection_retries,
+            max_fix_rounds: 5,
+            max_judge_rounds: 0,
+            judge_model: model.to_string(),
+            judge_api_url: api_url.to_string(),
+            judge_api_key: api_key.to_string(),
+            rubric: String::new(),
+            allow_execute: false,
+            graph: None,
+        })
+    } else {
+        None
+    };
+
+    // --- Checkpoint resume (tiger_cowork: try to resume from checkpoint) ---
+    let mut all_messages = Vec::new();
+    let mut tool_records: Vec<ToolCallRecord> = Vec::new();
+    let mut collected_files: Vec<String> = Vec::new();
+    let mut total_tool_calls: usize = 0;
+    #[allow(unused_assignments)]
+    let mut consecutive_errors: usize = 0;
+    let mut error_recovery_attempts: usize = 0;
+    let mut no_choices_retries: usize = 0;
+    let mut _uses_skill = false;
+    let mut early_content = String::new();
+    let mut start_round: usize = 0;
+    // Track whether the AI has successfully delegated to any agent
+    let mut agent_task_sent = false;
+    let mut agent_stop_nudged = false;
+    // For loop detection: track recent (tool_name, args_signature) tuples
+    let mut recent_signatures: Vec<String> = Vec::new();
+    // For tracking tool call history (loop detection)
+    let mut tool_call_history: Vec<String> = Vec::new();
+
+    // Identify this conversation by its last real user message — a checkpoint
+    // saved for a DIFFERENT message (e.g. left behind by a crashed or killed
+    // run) must not hijack this one, or the new question is silently dropped.
+    let conversation_key: String = messages.iter().rev()
+        .find(|m| m["role"].as_str() == Some("user"))
+        .map(|m| content_to_text(&m["content"]).chars().take(300).collect())
+        .unwrap_or_default();
+
+    // A checkpoint saved under a different agent-loop profile carries a
+    // transcript built with different tools/prompt — never resume it.
+    let profile_key: String = sub_agent.loop_profile.as_deref().map(|p| p.name.clone()).unwrap_or_default();
+
+    if checkpoint_enabled && !sub_agent.session_id.is_empty() {
+        if let Some(checkpoint) = load_checkpoint(&sub_agent.session_id).await {
+            let age_ok = checkpoint.timestamp
+                .map(|t| chrono::Utc::now() - t < chrono::Duration::hours(2))
+                .unwrap_or(false);
+            let key_ok = !conversation_key.is_empty()
+                && checkpoint.conversation_key == conversation_key
+                && checkpoint.profile_key == profile_key;
+            if age_ok && key_ok {
+                info!("[ToolLoop] Resuming from checkpoint at round {}", checkpoint.round);
+                all_messages = checkpoint.messages;
+                total_tool_calls = checkpoint.total_tool_calls;
+                collected_files = checkpoint.files;
+                tool_call_history = checkpoint.tool_call_history;
+                consecutive_errors = checkpoint.consecutive_errors;
+                if let Some(ec) = checkpoint.early_content {
+                    early_content = ec;
+                }
+                start_round = checkpoint.round;
+            } else {
+                warn!("[ToolLoop] Ignoring stale checkpoint for session {} (age_ok={}, key_ok={}) — starting fresh",
+                    sub_agent.session_id, age_ok, key_ok);
+                clear_checkpoint(&sub_agent.session_id).await;
+            }
+        }
+    }
+
+    // Initialize messages if not resuming from checkpoint
+    if all_messages.is_empty() {
+        if let Some(sys) = &system_prompt {
+            all_messages.push(json!({ "role": "system", "content": sys }));
+        }
+        all_messages.extend(messages);
+    }
+
+    // Extract user objective for reflection: the LAST real user message is the
+    // current request (the first one is stale in multi-turn sessions). Skip
+    // injected system nudges, which also use the user role.
+    let user_objective: String = all_messages.iter().rev()
+        .filter(|m| m["role"].as_str() == Some("user"))
+        .map(|m| content_to_text(&m["content"]))
+        .find(|c| !c.starts_with('⚠') && !c.starts_with('🔴') && !c.starts_with('🚨')
+            && !c.starts_with("REFLECTION"))
+        .unwrap_or_default()
+        .chars().take(2000)
+        .collect();
+
+    // Check if user wants output files (charts/graphs)
+    let user_wants_output = {
+        let lower = user_objective.to_lowercase();
+        lower.contains("chart") || lower.contains("graph") || lower.contains("plot")
+            || lower.contains("diagram") || lower.contains("visualiz")
+            || lower.contains("figure") || lower.contains("draw")
+    };
+
+    for round in start_round..max_rounds {
+        // --- Abort check: save checkpoint and return early (tiger_cowork: signal.aborted) ---
+        if sub_agent.cancel_flag.load(Ordering::Relaxed) {
+            info!("[ToolLoop] Abort signal received at round {} — saving checkpoint", round);
+            if checkpoint_enabled {
+                save_checkpoint(
+                    &sub_agent.session_id, round, &all_messages, &tool_records,
+                    total_tool_calls, &collected_files, &tool_call_history,
+                    consecutive_errors, &early_content, &conversation_key, &profile_key,
+                ).await;
+            }
+            let content = if early_content.is_empty() {
+                "Task was cancelled.".to_string()
+            } else {
+                early_content
+            };
+            return ToolLoopResult {
+                content,
+                tool_results: tool_records,
+                files: collected_files,
+            };
+        }
+
+        let ctx_chars = compact::estimate_messages_chars(&all_messages);
+        info!("Tool loop round {}/{} — {} messages, ~{} chars (~{} tokens)", round + 1, max_rounds, all_messages.len(), ctx_chars, ctx_chars / 4);
+
+        // --- Context compression ---
+        // Periodic compression every N rounds (profile can disable this — the
+        // proactive and overflow paths below always stay on).
+        if periodic_compaction_enabled && round > 0 && round % compression_interval == 0 {
+            let compressed = compact::compress_older_messages(
+                &all_messages, compression_window, api_key, api_url, compression_model_ref, None,
+            ).await;
+            if compressed.len() < all_messages.len() {
+                info!("[ToolLoop] Periodic compression: {} -> {} messages", all_messages.len(), compressed.len());
+                all_messages = compressed;
+            }
+        }
+
+        // Proactive compaction: estimate tokens and compress if over budget
+        let estimated_tokens = compact::estimate_messages_chars(&all_messages) / 4;
+        if estimated_tokens > max_context_tokens {
+            info!("[ToolLoop] Context ~{} tokens exceeds limit {} — compacting...", estimated_tokens, max_context_tokens);
+            let compressed = compact::compress_older_messages(
+                &all_messages, compression_window.min(6), api_key, api_url, compression_model_ref, None,
+            ).await;
+            if compressed.len() < all_messages.len() {
+                all_messages = compressed;
+                info!("[ToolLoop] Compacted to ~{} tokens ({} messages)",
+                    compact::estimate_messages_chars(&all_messages) / 4, all_messages.len());
+            }
+        }
+
+        // Safety fallback: naive trim if still over budget
+        let trimmed = compact::trim_conversation_context(&all_messages, 6_000_000);
+        if trimmed.len() < all_messages.len() {
+            all_messages = trimmed;
+        }
+
+        // Validate message structure after trimming (tiger_cowork: tool-pair consistency)
+        let validated = compact::validate_message_structure(&all_messages);
+        if validated.messages.len() != all_messages.len() {
+            all_messages = validated.messages;
+        }
+
+        // Periodic checkpoint save
+        if round > 0 && round % CHECKPOINT_INTERVAL == 0 {
+            save_checkpoint(
+                &sub_agent.session_id, round, &all_messages, &tool_records,
+                total_tool_calls, &collected_files, &tool_call_history,
+                consecutive_errors, &early_content, &conversation_key, &profile_key,
+            ).await;
+        }
+
+        // --- LLM call with retry logic (tiger_cowork: 3 retries + overload backoff) ---
+        // Note: sanitize_messages() is called inside llm_call() before sending to API
+        let mut data: Option<Value> = None;
+        let mut overload_retry_count: usize = 0;
+
+        for llm_retry in 0..LLM_MAX_RETRIES {
+            match llm_call(
+                &client, api_key, api_url, model, &all_messages,
+                Some(&tools), temperature, max_tokens,
+            ).await {
+                Ok(resp) => {
+                    data = Some(resp);
+                    break;
+                }
+                Err(err_msg) => {
+                    // Context overflow: compress before retrying
+                    if compact::is_context_overflow(&err_msg) && all_messages.len() > 3 {
+                        info!("[ToolLoop] Context overflow detected — compressing before retry (attempt {}/{})...", llm_retry + 1, LLM_MAX_RETRIES);
+                        let force_opts = compact::CompactOptions { force: true };
+                        let compressed = compact::compress_older_messages(
+                            &all_messages, compression_window.min(6), api_key, api_url, compression_model_ref, Some(&force_opts),
+                        ).await;
+                        if compressed.len() < all_messages.len() {
+                            all_messages = compact::validate_message_structure(&compressed).messages;
+                        } else if llm_retry >= 1 {
+                            // Retries 2+: target single largest tool result (tiger_cowork)
+                            let before_chars = compact::estimate_messages_chars(&all_messages);
+                            compact::truncate_largest_tool_result(&mut all_messages, 4000);
+                            let after_chars = compact::estimate_messages_chars(&all_messages);
+                            if after_chars < before_chars {
+                                all_messages = compact::validate_message_structure(&all_messages).messages;
+                                info!("[ToolLoop] Truncated largest tool result: {} → {} chars", before_chars, after_chars);
+                            } else {
+                                // No tool message large enough — fall back to halving trim
+                                let trimmed = compact::trim_conversation_context(&all_messages, before_chars / 2);
+                                all_messages = compact::validate_message_structure(&trimmed).messages;
+                                info!("[ToolLoop] Trimmed to {} messages ({} chars)", all_messages.len(), compact::estimate_messages_chars(&all_messages));
+                            }
+                        } else {
+                            // First retry: halving trim path
+                            let current_chars = compact::estimate_messages_chars(&all_messages);
+                            let trimmed = compact::trim_conversation_context(&all_messages, current_chars / 2);
+                            all_messages = compact::validate_message_structure(&trimmed).messages;
+                            info!("[ToolLoop] Trimmed to {} messages ({} chars)", all_messages.len(), compact::estimate_messages_chars(&all_messages));
+                        }
+                        if llm_retry >= LLM_MAX_RETRIES - 1 {
+                            on_update(ToolUpdate::Error(format!("Context overflow after {} retries", LLM_MAX_RETRIES)));
+                            return ToolLoopResult {
+                                content: format!("Context overflow after {} retries", LLM_MAX_RETRIES),
+                                tool_results: tool_records,
+                                files: collected_files,
+                            };
+                        }
+                        continue;
+                    }
+
+                    // 529 overloaded: exponential backoff with jitter
+                    let is_overloaded = err_msg.contains("529") || err_msg.to_lowercase().contains("overloaded");
+                    if is_overloaded && overload_retry_count < OVERLOAD_MAX_RETRIES {
+                        overload_retry_count += 1;
+                        let base_delay = 3000u64.min(3000u64.saturating_mul(1u64 << (overload_retry_count - 1))).min(30000);
+                        let jitter = rand_jitter(2000);
+                        let delay = base_delay + jitter;
+                        info!("[ToolLoop] API overloaded — backoff retry {}/{} in {}ms...",
+                            overload_retry_count, OVERLOAD_MAX_RETRIES, delay);
+                        on_update(ToolUpdate::Error(format!("API overloaded — retrying in {}ms...", delay)));
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        continue; // Don't count toward normal retries
+                    }
+
+                    // Normal retry: 2s, 4s backoff
+                    if llm_retry < LLM_MAX_RETRIES - 1 {
+                        let delay = ((llm_retry + 1) * 2000) as u64;
+                        info!("[ToolLoop] LLM call failed (attempt {}/{}). Retrying in {}ms...",
+                            llm_retry + 1, LLM_MAX_RETRIES, delay);
+                        on_update(ToolUpdate::Error(format!("LLM call failed, retrying... ({})", err_msg)));
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    } else {
+                        on_update(ToolUpdate::Error(format!("Connection error after {} retries: {}", LLM_MAX_RETRIES, err_msg)));
+                        return ToolLoopResult {
+                            content: format!("Connection error after {} retries: {}", LLM_MAX_RETRIES, err_msg),
+                            tool_results: tool_records,
+                            files: collected_files,
+                        };
+                    }
+                }
+            }
+        }
+
+        let resp_json = match data {
+            Some(d) => {
+                // Log key response info for diagnostics
+                if let Some(usage) = d.get("usage") {
+                    info!("[ToolLoop] API usage: prompt_tokens={}, completion_tokens={}, total={}",
+                        usage["prompt_tokens"].as_u64().unwrap_or(0),
+                        usage["completion_tokens"].as_u64().unwrap_or(0),
+                        usage["total_tokens"].as_u64().unwrap_or(0));
+                }
+                d
+            },
+            None => continue,
+        };
+
+        // Reset consecutive errors on successful API response
+        consecutive_errors = 0;
+
+        // Check for API-level error in response body
+        if let Some(err) = resp_json.get("error") {
+            let err_msg = err.to_string();
+            error!("API error: {}", err_msg);
+
+            // Context overflow — try compression before giving up
+            if compact::is_context_overflow(&err_msg) && all_messages.len() > 3 {
+                info!("[ToolLoop] Context overflow in response — compressing and retrying...");
+                let force_opts2 = compact::CompactOptions { force: true };
+                let compressed = compact::compress_older_messages(
+                    &all_messages, compression_window.min(6), api_key, api_url, compression_model_ref, Some(&force_opts2),
+                ).await;
+                if compressed.len() < all_messages.len() {
+                    all_messages = compact::validate_message_structure(&compressed).messages;
+                    continue;
+                } else {
+                    let current_chars = compact::estimate_messages_chars(&all_messages);
+                    let trimmed = compact::trim_conversation_context(&all_messages, current_chars / 2);
+                    all_messages = compact::validate_message_structure(&trimmed).messages;
+                    continue;
+                }
+            }
+
+            // Tool ID mismatch: remove orphaned tool results and retry
+            if err_msg.contains("tool_id") || err_msg.contains("tool result") || err_msg.contains("tool_call_id") {
+                let before_len = all_messages.len();
+                let valid_ids: std::collections::HashSet<String> = all_messages.iter()
+                    .filter_map(|m| m["tool_calls"].as_array())
+                    .flatten()
+                    .filter_map(|tc| tc["id"].as_str().map(|s| s.to_string()))
+                    .collect();
+                all_messages.retain(|m| {
+                    if m["role"].as_str() == Some("tool") {
+                        if let Some(id) = m["tool_call_id"].as_str() {
+                            return valid_ids.contains(id);
+                        }
+                    }
+                    true
+                });
+                if all_messages.len() < before_len {
+                    info!("[ToolLoop] Removed {} orphaned tool results. Retrying...", before_len - all_messages.len());
+                    continue;
+                }
+            }
+
+            // "content is empty" error (MiniMax 2013) — re-sanitize and retry
+            if (err_msg.contains("content is empty") || err_msg.contains("2013"))
+                && all_messages.len() > 2
+            {
+                info!("[ToolLoop] Empty content error — re-sanitizing messages and retrying...");
+                all_messages = sanitize_messages(&all_messages);
+                // Also trim if too long
+                let trimmed = compact::trim_conversation_context(&all_messages, 6_000_000);
+                if trimmed.len() < all_messages.len() {
+                    all_messages = compact::validate_message_structure(&trimmed).messages;
+                }
+                continue;
+            }
+
+            on_update(ToolUpdate::Error(format!("API error: {}", err_msg)));
+            return ToolLoopResult {
+                content: format!("Error: API error: {}", err_msg),
+                tool_results: tool_records,
+                files: collected_files,
+            };
+        }
+
+        // --- Handle no-choices error ---
+        let choice = &resp_json["choices"][0];
+        if choice.is_null() {
+            let api_error = resp_json.get("error")
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| serde_json::to_string(&resp_json).unwrap_or_default().chars().take(500).collect());
+            warn!("[ToolLoop] No response from API at round {}. Error: {}", round, api_error);
+
+            no_choices_retries += 1;
+            if no_choices_retries < 3 {
+                tokio::time::sleep(Duration::from_millis(2000)).await;
+                continue;
+            }
+            return ToolLoopResult {
+                content: format!("API returned no choices: {}", api_error),
+                tool_results: tool_records,
+                files: collected_files,
+            };
+        }
+        no_choices_retries = 0;
+
+        let message = &choice["message"];
+        let _finish_reason = choice["finish_reason"].as_str().unwrap_or("");
+
+        // Capture early content (for abort/cancel scenarios)
+        if let Some(text) = message["content"].as_str() {
+            if !text.is_empty() {
+                early_content = text.to_string();
+            }
+        }
+
+        // Stream reasoning content to callback if present (extended thinking models)
+        if let Some(reasoning) = message.get("reasoning_content").and_then(|r| r.as_str()) {
+            if !reasoning.is_empty() {
+                on_update(ToolUpdate::TextChunk(format!("[reasoning] {}", crate::util::truncate_utf8(&reasoning, 500))));
+            }
+        }
+
+        // Get tool calls and truncate large args before adding to context
+        let tool_calls = message["tool_calls"].as_array();
+        let mut truncated_message = if let Some(calls) = tool_calls {
+            if !calls.is_empty() {
+                let truncated = truncate_tool_call_args(calls);
+                let mut msg = message.clone();
+                msg["tool_calls"] = json!(truncated);
+                msg
+            } else {
+                message.clone()
+            }
+        } else {
+            message.clone()
+        };
+
+        // Preserve reasoning_content in the assistant message (tiger_cowork: reasoning support)
+        if let Some(reasoning) = message.get("reasoning_content") {
+            if reasoning.is_string() && !reasoning.as_str().unwrap_or("").is_empty() {
+                truncated_message["reasoning_content"] = reasoning.clone();
+                // Kimi API rejects empty content — fill from reasoning if content is empty
+                if truncated_message["content"].as_str().unwrap_or("").is_empty() {
+                    let r = reasoning.as_str().unwrap_or("");
+                    truncated_message["content"] = json!(crate::util::truncate_utf8(r, 200));
+                }
+            }
+        }
+
+        // Ensure content is never empty (MiniMax/Kimi APIs reject "chat content is empty")
+        // This applies even when tool_calls are present — some APIs require non-empty content always
+        if truncated_message["content"].as_str().unwrap_or("").is_empty() {
+            truncated_message["content"] = json!("(thinking...)");
+        }
+
+        // Append the assistant message (with truncated args) to the conversation
+        all_messages.push(truncated_message);
+
+        // Check for tool calls
+        if let Some(calls) = tool_calls {
+            if calls.is_empty() {
+                // No tool calls -- treat as final response
+                let mut content = strip_think_blocks(message["content"].as_str().unwrap_or(""));
+                info!("[ToolLoop] LLM returned text-only (no tools) at round {}: {} chars", round, content.len());
+                // Checkpoint is cleared BEFORE evaluation on purpose: a stale
+                // checkpoint surviving a mid-eval crash would resume a
+                // transcript that already contains a final answer.
+                clear_checkpoint(&sub_agent.session_id).await;
+                // Outer evaluation: this is a normal completion too (some
+                // providers return tool_calls: [] instead of omitting the
+                // key). Judge before the final TextChunk so the UI receives
+                // the improved answer. Plain no-tool replies are only judged
+                // in graph mode (judge_plain_answers).
+                if let Some(eval_cfg) = &effective_eval_config {
+                    if eval_cfg.should_judge(total_tool_calls) && !content.is_empty() {
+                        let eval_result = run_evaluation_loop(
+                            &client, api_key, api_url, model, &mut all_messages, &user_objective,
+                            eval_cfg, temperature, max_tokens,
+                            &tools, &sub_agent, sandbox_dir, on_update.clone(), realtime,
+                            &mut tool_records, &mut collected_files, &mut total_tool_calls,
+                        ).await;
+                        if let Some(improved) = eval_result {
+                            let improved = strip_think_blocks(&improved);
+                            if !improved.trim().is_empty() {
+                                content = improved;
+                            }
+                        }
+                    }
+                }
+                on_update(ToolUpdate::TextChunk(content.clone()));
+                return ToolLoopResult {
+                    content,
+                    tool_results: tool_records,
+                    files: collected_files,
+                };
+            }
+
+            // --- Parse tool calls ---
+            let mut parsed_calls: Vec<(String, String, Value, String)> = Vec::new(); // (name, id, args, raw_args_str)
+            for call in calls {
+                let tool_name = call["function"]["name"].as_str().unwrap_or("unknown").to_string();
+                let tool_args_str = call["function"]["arguments"].as_str().unwrap_or("{}").to_string();
+                let tool_id = call["id"].as_str().unwrap_or("").to_string();
+
+                let tool_args: Value = match serde_json::from_str(&tool_args_str) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // JSON parse recovery for malformed args
+                        if let Some(recovered) = recover_tool_args(&tool_name, &tool_args_str) {
+                            info!("[ToolLoop] Recovered malformed JSON for {}", tool_name);
+                            recovered
+                        } else {
+                            warn!("[ToolLoop] Failed to parse args for {}: {}", tool_name, crate::util::truncate_utf8(&tool_args_str, 200));
+                            json!({})
+                        }
+                    }
+                };
+                parsed_calls.push((tool_name, tool_id, tool_args, tool_args_str));
+            }
+
+            // --- Execute tools: parallel for sub-agent tools, sequential for others ---
+            let parallel_tool_names: std::collections::HashSet<&str> =
+                ["spawn_subagent", "send_task", "wait_result"].iter().copied().collect();
+
+            let (sequential_calls, parallel_calls): (Vec<_>, Vec<_>) = parsed_calls.iter()
+                .partition(|(name, _, _, _)| !parallel_tool_names.contains(name.as_str()));
+
+            // Execute sequential tools
+            for (tool_name, tool_id, tool_args, _raw) in &sequential_calls {
+                if total_tool_calls >= max_tool_calls {
+                    warn!("Max total tool calls reached ({})", max_tool_calls);
+                    let content = strip_think_blocks(&force_final_response(
+                        &client, api_key, api_url, model, &all_messages, &tool_records,
+                        total_tool_calls, temperature,
+                    ).await);
+                    on_update(ToolUpdate::TextChunk(content.clone()));
+                    clear_checkpoint(&sub_agent.session_id).await;
+                    return ToolLoopResult { content, tool_results: tool_records, files: collected_files };
+                }
+
+                if tool_name == "load_skill" { _uses_skill = true; }
+
+                // Loop detection — skip for monitoring tools that are legitimately called repeatedly
+                let is_monitoring_tool = matches!(tool_name.as_str(),
+                    "check_agents" | "bb_read" | "proto_bb_read" | "proto_bus_history" | "proto_queue_peek"
+                );
+                let signature = format!("{}:{}", tool_name, tool_args);
+                if !is_monitoring_tool {
+                    recent_signatures.push(signature.clone());
+                }
+                tool_call_history.push(format!("{}:{}", tool_name, tool_args.to_string().chars().take(100).collect::<String>()));
+                if recent_signatures.len() >= MAX_LOOP_REPEATS {
+                    let tail = &recent_signatures[recent_signatures.len() - MAX_LOOP_REPEATS..];
+                    if tail.iter().all(|s| s == &signature) {
+                        warn!("Loop detected: same tool+args repeated {} times", MAX_LOOP_REPEATS);
+                        on_update(ToolUpdate::Error("Loop detected: same tool call repeated".to_string()));
+                        let content = strip_think_blocks(&force_final_response(
+                            &client, api_key, api_url, model, &all_messages, &tool_records,
+                            total_tool_calls, temperature,
+                        ).await);
+                        on_update(ToolUpdate::TextChunk(content.clone()));
+                        clear_checkpoint(&sub_agent.session_id).await;
+                        return ToolLoopResult { content, tool_results: tool_records, files: collected_files };
+                    }
+                }
+
+                on_update(ToolUpdate::ToolCall { name: tool_name.clone(), args: tool_args.clone() });
+
+                // Log tool call to agent history
+                let args_preview: String = tool_args.to_string().chars().take(200).collect();
+                write_agent_history(&sub_agent.session_id, "TOOL_CALL", json!({
+                    "agent_id": sub_agent.agent_id,
+                    "tool": tool_name,
+                    "args_preview": args_preview,
+                    "round": round,
+                })).await;
+
+                info!("Executing tool: {} (round {})", tool_name, round);
+                let result = execute_tool_dispatch(
+                    tool_name, tool_args, sandbox_dir, &sub_agent, on_update.clone(), realtime,
+                ).await;
+
+                // Track successful agent delegation
+                if tool_name == "send_task" && result.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                    agent_task_sent = true;
+                }
+
+                // Track consecutive errors (skip agent timeouts)
+                let is_agent_timeout = matches!(tool_name.as_str(), "wait_result" | "send_task")
+                    && result.get("error").and_then(|v| v.as_str())
+                        .map(|s| s.to_lowercase().contains("timeout")).unwrap_or(false);
+
+                if (result.get("ok").and_then(|v| v.as_bool()) == Some(false)
+                    || result.get("exit_code").and_then(|v| v.as_i64()) == Some(1))
+                    && !is_agent_timeout
+                {
+                    consecutive_errors += 1;
+                } else if !is_agent_timeout {
+                    consecutive_errors = 0;
+                }
+
+                on_update(ToolUpdate::ToolResult { name: tool_name.clone(), result: result.clone() });
+
+                // Check cancel flag after each tool execution (not just at round start)
+                if sub_agent.cancel_flag.load(Ordering::Relaxed) {
+                    info!("[ToolLoop] Abort signal after tool '{}' — stopping", tool_name);
+                    on_update(ToolUpdate::Error("Task cancelled by user.".to_string()));
+                    let content = if early_content.is_empty() { "Task was cancelled.".to_string() } else { early_content };
+                    return ToolLoopResult { content, tool_results: tool_records, files: collected_files };
+                }
+
+                // Log tool result to agent history
+                {
+                    let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let result_preview: String = result.to_string().chars().take(200).collect();
+                    write_agent_history(&sub_agent.session_id, "TOOL_RESULT", json!({
+                        "agent_id": sub_agent.agent_id,
+                        "tool": tool_name,
+                        "ok": ok,
+                        "result_preview": result_preview,
+                    })).await;
+                }
+
+                // Track file reads for post-compact restoration
+                if tool_name == "read_file" {
+                    if let (Some(path), Some(content)) = (
+                        result.get("path").and_then(|v| v.as_str()),
+                        result.get("content").and_then(|v| v.as_str()),
+                    ) {
+                        compact::track_file_read(path, content);
+                    }
+                }
+
+                tool_records.push(ToolCallRecord { tool: tool_name.clone(), result: result.clone() });
+
+                // After create_architecture or select_swarm: update agent_ids + refresh tools
+                if (tool_name == "create_architecture" || tool_name == "select_swarm")
+                    && result.get("ok").and_then(|v| v.as_bool()) == Some(true)
+                    && !session_activated
+                {
+                    session_activated = true;
+
+                    // Update agent_ids from the result so tool_definitions_for_mode works
+                    if tool_name == "select_swarm" {
+                        // select_swarm returns { agents: [{id, ...}, ...], selected: "filename" }
+                        if let Some(selected) = result.get("selected").and_then(|v| v.as_str()) {
+                            sub_agent.config_file = selected.to_string();
+                        }
+                        if let Some(agents) = result.get("agents").and_then(|v| v.as_array()) {
+                            sub_agent.agent_ids = agents.iter()
+                                .filter_map(|a| a["id"].as_str().map(|s| s.to_string()))
+                                .collect();
+                        }
+                    } else {
+                        // create_architecture returns { filename: "..." }
+                        if let Some(filename) = result.get("filename").and_then(|v| v.as_str()) {
+                            sub_agent.config_file = filename.to_string();
+                            if let Some((_, ids)) = load_agent_yaml(filename) {
+                                sub_agent.agent_ids = ids;
+                            }
+                            // Router mode boots the team here: the orchestrator calls
+                            // create_architecture mid-loop (triage), so there's no UI
+                            // proactive boot like fully_auto. Idempotent — start_realtime_session
+                            // no-ops if the session is already running. Gated to router so
+                            // other modes are unchanged.
+                            if sub_agent.mode == "router" {
+                                boot_realtime_session_deferred(
+                                    sub_agent.session_id.clone(),
+                                    sub_agent.config_file.clone(),
+                                    sub_agent.api_key.clone(),
+                                    sub_agent.api_url.clone(),
+                                    sub_agent.model.clone(),
+                                    sandbox_dir.to_string(),
+                                );
+                            }
+                        }
+                    }
+
+                    info!("[ToolLoop] Session activated via {}, agent_ids={:?}", tool_name, sub_agent.agent_ids);
+
+                    // Refresh tool set to include send_task/wait_result
+                    tools = tool_definitions_for_mode(&sub_agent, true, true);
+                    apply_profile_tool_overrides(&mut tools, &sub_agent);
+                    info!("[ToolLoop] Tools refreshed: {}", tools.iter().filter_map(|td| td["function"]["name"].as_str()).collect::<Vec<_>>().join(", "));
+                }
+
+                // Collect output files
+                if let Some(files) = result.get("output_files").and_then(|v| v.as_array()) {
+                    for f in files {
+                        if let Some(s) = f.as_str() {
+                            if !collected_files.contains(&s.to_string()) {
+                                collected_files.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+
+                // Append tool result message (with smart compression)
+                let max_len = if tool_name == "load_skill" { 3000 } else { tool_result_max_len };
+                let result_str = compact::compress_tool_result(tool_name, &result, max_len);
+                all_messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "content": result_str,
+                }));
+
+                total_tool_calls += 1;
+            }
+
+            // Execute parallel sub-agent tools concurrently (tiger_cowork: Promise.all)
+            if !parallel_calls.is_empty() && total_tool_calls < max_tool_calls {
+                let mut handles = Vec::new();
+                for (tool_name, tool_id, tool_args, _raw) in &parallel_calls {
+                    let name = tool_name.clone();
+                    let id = tool_id.clone();
+                    let args = tool_args.clone();
+                    let sa = sub_agent.clone();
+                    let sd = sandbox_dir.to_string();
+                    let upd = on_update.clone();
+                    let rt = realtime;
+
+                    handles.push(tokio::spawn(async move {
+                        let result = execute_tool_dispatch(&name, &args, &sd, &sa, upd, rt).await;
+                        (name, id, args, result)
+                    }));
+                }
+
+                let results = futures_util::future::join_all(handles).await;
+                for join_result in results {
+                    if let Ok((tool_name, tool_id, tool_args, result)) = join_result {
+                        on_update(ToolUpdate::ToolCall { name: tool_name.clone(), args: tool_args.clone() });
+                        on_update(ToolUpdate::ToolResult { name: tool_name.clone(), result: result.clone() });
+
+                        // Log
+                        let args_preview: String = tool_args.to_string().chars().take(200).collect();
+                        write_agent_history(&sub_agent.session_id, "TOOL_CALL", json!({
+                            "agent_id": sub_agent.agent_id, "tool": &tool_name, "args_preview": args_preview, "round": round,
+                        })).await;
+                        let result_preview: String = result.to_string().chars().take(200).collect();
+                        write_agent_history(&sub_agent.session_id, "TOOL_RESULT", json!({
+                            "agent_id": sub_agent.agent_id, "tool": &tool_name,
+                            "ok": result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+                            "result_preview": result_preview,
+                        })).await;
+
+                        tool_records.push(ToolCallRecord { tool: tool_name.clone(), result: result.clone() });
+
+                        if let Some(files) = result.get("output_files").and_then(|v| v.as_array()) {
+                            for f in files {
+                                if let Some(s) = f.as_str() {
+                                    if !collected_files.contains(&s.to_string()) {
+                                        collected_files.push(s.to_string());
+                                    }
+                                }
+                            }
+                        }
+
+                        let max_len = tool_result_max_len;
+                        let result_str = compact::compress_tool_result(&tool_name, &result, max_len);
+                        all_messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "content": result_str,
+                        }));
+
+                        total_tool_calls += 1;
+                    }
+                }
+            }
+
+            // --- Consecutive error recovery (tiger_cowork: nudge messages) ---
+            if consecutive_errors >= max_consecutive_errors {
+                if error_recovery_attempts < max_error_recoveries {
+                    error_recovery_attempts += 1;
+                    info!("[ToolLoop] {} consecutive errors. Recovery attempt {}/{}...",
+                        max_consecutive_errors, error_recovery_attempts, max_error_recoveries);
+
+                    let recovery_msg = if error_recovery_attempts <= 2 {
+                        format!(
+                            "⚠️ SYSTEM: You have had {} consecutive tool errors. Do NOT give up. \
+                            Analyze the errors above and try a DIFFERENT approach:\n\
+                            1. Check if paths/filenames are correct\n\
+                            2. Try simpler commands\n\
+                            3. Break complex operations into smaller steps\n\
+                            4. If a tool keeps failing, try an alternative tool",
+                            max_consecutive_errors
+                        )
+                    } else {
+                        format!(
+                            "🔴 SYSTEM CRITICAL: Recovery attempt {}/{}. Take a completely different strategy:\n\
+                            1. Abandon the failing approach entirely\n\
+                            2. List what you know works\n\
+                            3. Use only the simplest possible tools\n\
+                            4. If writing code, write minimal test code first",
+                            error_recovery_attempts, max_error_recoveries
+                        )
+                    };
+
+                    all_messages.push(json!({"role": "user", "content": recovery_msg}));
+                    consecutive_errors = 0;
+                } else {
+                    // Final fallback: one more chance
+                    all_messages.push(json!({
+                        "role": "user",
+                        "content": "🚨 SYSTEM FINAL FALLBACK: All recovery attempts exhausted. \
+                            Provide a final answer with whatever partial results you have. \
+                            Do NOT attempt any more tool calls."
+                    }));
+                    consecutive_errors = 0;
+                    error_recovery_attempts = 0;
+                }
+            }
+
+            // --- Max tool calls check ---
+            if total_tool_calls >= max_tool_calls {
+                info!("[ToolLoop] Reached max tool calls ({}). Ending loop.", max_tool_calls);
+                break;
+            }
+
+            // --- Persistent errors after all recoveries ---
+            if consecutive_errors >= max_consecutive_errors && error_recovery_attempts >= max_error_recoveries * 2 {
+                info!("[ToolLoop] Persistent errors after all recovery cycles. Ending loop.");
+                break;
+            }
+
+        } else {
+            // No tool calls — agent wants to stop
+            // But first: check for pending sub-agent work (tiger_cowork)
+            if !sub_agent.session_id.is_empty() {
+                let (working, pending, bb_tasks) = check_pending_work(&sub_agent.session_id).await;
+                let has_pending = !working.is_empty() || !pending.is_empty() || !bb_tasks.is_empty();
+
+                if has_pending {
+                    let agent_names = working.join(", ");
+                    let mut pending_info = String::new();
+                    if !pending.is_empty() {
+                        pending_info = format!("\n\nResults just arrived from your agents:\n{}",
+                            pending.iter().map(|(id, r)| format!("**{}**: {}", id, crate::util::truncate_utf8(&r.result, 3000)))
+                                .collect::<Vec<_>>().join("\n\n")
+                        );
+                    }
+
+                    all_messages.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "⚠️ SYSTEM: Do NOT stop yet — you have {} agent(s) still working [{}], \
+                            {} pending result(s), and {} unfinished blackboard task(s). You MUST:\n\
+                            1. Use bb_read to check bid status, then bb_award to assign open tasks\n\
+                            2. Use send_task to deliver work to awarded agents\n\
+                            3. Use wait_result to collect all agent results\n\
+                            4. Integrate ALL results into your final answer\n\
+                            5. Only finish AFTER all tasks are completed{}",
+                            working.len(), agent_names,
+                            pending.len(), bb_tasks.len(),
+                            pending_info
+                        )
+                    }));
+                    #[allow(unused_assignments)]
+                    { consecutive_errors = 0; }
+                    continue;
+                }
+            }
+
+            // Nudge: if in multi-agent mode and AI never successfully delegated, push it to retry
+            if sub_agent.enabled && !agent_task_sent && !agent_stop_nudged && !sub_agent.agent_ids.is_empty() {
+                agent_stop_nudged = true;
+                let agents_list = sub_agent.agent_ids.join(", ");
+                // Find the orchestrator if it exists
+                let orch_hint = if let Some((yaml, _)) = load_agent_yaml(&sub_agent.config_file) {
+                    yaml.get("agents").and_then(|a| a.as_array()).and_then(|arr|
+                        arr.iter().find(|a| a["role"].as_str() == Some("orchestrator"))
+                            .and_then(|a| a["id"].as_str().map(|s| s.to_string()))
+                    )
+                } else { None };
+                let orch_msg = if let Some(orch_id) = orch_hint {
+                    format!("The orchestrator is '{}'. Send your task to the orchestrator using: send_task({{\"to\": \"{}\", \"task\": \"...\"}})", orch_id, orch_id)
+                } else {
+                    format!("Available agents: [{}]. Use send_task to delegate your task.", agents_list)
+                };
+                warn!("[ToolLoop] AI tried to stop without delegating in multi-agent mode. Nudging to retry.");
+                all_messages.push(json!({
+                    "role": "user",
+                    "content": format!(
+                        "⚠️ SYSTEM: You are in MULTI-AGENT mode but you have NOT delegated any task to your agents yet. \
+                        Do NOT give up or answer directly — you MUST delegate the user's task to agents. \
+                        {}. \
+                        After sending the task, use wait_result to collect the response. \
+                        Then synthesize the agent's results into your final answer.",
+                        orch_msg
+                    )
+                }));
+                consecutive_errors = 0;
+                continue;
+            }
+
+            // Truly done — return final response
+            let mut content = strip_think_blocks(message["content"].as_str().unwrap_or(""));
+            // Some models end with empty content (e.g. text went to reasoning_content,
+            // or a malformed tool call). Never return a blank answer after real work.
+            if content.is_empty() && total_tool_calls > 0 {
+                warn!("[ToolLoop] Empty final content after {} tool calls — forcing final synthesis", total_tool_calls);
+                content = strip_think_blocks(&force_final_response(
+                    &client, api_key, api_url, model, &all_messages, &tool_records,
+                    total_tool_calls, temperature,
+                ).await);
+            }
+            if content.is_empty() && !early_content.is_empty() {
+                content = strip_think_blocks(&early_content);
+            }
+            if content.is_empty() && total_tool_calls > 0 {
+                content = format!(
+                    "The task ran {} tool calls but the model did not produce a final answer. \
+                    Please send the request again or rephrase it.", total_tool_calls
+                );
+            }
+            info!("[ToolLoop] No tool_calls from LLM at round {} — returning text ({} chars)", round, content.len());
+            clear_checkpoint(&sub_agent.session_id).await;
+
+            // --- Evaluation loop (outer job-level judge; legacy reflection) ---
+            // Runs BEFORE the final TextChunk emission so the UI receives the
+            // improved answer, not the pre-evaluation draft. Note checkpoint
+            // was already cleared above — see the comment at completion point A.
+            if effective_eval_config.as_ref().is_some_and(|c| c.should_judge(total_tool_calls))
+                && !content.is_empty()
+            {
+                let eval_cfg = effective_eval_config.as_ref().unwrap();
+                let reflection_result = run_evaluation_loop(
+                    &client, api_key, api_url, model, &mut all_messages, &user_objective,
+                    eval_cfg, temperature, max_tokens,
+                    &tools, &sub_agent, sandbox_dir, on_update.clone(), realtime,
+                    &mut tool_records, &mut collected_files, &mut total_tool_calls,
+                ).await;
+                if let Some(improved) = reflection_result {
+                    let improved = strip_think_blocks(&improved);
+                    if !improved.trim().is_empty() {
+                        content = improved;
+                    }
+                }
+
+                on_update(ToolUpdate::TextChunk(content.clone()));
+                return ToolLoopResult {
+                    content,
+                    tool_results: tool_records,
+                    files: collected_files,
+                };
+            }
+            on_update(ToolUpdate::TextChunk(content.clone()));
+
+            // --- Output file nudge (tiger_cowork: if user wants files but none generated) ---
+            if user_wants_output && collected_files.is_empty() && total_tool_calls > 0 {
+                let nudge_result = run_output_nudge(
+                    &client, api_key, api_url, model, &mut all_messages,
+                    &tools, temperature, max_tokens, &sub_agent, sandbox_dir,
+                    on_update.clone(), realtime,
+                    &mut tool_records, &mut collected_files, &mut total_tool_calls,
+                ).await;
+                if let Some(nudged_content) = nudge_result {
+                    return ToolLoopResult {
+                        content: nudged_content,
+                        tool_results: tool_records,
+                        files: collected_files,
+                    };
+                }
+            }
+
+            return ToolLoopResult {
+                content,
+                tool_results: tool_records,
+                files: collected_files,
+            };
+        }
+    }
+
+    // Exhausted max rounds — force a final text response.
+    // No evaluation here: its remedy is MORE rounds, which would defeat
+    // max_rounds as the hard safety valve exactly when a job is misbehaving.
+    warn!("Tool loop exhausted max rounds ({})", max_rounds);
+    if effective_eval_config.is_some() {
+        info!("[Evaluation] Skipped: max rounds exhausted");
+    }
+    clear_checkpoint(&sub_agent.session_id).await;
+    let content = strip_think_blocks(&force_final_response(
+        &client, api_key, api_url, model, &all_messages, &tool_records,
+        total_tool_calls, temperature,
+    ).await);
+    // Fall back to early_content if force_final_response returned empty
+    let content = if content.is_empty() && !early_content.is_empty() {
+        strip_think_blocks(&early_content)
+    } else {
+        content
+    };
+    // Last resort: never end a long run with a blank answer
+    let content = if content.is_empty() {
+        format!(
+            "The task hit the tool-call limit ({} calls) without producing a final answer. \
+            Partial results may be in the activity log. Please retry or narrow the request.",
+            total_tool_calls
+        )
+    } else {
+        content
+    };
+    on_update(ToolUpdate::TextChunk(content.clone()));
+
+    ToolLoopResult {
+        content,
+        tool_results: tool_records,
+        files: collected_files,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: dispatch tool execution
+// ---------------------------------------------------------------------------
+
+async fn execute_tool_dispatch(
+    tool_name: &str,
+    tool_args: &Value,
+    sandbox_dir: &str,
+    sub_agent: &SubAgentConfig,
+    on_update: Arc<dyn Fn(ToolUpdate) + Send + Sync + 'static>,
+    realtime: bool,
+) -> Value {
+    // Bind the owning session + its cancel flag for the whole dispatch so any
+    // child process spawned inside a tool is tracked and killed when this chat
+    // task is killed (see run_guarded / proc_registry).
+    let ctx = ExecCtx {
+        session_id: sub_agent.session_id.clone(),
+        cancel: sub_agent.cancel_flag.clone(),
+    };
+    EXEC_CTX
+        .scope(
+            ctx,
+            execute_tool_dispatch_inner(
+                tool_name, tool_args, sandbox_dir, sub_agent, on_update, realtime,
+            ),
+        )
+        .await
+}
+
+async fn execute_tool_dispatch_inner(
+    tool_name: &str,
+    tool_args: &Value,
+    sandbox_dir: &str,
+    sub_agent: &SubAgentConfig,
+    on_update: Arc<dyn Fn(ToolUpdate) + Send + Sync + 'static>,
+    _realtime: bool,
+) -> Value {
+    // Per-tool config resolved once for the whole dispatch: the global YAML
+    // file config (data/tools/<name>.yaml `config:`) layered under the
+    // per-profile tools.config.<name> (profile fields win).
+    let effective_cfg = crate::server::services::agent_loop::merge_tool_config(
+        crate::server::services::custom_tools::global_config(tool_name),
+        sub_agent
+            .loop_profile
+            .as_deref()
+            .and_then(|p| p.tool_config(tool_name)),
+    );
+    let tcfg = effective_cfg.as_ref();
+    let protected = is_protected_tool(tool_name, sub_agent);
+
+    // Hard-deny disabled tools. The spec-level filter already hides them from
+    // the model, but models sometimes call tools that were never offered.
+    if !protected && tcfg.and_then(|c| c.enabled) == Some(false) {
+        return json!({
+            "ok": false,
+            "error": format!("Tool '{}' is disabled by the active agent-loop profile", tool_name)
+        });
+    }
+
+    // Merge profile params (defaults + pins) BEFORE the approval gate so the
+    // approval modal shows exactly the arguments that will run.
+    let merged_args: Value = match tcfg {
+        Some(c) if c.params.is_some() || c.pinned_params.is_some() => {
+            if let Some(pins) = &c.pinned_params {
+                let sent = tool_args.as_object();
+                for (k, v) in pins {
+                    if sent.and_then(|o| o.get(k)).map(|old| old != v).unwrap_or(false) {
+                        info!("[profile] pinned_params override on '{}': key '{}'", tool_name, k);
+                    }
+                }
+            }
+            crate::server::services::agent_loop::merge_tool_args(tool_args, c)
+        }
+        _ => tool_args.clone(),
+    };
+    let tool_args = &merged_args;
+
+    // Gate: require user approval for dangerous tools. The profile can fully
+    // override WHETHER a tool is gated (require_approval: true/false; absent =
+    // global tool_requires_approval logic). Protected coordination tools are
+    // never gated: blocking send_task/wait_result mid-swarm deadlocks agents.
+    //
+    // WHO approves is unchanged. Interactive approval is only meaningful for
+    // the foreground "main" agent: it relies on a single global oneshot channel
+    // (APPROVAL_TX/APPROVAL_RX) plus a UI prompt the user actually sees.
+    // Background swarm sub-agents (agent_id != "main") have no UI to approve
+    // them, and routing several concurrent sub-agents through that one global
+    // slot makes each request overwrite the previous receiver — the earlier
+    // agent's oneshot never fires, it blocks for the full 120s timeout, its
+    // result never returns, and every agent waiting on it via wait_result
+    // deadlocks. That is the swarm hang.
+    //
+    // So only the main agent uses the interactive channel. Background sub-agents are
+    // governed by the `auto_approve_subagent_tools` setting (default true) instead.
+    let needs_approval = if protected {
+        false
+    } else {
+        match tcfg.and_then(|c| c.require_approval) {
+            Some(v) => v,
+            None => tool_requires_approval(tool_name).await,
+        }
+    };
+    if needs_approval {
+        let is_main_agent = sub_agent.agent_id.is_empty() || sub_agent.agent_id == "main";
+        let approved = if is_main_agent {
+            request_tool_approval(tool_name, tool_args, &on_update).await
+        } else {
+            crate::server::data::get_settings()
+                .await
+                .auto_approve_subagent_tools
+                .unwrap_or(true)
+        };
+        if !approved {
+            let reason = if is_main_agent {
+                format!("User denied execution of '{}'", tool_name)
+            } else {
+                format!(
+                    "Tool '{}' requires approval but background sub-agents cannot prompt for it. \
+                     Enable `auto_approve_subagent_tools` in settings to let swarm agents run \
+                     sandboxed approval-gated tools, or have this agent complete its task without it.",
+                    tool_name
+                )
+            };
+            return json!({ "ok": false, "error": reason });
+        }
+    }
+
+    let mut result = if tool_name == "spawn_subagent" {
+        exec_spawn_subagent(tool_args, sub_agent, sandbox_dir, on_update).await
+    } else if tool_name == "send_task" {
+        exec_send_task_from(tool_args, &sub_agent.session_id, &sub_agent.agent_id).await
+    } else if tool_name == "wait_result" {
+        exec_wait_result_from(tool_args, &sub_agent.session_id, &sub_agent.agent_id).await
+    } else if tool_name == "check_agents" {
+        exec_check_agents(&sub_agent.session_id).await
+    } else if tool_name == "create_architecture" {
+        exec_create_architecture(tool_args, sub_agent).await
+    } else if tool_name == "select_swarm" {
+        exec_select_swarm(tool_args, sub_agent, sandbox_dir).await
+    } else {
+        let fut = execute_tool_with_context(
+            tool_name, tool_args, sandbox_dir,
+            &sub_agent.session_id, &sub_agent.agent_id,
+        );
+        // Profile wall-clock cap. Dropping the future kills the direct child
+        // process (kill_on_drop in run_guarded), but grandchildren in the
+        // process group may linger until the session's kill_session sweep —
+        // do NOT call kill_session here, it would kill unrelated concurrent
+        // tools of the same session.
+        match tcfg.and_then(|c| c.timeout_secs).filter(|s| *s > 0) {
+            Some(secs) => {
+                match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+                    Ok(v) => v,
+                    Err(_) => json!({
+                        "ok": false,
+                        "error": format!(
+                            "Tool '{}' timed out after {}s (agent-loop profile limit)",
+                            tool_name, secs
+                        )
+                    }),
+                }
+            }
+            None => fut.await,
+        }
+    };
+
+    if let Some(max) = tcfg.and_then(|c| c.max_result_len).filter(|m| *m > 0) {
+        truncate_result_value(&mut result, max as usize);
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Reflection loop (tiger_cowork: post-loop evaluation with outer retry)
+// ---------------------------------------------------------------------------
+
+/// Verdict from an LLM judge call.
+struct JudgeVerdict {
+    score: f64,
+    satisfied: bool,
+    missing: String,
+}
+
+/// Resolved runtime config for the evaluation loop. Built once per job in
+/// call_with_tools_inner (profile > settings.json > defaults). Two flavors:
+/// tool_judge=true is the outer job-level judge (top level only), false is
+/// the legacy text-only reflection judge (any depth).
+struct EvalConfig {
+    tool_judge: bool,
+    threshold: f64,
+    max_retries: usize,
+    max_fix_rounds: usize,
+    max_judge_rounds: usize,
+    judge_model: String,
+    judge_api_url: String,
+    judge_api_key: String,
+    rubric: String,
+    allow_execute: bool,
+    /// Graph mode: judge panel replacing the single judge above. When Some,
+    /// the legacy judge_* fields are unused (each judge carries its own).
+    graph: Option<GraphEvalConfig>,
+}
+
+impl EvalConfig {
+    /// Whether the final answer should be judged. Legacy evaluation only
+    /// judges after real work (tool calls); graph mode gates plain replies
+    /// too when judge_plain_answers is set — gating is its whole point.
+    fn should_judge(&self, total_tool_calls: usize) -> bool {
+        total_tool_calls > 0
+            || self.graph.as_ref().map(|g| g.judge_plain_answers).unwrap_or(false)
+    }
+}
+
+/// Judge panel config resolved from a GraphProfile (creds/rules loaded once
+/// per job; rules_file contents already read from data/graph/rules/).
+struct GraphEvalConfig {
+    judges: Vec<ResolvedJudge>,
+    /// "all_pass" | "majority" | "weighted_average"
+    policy: String,
+    agg_threshold: f64,
+    judge_plain_answers: bool,
+}
+
+struct ResolvedJudge {
+    name: String,
+    model: String,
+    api_url: String,
+    api_key: String,
+    rules: String,
+    weight: f64,
+    threshold: Option<f64>,
+    use_tools: bool,
+    allow_execute: bool,
+    max_judge_rounds: usize,
+}
+
+/// One rule's echo in a graph judge verdict.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RuleResult {
+    #[serde(default)]
+    rule: String,
+    #[serde(default)]
+    pass: bool,
+    #[serde(default)]
+    note: String,
+}
+
+/// Structured YAML verdict returned by a graph judge and fed back to the
+/// worker verbatim (serialized) as revision instructions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct GraphJudgeVerdict {
+    #[serde(default)]
+    judge: String,
+    #[serde(default)]
+    score: f64,
+    #[serde(default)]
+    satisfied: bool,
+    #[serde(default)]
+    missing: String,
+    #[serde(default)]
+    rule_results: Vec<RuleResult>,
+    #[serde(default)]
+    revise: String,
+}
+
+/// Aggregate panel report — serialized to YAML for the revise message.
+#[derive(Debug, Serialize)]
+struct GraphAggregateReport {
+    pass: bool,
+    policy: String,
+    aggregate_score: f64,
+    threshold: f64,
+    judges: Vec<GraphJudgeVerdict>,
+    revise: String,
+}
+
+/// First fenced code block body ("```yaml\n...\n```" or plain "```"), if any.
+/// Byte indices from find() land on ASCII fence chars, so slicing is safe.
+fn extract_fenced_block(text: &str) -> Option<&str> {
+    let start = text.find("```")?;
+    let after = &text[start + 3..];
+    let nl = after.find('\n')?;
+    let body = &after[nl + 1..];
+    let end = body.find("```")?;
+    Some(&body[..end])
+}
+
+/// Parse a graph judge's structured YAML verdict. Accepts a fenced YAML block
+/// or bare YAML (YAML is a JSON superset, so JSON verdicts parse too); falls
+/// back to the legacy JSON-substring scan. None = fail open, like the legacy
+/// parser. A candidate only counts when it carries score or satisfied, so
+/// stray "key: value" prose can't masquerade as a verdict.
+fn parse_graph_verdict(content: &str) -> Option<GraphJudgeVerdict> {
+    let stripped = strip_think_blocks(content);
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(block) = extract_fenced_block(&stripped) {
+        candidates.push(block);
+    }
+    candidates.push(&stripped);
+    for candidate in candidates {
+        if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(candidate) {
+            let is_verdict = v.as_mapping().map(|m| {
+                m.contains_key(serde_yaml::Value::String("score".into()))
+                    || m.contains_key(serde_yaml::Value::String("satisfied".into()))
+            }) == Some(true);
+            if is_verdict {
+                if let Ok(doc) = serde_yaml::from_value::<GraphJudgeVerdict>(v) {
+                    return Some(doc);
+                }
+            }
+        }
+    }
+    parse_judge_verdict(&stripped)
+        .or_else(|| parse_judge_verdict(content))
+        .map(|v| GraphJudgeVerdict {
+            judge: String::new(),
+            score: v.score,
+            satisfied: v.satisfied,
+            missing: v.missing,
+            rule_results: Vec::new(),
+            revise: String::new(),
+        })
+}
+
+/// Combine panel verdicts into (pass, aggregate_score, report_yaml).
+/// Judges with weight <= 0 are ignored (unless every judge has weight <= 0,
+/// in which case all count with weight 1 — a profile of ignored judges would
+/// otherwise silently pass everything).
+fn aggregate_verdicts(
+    judges: &[ResolvedJudge],
+    verdicts: &[(usize, GraphJudgeVerdict)],
+    policy: &str,
+    agg_threshold: f64,
+) -> (bool, f64, String) {
+    let all_ignored = verdicts.iter().all(|(i, _)| judges[*i].weight <= 0.0);
+    let considered: Vec<&(usize, GraphJudgeVerdict)> = verdicts
+        .iter()
+        .filter(|(i, _)| all_ignored || judges[*i].weight > 0.0)
+        .collect();
+    let weight_of = |i: usize| if all_ignored { 1.0 } else { judges[i].weight };
+    let judge_passes = |i: usize, v: &GraphJudgeVerdict| {
+        v.satisfied || v.score >= judges[i].threshold.unwrap_or(agg_threshold)
+    };
+
+    let total_weight: f64 = considered.iter().map(|(i, _)| weight_of(*i)).sum();
+    let aggregate_score = if total_weight > 0.0 {
+        considered.iter().map(|(i, v)| weight_of(*i) * v.score).sum::<f64>() / total_weight
+    } else {
+        0.0
+    };
+    let pass_count = considered.iter().filter(|(i, v)| judge_passes(*i, v)).count();
+    let pass = match policy {
+        "majority" => pass_count * 2 > considered.len(),
+        "weighted_average" => aggregate_score >= agg_threshold,
+        _ => pass_count == considered.len(), // all_pass (default)
+    };
+
+    let revise = considered
+        .iter()
+        .filter(|(i, v)| !judge_passes(*i, v))
+        .map(|(_, v)| {
+            let instr = if v.revise.trim().is_empty() { &v.missing } else { &v.revise };
+            format!("[{}] {}", v.judge, instr.trim())
+        })
+        .filter(|s| !s.ends_with("] "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = GraphAggregateReport {
+        pass,
+        policy: policy.to_string(),
+        aggregate_score,
+        threshold: agg_threshold,
+        judges: verdicts.iter().map(|(_, v)| v.clone()).collect(),
+        revise,
+    };
+    let yaml = serde_yaml::to_string(&report).unwrap_or_else(|_| {
+        format!("pass: {}\naggregate_score: {:.2}\n", pass, aggregate_score)
+    });
+    (pass, aggregate_score, yaml)
+}
+
+/// Extract the verdict JSON from a judge reply. Shared by the text-only and
+/// tool-using judges. Returns None (fail open) when no JSON can be parsed.
+fn parse_judge_verdict(content: &str) -> Option<JudgeVerdict> {
+    let json_str = content.find('{')
+        .and_then(|start| content.rfind('}').map(|end| &content[start..=end]));
+    let parsed: Value = match json_str.and_then(|s| serde_json::from_str(s).ok()) {
+        Some(p) => p,
+        None => {
+            warn!("[Judge] Could not parse verdict — failing open");
+            return None;
+        }
+    };
+    Some(JudgeVerdict {
+        score: parsed["score"].as_f64().unwrap_or(1.0),
+        satisfied: parsed["satisfied"].as_bool().unwrap_or(false),
+        missing: parsed["missing"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// Summarize tool-call records for a judge prompt: most recent records first
+/// (newest are the most relevant after a gap-fix pass), capped in total size.
+fn summarize_tool_records(records: &[ToolCallRecord]) -> String {
+    const SUMMARY_MAX_RECORDS: usize = 40;
+    const SUMMARY_MAX_CHARS: usize = 8000;
+    let mut tool_summary = String::new();
+    let skipped = records.len().saturating_sub(SUMMARY_MAX_RECORDS);
+    if skipped > 0 {
+        tool_summary.push_str(&format!("[... {} earlier tool calls omitted ...]\n", skipped));
+    }
+    for tr in records.iter().skip(skipped) {
+        let r = &tr.result;
+        let line = if let Some(files) = r.get("output_files").and_then(|v| v.as_array()).filter(|f| !f.is_empty()) {
+            let fnames: Vec<&str> = files.iter().filter_map(|f| f.as_str()).collect();
+            format!("[{}] Generated: {}", tr.tool, fnames.join(", "))
+        } else if r.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            format!("[{}] Error: {}", tr.tool, r.get("error").and_then(|v| v.as_str()).unwrap_or("failed"))
+        } else if let Some(stdout) = r.get("stdout").and_then(|v| v.as_str()) {
+            format!("[{}] {}", tr.tool, crate::util::truncate_utf8(stdout, 300))
+        } else {
+            let r_str = serde_json::to_string(r).unwrap_or_default();
+            format!("[{}] {}", tr.tool, crate::util::truncate_utf8(&r_str, 300))
+        };
+        if tool_summary.len() + line.len() > SUMMARY_MAX_CHARS { break; }
+        tool_summary.push_str(&line);
+        tool_summary.push('\n');
+    }
+    tool_summary
+}
+
+/// Score how well `answer` satisfies `objective`, with `evidence` (tool summary
+/// + files) as ground truth. Near-deterministic, small reply. Returns None when
+/// the judge call or parse fails — callers fail open (treat as satisfied).
+async fn judge_task_result(
+    client: &Client,
+    api_key: &str,
+    api_url: &str,
+    model: &str,
+    objective: &str,
+    evidence: &str,
+    answer: &str,
+    judge_role: &str, // e.g. "the user's objective" or "its assigned task"
+) -> Option<JudgeVerdict> {
+    let eval_messages = vec![
+        json!({"role": "system", "content": format!(
+            "You are a strict evaluation judge. Score how well the FINAL ANSWER satisfies {}. \
+            Judge the answer the reader will receive, not the effort spent. Output ONLY the JSON object.",
+            judge_role
+        )}),
+        json!({"role": "user", "content": format!(
+            "OBJECTIVE:\n{}\n\n\
+            EVIDENCE (tool calls and generated files):\n{}\n\n\
+            FINAL ANSWER:\n{}\n\n\
+            Respond in EXACTLY this JSON format (no other text):\n\
+            {{\"score\": <0.0-1.0>, \"satisfied\": <true/false>, \"missing\": \"<concrete, actionable list of what is missing or wrong; empty string if satisfied>\"}}\n\n\
+            Checklist before scoring:\n\
+            - Break the objective into its distinct parts; every part must be addressed in the FINAL ANSWER itself.\n\
+            - Claimed results must be backed by the evidence above (no fabricated data).\n\
+            - If files/charts were requested, they must appear in the evidence.\n\
+            - An answer that only describes what it WOULD do is NOT satisfied.\n\n\
+            Scoring guide:\n\
+            - 1.0: Fully satisfied, all parts addressed\n\
+            - 0.7-0.9: Mostly satisfied, minor gaps\n\
+            - 0.4-0.6: Partially satisfied, significant gaps\n\
+            - 0.0-0.3: Not satisfied, major parts missing",
+            objective, evidence, answer
+        )}),
+    ];
+
+    let eval_data = match llm_call(client, api_key, api_url, model, &eval_messages, None, 0.1, 1024).await {
+        Ok(d) => d,
+        Err(e) => {
+            error!("[Judge] Eval call failed: {}", e);
+            return None;
+        }
+    };
+    let eval_content = eval_data["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    info!("[Judge] Raw eval: {}", crate::util::truncate_utf8(eval_content, 300));
+    parse_judge_verdict(eval_content)
+}
+
+/// Tool-using job judge: may call read-only tools (read_file/list_files, plus
+/// run_python/run_shell when allow_execute) through a small bespoke loop to
+/// verify claimed artifacts actually exist before scoring. Deliberately NOT
+/// routed through call_with_tools: no recursion (so it can never re-enter
+/// evaluation) and no approval gates, which is safe because the allowlist is
+/// read-only by default. Returns None (fail open) on judge/parse failure.
+#[allow(clippy::too_many_arguments)]
+async fn judge_job_with_tools(
+    client: &Client,
+    cfg: &EvalConfig,
+    objective: &str,
+    evidence: &str,
+    answer: &str,
+    sandbox_dir: &str,
+    sub_agent: &SubAgentConfig,
+    on_update: Arc<dyn Fn(ToolUpdate) + Send + Sync + 'static>,
+) -> Option<JudgeVerdict> {
+    let mut allowed: Vec<&str> = vec!["read_file", "list_files"];
+    if cfg.allow_execute {
+        allowed.extend(["run_python", "run_shell"]);
+    }
+    let judge_tools: Vec<Value> = tool_definitions().into_iter()
+        .filter(|t| t["function"]["name"].as_str().map(|n| allowed.contains(&n)).unwrap_or(false))
+        .collect();
+
+    let rubric_section = if cfg.rubric.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "SUCCESS CRITERIA (mandatory rubric set by the user's configuration):\n{}\n\n",
+            cfg.rubric
+        )
+    };
+    // The rubric must be BINDING: judge models otherwise treat it as advisory
+    // and pass answers that satisfy the chat message but fail the criteria.
+    let rubric_rule = if cfg.rubric.trim().is_empty() {
+        ""
+    } else {
+        "- The SUCCESS CRITERIA are mandatory requirements IN ADDITION to the objective, even if the \
+        objective itself does not mention them. Verify each criterion with tools. If ANY criterion is \
+        not met, set satisfied=false, cap the score at 0.5, and name the unmet criterion in \"missing\".\n"
+    };
+    // Rubric enforcement lives in the SYSTEM prompt: judges anchor on
+    // "satisfies the objective" and ignore extra criteria buried mid-message.
+    let system_content = if cfg.rubric.trim().is_empty() {
+        "You are a strict evaluation judge. Score how well the FINAL ANSWER satisfies the user's objective. \
+        You may call the provided tools to verify that claimed files/artifacts actually exist and match the \
+        claims BEFORE scoring (paths are relative to the working directory). Judge the answer the reader \
+        will receive, not the effort spent. When done verifying, output ONLY the verdict JSON object.".to_string()
+    } else {
+        format!(
+            "You are a strict evaluation judge. Score how well the FINAL ANSWER satisfies BOTH the user's \
+            objective AND every one of these MANDATORY SUCCESS CRITERIA:\n{}\n\
+            The criteria are requirements in addition to the objective, even if the objective does not mention \
+            them. Use the provided tools to verify each criterion and each claimed file/artifact (paths are \
+            relative to the working directory) BEFORE scoring. If ANY criterion is not met, you MUST set \
+            satisfied=false, cap the score at 0.5, and name the unmet criterion in \"missing\" — a perfect \
+            answer to the objective alone still fails. When done verifying, output ONLY the verdict JSON object.",
+            cfg.rubric
+        )
+    };
+    let mut msgs = vec![
+        json!({"role": "system", "content": system_content}),
+        json!({"role": "user", "content": format!(
+            "OBJECTIVE:\n{}\n\n\
+            {}EVIDENCE (tool calls and generated files):\n{}\n\n\
+            FINAL ANSWER:\n{}\n\n\
+            Verify what you need with tools, then respond in EXACTLY this JSON format (no other text):\n\
+            {{\"score\": <0.0-1.0>, \"satisfied\": <true/false>, \"missing\": \"<concrete, actionable list of what is missing or wrong; empty string if satisfied>\"}}\n\n\
+            Checklist before scoring:\n\
+            {}- Break the objective into its distinct parts; every part must be addressed in the FINAL ANSWER itself.\n\
+            - Claimed results must be backed by the evidence above or by your own tool checks (no fabricated data).\n\
+            - If files/charts were requested, verify they exist with list_files/read_file.\n\
+            - An answer that only describes what it WOULD do is NOT satisfied.\n\n\
+            Scoring guide:\n\
+            - 1.0: Fully satisfied, all parts addressed\n\
+            - 0.7-0.9: Mostly satisfied, minor gaps\n\
+            - 0.4-0.6: Partially satisfied, significant gaps\n\
+            - 0.0-0.3: Not satisfied, major parts missing",
+            objective, rubric_section, evidence, answer, rubric_rule
+        )}),
+    ];
+
+    for _judge_round in 0..cfg.max_judge_rounds {
+        if sub_agent.cancel_flag.load(Ordering::Relaxed) {
+            info!("[Judge] Abort signal — skipping tool-judge");
+            return None;
+        }
+        let data = match llm_call(client, &cfg.judge_api_key, &cfg.judge_api_url, &cfg.judge_model, &msgs, Some(&judge_tools), 0.1, 1024).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("[Judge] Tool-judge call failed: {}", e);
+                return None;
+            }
+        };
+        let message = data["choices"][0]["message"].clone();
+        // Some APIs reject assistant messages with empty content (same patch
+        // as the main loop applies).
+        let mut assistant_msg = message.clone();
+        if assistant_msg["content"].as_str().unwrap_or("").is_empty() {
+            assistant_msg["content"] = json!("(verifying...)");
+        }
+        msgs.push(assistant_msg);
+
+        let calls = message["tool_calls"].as_array().filter(|c| !c.is_empty()).cloned();
+        let Some(calls) = calls else {
+            let content = message["content"].as_str().unwrap_or("");
+            info!("[Judge] Raw eval (tool-judge): {}", crate::util::truncate_utf8(content, 300));
+            let stripped = strip_think_blocks(content);
+            if let Some(v) = parse_judge_verdict(&stripped).or_else(|| parse_judge_verdict(content)) {
+                return Some(v);
+            }
+            // Text reply without a verdict (thinking models often narrate a
+            // round without calling tools) — nudge and spend another judge
+            // round rather than failing open.
+            msgs.push(json!({"role": "user", "content":
+                "Continue verifying with the tools if needed, or output ONLY the verdict JSON now."}));
+            continue;
+        };
+        for call in &calls {
+            let name = call["function"]["name"].as_str().unwrap_or("unknown");
+            let args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+            let id = call["id"].as_str().unwrap_or("");
+            let result = if allowed.contains(&name) {
+                info!("[Judge] Verifying with {}", name);
+                // Surface judge verification in the activity log so users can
+                // see the evaluator working (prefixed to distinguish from the
+                // worker's own tool calls).
+                on_update(ToolUpdate::ToolCall { name: format!("evaluator:{}", name), args: args.clone() });
+                let r = execute_tool_with_context(name, &args, sandbox_dir, &sub_agent.session_id, "evaluator").await;
+                on_update(ToolUpdate::ToolResult { name: format!("evaluator:{}", name), result: r.clone() });
+                r
+            } else {
+                json!({"ok": false, "error": format!("tool '{}' is not allowed for the evaluator", name)})
+            };
+            let result_str = compact::compress_tool_result(name, &result, 4000);
+            msgs.push(json!({"role": "tool", "tool_call_id": id, "content": result_str}));
+        }
+    }
+
+    // Verification budget exhausted — demand the verdict with no tools.
+    msgs.push(json!({"role": "user", "content": "Verification budget exhausted. Output ONLY the verdict JSON now."}));
+    match llm_call(client, &cfg.judge_api_key, &cfg.judge_api_url, &cfg.judge_model, &msgs, None, 0.1, 1024).await {
+        Ok(d) => {
+            let content = d["choices"][0]["message"]["content"].as_str().unwrap_or("");
+            info!("[Judge] Raw eval (tool-judge, forced): {}", crate::util::truncate_utf8(content, 300));
+            parse_judge_verdict(&strip_think_blocks(content)).or_else(|| parse_judge_verdict(content))
+        }
+        Err(e) => {
+            error!("[Judge] Final verdict call failed: {}", e);
+            None
+        }
+    }
+}
+
+/// One graph judge's review: verify the final answer against the judge's YAML
+/// rules and return a structured YAML verdict. use_tools=true runs the same
+/// bespoke read-only tool loop as judge_job_with_tools (never routed through
+/// call_with_tools — no recursion, no approval gates); use_tools=false is a
+/// single near-deterministic call. Returns None (fail open) on any failure.
+#[allow(clippy::too_many_arguments)]
+async fn run_graph_judge(
+    client: &Client,
+    judge: &ResolvedJudge,
+    objective: &str,
+    evidence: &str,
+    answer: &str,
+    sandbox_dir: &str,
+    sub_agent: &SubAgentConfig,
+    on_update: Arc<dyn Fn(ToolUpdate) + Send + Sync + 'static>,
+) -> Option<GraphJudgeVerdict> {
+    let verdict_format = format!(
+        "judge: {}\n\
+        score: <0.0-1.0>\n\
+        satisfied: <true|false>\n\
+        rule_results:\n\
+        \x20 - rule: <rule id>\n\
+        \x20   pass: <true|false>\n\
+        \x20   note: \"<short reason>\"\n\
+        missing: \"<concrete, actionable list of what is missing or wrong; empty if satisfied>\"\n\
+        revise: \"<concrete instructions telling the worker how to fix the answer; empty if satisfied>\"",
+        judge.name
+    );
+    let rules_section = if judge.rules.trim().is_empty() {
+        String::new()
+    } else {
+        format!("RULES (mandatory — verify each one, echo each rule id in rule_results):\n{}\n\n", judge.rules)
+    };
+    // Rules are BINDING and live in the SYSTEM prompt, like the legacy rubric:
+    // judges anchor on "satisfies the objective" and treat mid-message
+    // criteria as advisory otherwise.
+    let system_content = format!(
+        "You are '{}', a strict evaluation judge in a review panel. The FINAL ANSWER below is about to be \
+        delivered to the human; decide whether it may pass. Score how well it satisfies the user's objective{}\
+        Judge the answer the reader will receive, not the effort spent. An answer that only describes what it \
+        WOULD do is NOT satisfied. If ANY blocker-severity rule fails, set satisfied=false and cap the score at 0.5. \
+        When done, output ONLY the verdict as a YAML document in exactly this shape:\n{}",
+        judge.name,
+        if judge.rules.trim().is_empty() {
+            ". ".to_string()
+        } else {
+            format!(
+                " AND every one of these MANDATORY RULES:\n{}\nThe rules are requirements in addition to the \
+                objective, even if the objective does not mention them. ",
+                judge.rules
+            )
+        },
+        verdict_format
+    );
+    let user_content = format!(
+        "OBJECTIVE:\n{}\n\n\
+        {}EVIDENCE (tool calls and generated files):\n{}\n\n\
+        FINAL ANSWER:\n{}\n\n\
+        Respond with ONLY the verdict YAML (no prose around it).",
+        objective, rules_section, evidence, answer
+    );
+
+    if !judge.use_tools {
+        let msgs = vec![
+            json!({"role": "system", "content": system_content}),
+            json!({"role": "user", "content": user_content}),
+        ];
+        let data = match llm_call(client, &judge.api_key, &judge.api_url, &judge.model, &msgs, None, 0.1, 2048).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("[Graph] Judge '{}' call failed: {}", judge.name, e);
+                return None;
+            }
+        };
+        let content = data["choices"][0]["message"]["content"].as_str().unwrap_or("");
+        info!("[Graph] Judge '{}' raw verdict: {}", judge.name, crate::util::truncate_utf8(content, 300));
+        return parse_graph_verdict(content);
+    }
+
+    let mut allowed: Vec<&str> = vec!["read_file", "list_files"];
+    if judge.allow_execute {
+        allowed.extend(["run_python", "run_shell"]);
+    }
+    let judge_tools: Vec<Value> = tool_definitions().into_iter()
+        .filter(|t| t["function"]["name"].as_str().map(|n| allowed.contains(&n)).unwrap_or(false))
+        .collect();
+    let mut msgs = vec![
+        json!({"role": "system", "content": format!(
+            "{}\nYou may call the provided tools to verify that claimed files/artifacts actually exist and \
+            match the claims BEFORE scoring (paths are relative to the working directory).", system_content
+        )}),
+        json!({"role": "user", "content": format!(
+            "{}\nVerify what you need with tools first, then output ONLY the verdict YAML.", user_content
+        )}),
+    ];
+
+    for _judge_round in 0..judge.max_judge_rounds {
+        if sub_agent.cancel_flag.load(Ordering::Relaxed) {
+            info!("[Graph] Abort signal — skipping judge '{}'", judge.name);
+            return None;
+        }
+        let data = match llm_call(client, &judge.api_key, &judge.api_url, &judge.model, &msgs, Some(&judge_tools), 0.1, 2048).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("[Graph] Judge '{}' call failed: {}", judge.name, e);
+                return None;
+            }
+        };
+        let message = data["choices"][0]["message"].clone();
+        let mut assistant_msg = message.clone();
+        if assistant_msg["content"].as_str().unwrap_or("").is_empty() {
+            assistant_msg["content"] = json!("(verifying...)");
+        }
+        msgs.push(assistant_msg);
+
+        let calls = message["tool_calls"].as_array().filter(|c| !c.is_empty()).cloned();
+        let Some(calls) = calls else {
+            let content = message["content"].as_str().unwrap_or("");
+            info!("[Graph] Judge '{}' raw verdict: {}", judge.name, crate::util::truncate_utf8(content, 300));
+            if let Some(v) = parse_graph_verdict(content) {
+                return Some(v);
+            }
+            // Narration without a verdict — nudge, spend another round.
+            msgs.push(json!({"role": "user", "content":
+                "Continue verifying with the tools if needed, or output ONLY the verdict YAML now."}));
+            continue;
+        };
+        for call in &calls {
+            let name = call["function"]["name"].as_str().unwrap_or("unknown");
+            let args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+            let id = call["id"].as_str().unwrap_or("");
+            let display = format!("judge:{}:{}", judge.name, name);
+            let result = if allowed.contains(&name) {
+                on_update(ToolUpdate::ToolCall { name: display.clone(), args: args.clone() });
+                let r = execute_tool_with_context(name, &args, sandbox_dir, &sub_agent.session_id, "evaluator").await;
+                on_update(ToolUpdate::ToolResult { name: display, result: r.clone() });
+                r
+            } else {
+                json!({"ok": false, "error": format!("tool '{}' is not allowed for the judge", name)})
+            };
+            let result_str = compact::compress_tool_result(name, &result, 4000);
+            msgs.push(json!({"role": "tool", "tool_call_id": id, "content": result_str}));
+        }
+    }
+
+    msgs.push(json!({"role": "user", "content": "Verification budget exhausted. Output ONLY the verdict YAML now."}));
+    match llm_call(client, &judge.api_key, &judge.api_url, &judge.model, &msgs, None, 0.1, 2048).await {
+        Ok(d) => {
+            let content = d["choices"][0]["message"]["content"].as_str().unwrap_or("");
+            info!("[Graph] Judge '{}' forced verdict: {}", judge.name, crate::util::truncate_utf8(content, 300));
+            parse_graph_verdict(content)
+        }
+        Err(e) => {
+            error!("[Graph] Judge '{}' final verdict call failed: {}", judge.name, e);
+            None
+        }
+    }
+}
+
+/// Outer evaluation / legacy reflection loop: judge the final result against
+/// the user objective; below cfg.threshold, inject the gap list and grant
+/// bounded extra tool rounds (the orchestrator can re-delegate targeted fixes),
+/// then re-judge. cfg.tool_judge selects the tool-using job judge (top level
+/// only) vs the legacy text-only judge. The judge itself is restricted; the
+/// gap-fix rounds keep the worker's full toolset and approval gates.
+#[allow(clippy::too_many_arguments)]
+async fn run_evaluation_loop(
+    client: &Client,
+    api_key: &str,
+    api_url: &str,
+    model: &str,
+    all_messages: &mut Vec<Value>,
+    user_objective: &str,
+    cfg: &EvalConfig,
+    temperature: f64,
+    max_tokens: u64,
+    tools: &[Value],
+    sub_agent: &SubAgentConfig,
+    sandbox_dir: &str,
+    on_update: Arc<dyn Fn(ToolUpdate) + Send + Sync + 'static>,
+    realtime: bool,
+    tool_records_mut: &mut Vec<ToolCallRecord>,
+    collected_files: &mut Vec<String>,
+    total_tool_calls: &mut usize,
+) -> Option<String> {
+    // Outer retry loop (tiger_cowork: maxReflectionRetries, default 2)
+    for retry_round in 0..cfg.max_retries {
+        if sub_agent.cancel_flag.load(Ordering::Relaxed) {
+            info!("[Evaluation] Abort signal — skipping evaluation");
+            break;
+        }
+        info!("[Evaluation] Round {}/{} — evaluating objective satisfaction...", retry_round + 1, cfg.max_retries);
+
+        let mut evidence = summarize_tool_records(tool_records_mut);
+        evidence.push_str(&format!(
+            "FILES GENERATED: {}",
+            if collected_files.is_empty() { "(none)".to_string() } else { collected_files.join(", ") }
+        ));
+
+        let last_assistant = all_messages.iter().rev()
+            .find(|m| m["role"].as_str() == Some("assistant"))
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or("(none)");
+
+        // Feedback message injected on a failing verdict. Role must be "user":
+        // several OpenAI-compatible APIs reject system messages mid-conversation
+        // (consistent with the other loop nudges). Both branches break out of
+        // the retry loop on pass or judge failure (fail open).
+        let gap_message: String = if let Some(g) = &cfg.graph {
+            // --- Graph judge panel: sequential, each judge fails open ---
+            let mut verdicts: Vec<(usize, GraphJudgeVerdict)> = Vec::new();
+            for (i, judge) in g.judges.iter().enumerate() {
+                if sub_agent.cancel_flag.load(Ordering::Relaxed) {
+                    info!("[Graph] Abort signal — skipping judge panel");
+                    return None;
+                }
+                match run_graph_judge(
+                    client, judge, user_objective, &evidence, last_assistant,
+                    sandbox_dir, sub_agent, on_update.clone(),
+                ).await {
+                    Some(mut v) => {
+                        v.judge = judge.name.clone();
+                        info!("[Graph] Judge '{}': score {:.2}, satisfied {}", judge.name, v.score, v.satisfied);
+                        verdicts.push((i, v));
+                    }
+                    None => warn!("[Graph] Judge '{}' failed — skipped (fail open)", judge.name),
+                }
+            }
+            if verdicts.is_empty() {
+                warn!("[Graph] Every judge failed — releasing answer (fail open)");
+                break;
+            }
+            let (pass, agg_score, report_yaml) =
+                aggregate_verdicts(&g.judges, &verdicts, &g.policy, g.agg_threshold);
+            if pass {
+                info!("[Graph] Panel passed — policy {}, aggregate {:.2}", g.policy, agg_score);
+                on_update(ToolUpdate::TextChunk(format!(
+                    "[graph] ✓ Passed — {} judge(s), policy {}, aggregate score {:.2} (threshold {:.2})\n\n",
+                    verdicts.len(), g.policy, agg_score, g.agg_threshold
+                )));
+                break;
+            }
+            info!("[Graph] Panel rejected (iteration {}/{}) — aggregate {:.2}", retry_round + 1, cfg.max_retries, agg_score);
+            on_update(ToolUpdate::TextChunk(format!(
+                "[graph] ✗ Rejected (iteration {}/{}) — aggregate score {:.2}, policy {} — revising...\n",
+                retry_round + 1, cfg.max_retries, agg_score, g.policy
+            )));
+            format!(
+                "⚠️ GRAPH EVALUATION CHECK (iteration {}/{}): a judge panel reviewed your final answer before \
+                delivery and REJECTED it. Structured verdict:\n```yaml\n{}```\n\
+                Follow the `revise` instructions and fix every failed rule — do not redo completed work. If you \
+                are coordinating agents, delegate the fixes as targeted tasks (send_task/spawn_subagent) and wait \
+                for the results. Then give a COMPLETE final answer that includes both your previous results and the fixes.",
+                retry_round + 1, cfg.max_retries, report_yaml
+            )
+        } else {
+            // --- Legacy single judge ---
+            let verdict = if cfg.tool_judge {
+                judge_job_with_tools(
+                    client, cfg, user_objective, &evidence, last_assistant,
+                    sandbox_dir, sub_agent, on_update.clone(),
+                ).await
+            } else {
+                judge_task_result(
+                    client, &cfg.judge_api_key, &cfg.judge_api_url, &cfg.judge_model,
+                    user_objective, &evidence, last_assistant,
+                    "the user's objective",
+                ).await
+            };
+            let verdict = match verdict {
+                Some(v) => v,
+                None => break, // judge failed → fail open (treat as satisfied)
+            };
+            let (score, satisfied, missing) = (verdict.score, verdict.satisfied, verdict.missing);
+
+            info!("[Evaluation] Score: {:.2}, Satisfied: {}, Missing: {}", score, satisfied, crate::util::truncate_utf8(&missing, 200));
+
+            if score >= cfg.threshold || satisfied {
+                info!("[Evaluation] Score {:.2} >= threshold {:.2}. Objective satisfied.", score, cfg.threshold);
+                // Make a PASSING evaluation visible too — without this, users
+                // can't tell the eval loop ran at all (logs go to stderr, which
+                // Finder-launched apps discard).
+                on_update(ToolUpdate::TextChunk(format!(
+                    "[evaluation] ✓ Passed — score {:.2}/1.0 (threshold {:.2})\n\n",
+                    score, cfg.threshold
+                )));
+                break;
+            }
+
+            // Score below threshold — re-enter agent loop to address gaps.
+            info!("[Evaluation] Score {:.2} < threshold {:.2}. Re-entering agent loop...", score, cfg.threshold);
+            on_update(ToolUpdate::TextChunk(format!(
+                "[evaluation] Score {:.1}/1.0 — addressing gaps: {}",
+                score, crate::util::truncate_utf8(&missing, 200)
+            )));
+
+            format!(
+                "⚠️ SYSTEM EVALUATION CHECK: Your answer scored {:.1}/1.0 (threshold: {:.1}). The evaluation found these gaps:\n{}\n\n\
+                Address ONLY what is missing — do not redo completed work. If you are coordinating agents, \
+                delegate the missing pieces as targeted fix-up tasks (send_task/spawn_subagent) and wait for \
+                the results. Then give a COMPLETE final answer that includes both your previous results and the fixes.",
+                score, cfg.threshold, missing
+            )
+        };
+
+        all_messages.push(json!({"role": "user", "content": gap_message}));
+
+        // Run additional tool rounds to address the gaps (tiger_cowork: up to 5)
+        for _extra_round in 0..cfg.max_fix_rounds {
+            if sub_agent.cancel_flag.load(Ordering::Relaxed) {
+                info!("[Evaluation] Abort signal during gap-fix rounds");
+                return None;
+            }
+            let resp = match llm_call(client, api_key, api_url, model, all_messages, Some(tools), temperature, max_tokens).await {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("[Evaluation retry] LLM call failed: {}", e);
+                    break;
+                }
+            };
+
+            let message = &resp["choices"][0]["message"];
+            all_messages.push(message.clone());
+
+            if let Some(calls) = message["tool_calls"].as_array() {
+                if calls.is_empty() {
+                    break; // LLM done, loop back to re-evaluate
+                }
+                for call in calls {
+                    let name = call["function"]["name"].as_str().unwrap_or("unknown");
+                    let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
+                    let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                    let id = call["id"].as_str().unwrap_or("");
+
+                    on_update(ToolUpdate::ToolCall { name: name.to_string(), args: args.clone() });
+                    let result = execute_tool_dispatch(name, &args, sandbox_dir, sub_agent, on_update.clone(), realtime).await;
+                    on_update(ToolUpdate::ToolResult { name: name.to_string(), result: result.clone() });
+                    tool_records_mut.push(ToolCallRecord { tool: name.to_string(), result: result.clone() });
+
+                    if let Some(files) = result.get("output_files").and_then(|v| v.as_array()) {
+                        for f in files {
+                            if let Some(s) = f.as_str() {
+                                if !collected_files.contains(&s.to_string()) {
+                                    collected_files.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    let result_str = compact::compress_tool_result(name, &result, 6000);
+                    all_messages.push(json!({"role": "tool", "tool_call_id": id, "content": result_str}));
+                    *total_tool_calls += 1;
+                }
+            } else {
+                break; // No tool calls, done with this round
+            }
+        }
+        // Loop back to re-evaluate
+    }
+
+    // Return the last assistant message with real text content (gap-fix rounds
+    // can leave tool-call messages with null content at the tail).
+    all_messages.iter().rev()
+        .filter(|m| m["role"].as_str() == Some("assistant"))
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| !c.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Output file nudge (tiger_cowork: nudge agent to generate files)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn run_output_nudge(
+    client: &Client,
+    api_key: &str,
+    api_url: &str,
+    model: &str,
+    all_messages: &mut Vec<Value>,
+    tools: &[Value],
+    temperature: f64,
+    max_tokens: u64,
+    sub_agent: &SubAgentConfig,
+    sandbox_dir: &str,
+    on_update: Arc<dyn Fn(ToolUpdate) + Send + Sync + 'static>,
+    realtime: bool,
+    tool_records: &mut Vec<ToolCallRecord>,
+    collected_files: &mut Vec<String>,
+    total_tool_calls: &mut usize,
+) -> Option<String> {
+    all_messages.push(json!({
+        "role": "system",
+        "content": "IMPORTANT: The user asked for charts/graphs but you haven't generated output files yet. \
+            Call run_python to create matplotlib charts and save as PNG. Use plt.show() which auto-saves."
+    }));
+
+    for _nudge_round in 0..3 {
+        let resp = llm_call(client, api_key, api_url, model, all_messages, Some(tools), temperature, max_tokens).await.ok()?;
+
+        let message = &resp["choices"][0]["message"];
+        all_messages.push(message.clone());
+
+        if let Some(calls) = message["tool_calls"].as_array() {
+            if calls.is_empty() {
+                return message["content"].as_str().map(|s| s.to_string());
+            }
+            for call in calls {
+                let name = call["function"]["name"].as_str().unwrap_or("unknown");
+                let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
+                let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                let id = call["id"].as_str().unwrap_or("");
+
+                let result = execute_tool_dispatch(name, &args, sandbox_dir, sub_agent, on_update.clone(), realtime).await;
+                tool_records.push(ToolCallRecord { tool: name.to_string(), result: result.clone() });
+
+                if let Some(files) = result.get("output_files").and_then(|v| v.as_array()) {
+                    for f in files {
+                        if let Some(s) = f.as_str() {
+                            if !collected_files.contains(&s.to_string()) {
+                                collected_files.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+
+                let result_str = compact::compress_tool_result(name, &result, 6000);
+                all_messages.push(json!({"role": "tool", "tool_call_id": id, "content": result_str}));
+                *total_tool_calls += 1;
+            }
+
+            if !collected_files.is_empty() {
+                // Files generated — get final response
+                let final_resp = llm_call(client, api_key, api_url, model, all_messages, None, temperature, max_tokens).await.ok()?;
+                return final_resp["choices"][0]["message"]["content"].as_str().map(|s| s.to_string());
+            }
+        } else {
+            return message["content"].as_str().map(|s| s.to_string());
+        }
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Jitter helper
+// ---------------------------------------------------------------------------
+
+fn rand_jitter(max_ms: u64) -> u64 {
+    use std::time::SystemTime;
+    let seed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+    (seed as u64) % max_ms
+}
+
+// ---------------------------------------------------------------------------
+// Force final response (unchanged logic, added temperature param)
+// ---------------------------------------------------------------------------
+
+async fn force_final_response(
+    client: &Client,
+    api_key: &str,
+    api_url: &str,
+    model: &str,
+    all_messages: &[Value],
+    tool_records: &[ToolCallRecord],
+    total_tool_calls: usize,
+    temperature: f64,
+) -> String {
+    let tool_summary = tool_records.iter().map(|tr| {
+        let brief = if tr.result.get("output_files")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        {
+            let files: Vec<&str> = tr.result["output_files"]
+                .as_array().unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            format!("Generated: {}", files.join(", "))
+        } else if tr.result.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            format!("Error: {}", tr.result.get("error").and_then(|v| v.as_str()).unwrap_or("failed"))
+        } else if let Some(stdout) = tr.result.get("stdout").and_then(|v| v.as_str()) {
+            stdout.chars().take(300).collect::<String>()
+        } else if tr.result.is_string() {
+            tr.result.as_str().unwrap_or("").chars().take(300).collect::<String>()
+        } else {
+            serde_json::to_string(&tr.result).unwrap_or_default().chars().take(300).collect::<String>()
+        };
+        format!("[{}]: {}", tr.tool, brief)
+    }).collect::<Vec<_>>().join("\n");
+
+    // Keep system prompt (first system msg) + all user messages
+    let mut final_messages: Vec<Value> = vec![];
+    let mut first_system_added = false;
+    for m in all_messages {
+        let role = m["role"].as_str().unwrap_or("");
+        if role == "system" && !first_system_added {
+            final_messages.push(m.clone());
+            first_system_added = true;
+        } else if role == "user" {
+            final_messages.push(m.clone());
+        }
+    }
+
+    final_messages.push(json!({
+        "role": "user",
+        "content": format!(
+            "You executed {} tool calls. Summary:\n{}\n\nProvide a clear, helpful response to the user. \
+            Mention any generated files. Do NOT call tools. \
+            IMPORTANT: Do NOT include any internal tool call syntax, function names, parameter details, \
+            or markers like [web_search], [fetch_url], etc. in your response. \
+            The user should only see the final results, not the tools you used.",
+            total_tool_calls, tool_summary
+        )
+    }));
+
+    // Call LLM without tools (forces text-only response)
+    match llm_call(client, api_key, api_url, model, &final_messages, None, temperature, 8192).await {
+        Ok(data) => {
+            let content = data["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+            if !content.is_empty() {
+                return content;
+            }
+        }
+        Err(e) => warn!("[FinalResponse] LLM call failed: {e}"),
+    }
+
+    // Absolute fallback
+    let output_files: Vec<String> = tool_records.iter()
+        .filter_map(|tr| tr.result.get("output_files").and_then(|v| v.as_array()).map(|a| {
+            a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")
+        }))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let stdouts: Vec<String> = tool_records.iter()
+        .filter_map(|tr| tr.result.get("stdout").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        .map(|s| s.chars().take(500).collect::<String>())
+        .collect();
+
+    let errors: Vec<String> = tool_records.iter()
+        .filter_map(|tr| {
+            if tr.result.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+                tr.result.get("error").and_then(|v| v.as_str()).map(|s| format!("Error: {s}"))
+            } else { None }
+        })
+        .collect();
+
+    let fallback_parts: Vec<String> = output_files.into_iter()
+        .chain(stdouts.into_iter())
+        .chain(errors.into_iter())
+        .collect();
+
+    if !fallback_parts.is_empty() {
+        fallback_parts.join("\n\n")
+    } else {
+        "Task completed. Check the output panel for results.".to_string()
+    }
+}
+
+#[cfg(test)]
+mod vision_tests {
+    use super::*;
+
+    #[test]
+    fn minimax_m3_supports_vision() {
+        assert!(model_supports_vision("https://api.minimax.io/v1/chat/completions", "MiniMax-M3"));
+        // Non-vision MiniMax models should not be treated as vision-capable
+        assert!(!model_supports_vision("https://api.minimax.io/v1/chat/completions", "MiniMax-M2.5"));
+    }
+
+    #[test]
+    fn common_vision_and_text_models() {
+        assert!(model_supports_vision("https://api.openai.com/v1/chat/completions", "gpt-4o"));
+        assert!(model_supports_vision("https://x/v1", "qwen2.5-vl-72b"));
+        assert!(model_supports_vision("https://x/v1", "claude-3-5-sonnet"));
+        assert!(!model_supports_vision("https://x/v1", "TigerBot-70B-Chat"));
+        assert!(!model_supports_vision("https://x/v1", "deepseek-chat"));
+    }
+
+    #[test]
+    fn content_to_text_handles_string_and_array() {
+        assert_eq!(content_to_text(&json!("hello")), "hello");
+        let arr = json!([
+            {"type": "text", "text": "look at this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+        ]);
+        assert_eq!(content_to_text(&arr), "look at this");
+    }
+
+    #[test]
+    fn parse_data_uri_splits_media_and_data() {
+        let (media, data) = parse_data_uri("data:image/png;base64,QUJD").unwrap();
+        assert_eq!(media, "image/png");
+        assert_eq!(data, "QUJD");
+        assert!(parse_data_uri("https://example.com/a.png").is_none());
+    }
+
+    #[test]
+    fn openai_image_content_converts_to_anthropic_blocks() {
+        let content = json!([
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,QUJD"}}
+        ]);
+        let out = openai_content_to_anthropic(&content);
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1]["type"], "image");
+        assert_eq!(arr[1]["source"]["type"], "base64");
+        assert_eq!(arr[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(arr[1]["source"]["data"], "QUJD");
+    }
+
+    #[test]
+    fn build_image_content_inlines_a_real_png() {
+        use base64::Engine;
+        // 1x1 transparent PNG
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let png = base64::engine::general_purpose::STANDARD.decode(png_b64).unwrap();
+        let dir = std::env::temp_dir().join("tigrimos_vision_test");
+        let uploads = dir.join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        std::fs::write(uploads.join("pic.png"), &png).unwrap();
+
+        // Web UI note format
+        let text = "What is this?\n\n[Attached files]\n- uploads/pic.png (pic.png)";
+        let content = build_image_content(text, &dir.to_string_lossy()).expect("should inline image");
+        let arr = content.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1]["type"], "image_url");
+        let url = arr[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+
+        // A message with no image reference yields None
+        assert!(build_image_content("just text, no files", &dir.to_string_lossy()).is_none());
+        // A path that escapes the sandbox is rejected
+        assert!(build_image_content("see ../secret.png", &dir.to_string_lossy()).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn desktop_note_with_spaces_in_path_is_inlined() {
+        use base64::Engine;
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let png = base64::engine::general_purpose::STANDARD.decode(png_b64).unwrap();
+        // Reproduce the real macOS path that contains a space: "App Support".
+        let dir = std::env::temp_dir().join("tigrimos App Support").join("sandbox");
+        let uploads = dir.join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let img_path = uploads.join("20260613_pointcloud.png");
+        std::fs::write(&img_path, &png).unwrap();
+
+        // Exact desktop attachment note format.
+        let text = format!(
+            "explain for this picture\n\n[Attached file: pointcloud.png — saved at: {}]\nUse the read_file tool to access this file.",
+            img_path.to_string_lossy()
+        );
+        let content = build_image_content(&text, &dir.to_string_lossy())
+            .expect("path with spaces must still be inlined");
+        let arr = content.as_array().unwrap();
+        // Exactly one image part (the bare 'pointcloud.png' name must not double-add).
+        let imgs: Vec<_> = arr.iter().filter(|p| p["type"] == "image_url").collect();
+        assert_eq!(imgs.len(), 1, "should inline the image exactly once");
+        assert!(imgs[0]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("tigrimos App Support"));
+    }
+}
+
+#[cfg(test)]
+mod sandbox_path_tests {
+    use super::*;
+
+    #[test]
+    fn escape_paths_hit_the_sentinel_and_clear_error() {
+        let tmp = std::env::temp_dir().join("tigrimos_sandbox_test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let sandbox = tmp.to_string_lossy().to_string();
+
+        // Absolute path outside the sandbox -> sentinel.
+        let outside = if cfg!(windows) { "C:\\Windows\\system32" } else { "/etc" };
+        let resolved = resolve_path(&sandbox, outside);
+        assert!(is_blocked_path(&resolved), "expected sentinel for {outside}, got {resolved:?}");
+
+        // ../ traversal -> sentinel.
+        let resolved = resolve_path(&sandbox, "../../outside.txt");
+        assert!(is_blocked_path(&resolved));
+
+        // Inside path passes through untouched.
+        let resolved = resolve_path(&sandbox, "sub/file.txt");
+        assert!(!is_blocked_path(&resolved));
+
+        // The error result names the path and the sandbox.
+        let err = blocked_path_error("Hint.", outside, &sandbox);
+        let msg = err["error"].as_str().unwrap();
+        assert!(msg.contains("outside the sandbox") && msg.contains(outside), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod claude_cli_tests {
+    use super::*;
+
+    #[test]
+    fn detects_native_magic_numbers() {
+        // ELF (Linux): 0x7F 'E' 'L' 'F', with and without trailing bytes.
+        assert!(is_native_magic(&[0x7F, b'E', b'L', b'F']));
+        assert!(is_native_magic(&[0x7F, b'E', b'L', b'F', 0x02, 0x01]));
+        // PE / MS-DOS (Windows .exe): 'M' 'Z'.
+        assert!(is_native_magic(b"MZ\x90\x00"));
+        // Mach-O 64-bit (macOS), both endiannesses.
+        assert!(is_native_magic(&[0xFE, 0xED, 0xFA, 0xCF]));
+        assert!(is_native_magic(&[0xCF, 0xFA, 0xED, 0xFE]));
+    }
+
+    #[test]
+    fn rejects_js_script_bytes() {
+        // A node shebang / JS source must NOT be treated as a native binary.
+        assert!(!is_native_magic(b"#!/u"));
+        assert!(!is_native_magic(b"cons"));
+        // Too-short / empty reads are not native.
+        assert!(!is_native_magic(&[0x7F]));
+        assert!(!is_native_magic(&[]));
+    }
+
+    #[test]
+    fn is_native_executable_inspects_dummy_files() {
+        let dir = std::env::temp_dir().join("tigrimos_claude_cli_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Dummy ELF binary (magic bytes only, no real code needed).
+        let elf = dir.join("fake_claude_elf");
+        std::fs::write(&elf, [0x7F, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00]).unwrap();
+        assert!(is_native_executable(&elf.to_string_lossy()));
+
+        // Dummy JS bundle with a node shebang → not native.
+        let js = dir.join("fake_claude.js");
+        std::fs::write(&js, b"#!/usr/bin/env node\nconsole.log('hi')\n").unwrap();
+        assert!(!is_native_executable(&js.to_string_lossy()));
+
+        // Nonexistent path is not native.
+        assert!(!is_native_executable(&dir.join("does_not_exist").to_string_lossy()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod graph_judge_tests {
+    use super::*;
+
+    fn judge(name: &str, weight: f64, threshold: Option<f64>) -> ResolvedJudge {
+        ResolvedJudge {
+            name: name.to_string(),
+            model: String::new(),
+            api_url: String::new(),
+            api_key: String::new(),
+            rules: String::new(),
+            weight,
+            threshold,
+            use_tools: false,
+            allow_execute: false,
+            max_judge_rounds: 3,
+        }
+    }
+
+    fn verdict(score: f64, satisfied: bool) -> GraphJudgeVerdict {
+        GraphJudgeVerdict { score, satisfied, ..Default::default() }
+    }
+
+    #[test]
+    fn parses_bare_yaml_verdict() {
+        let v = parse_graph_verdict(
+            "judge: quality\nscore: 0.6\nsatisfied: false\nrule_results:\n  - rule: answers-all-parts\n    pass: false\n    note: \"missing chart\"\nmissing: \"second chart\"\nrevise: \"add the chart\"\n",
+        ).unwrap();
+        assert_eq!(v.judge, "quality");
+        assert!(!v.satisfied);
+        assert_eq!(v.rule_results.len(), 1);
+        assert_eq!(v.rule_results[0].rule, "answers-all-parts");
+        assert_eq!(v.revise, "add the chart");
+    }
+
+    #[test]
+    fn parses_fenced_yaml_verdict() {
+        let v = parse_graph_verdict(
+            "Here is my verdict:\n```yaml\nscore: 0.9\nsatisfied: true\nmissing: \"\"\n```\nDone.",
+        ).unwrap();
+        assert!(v.satisfied);
+        assert!((v.score - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn falls_back_to_json_verdict() {
+        let v = parse_graph_verdict(
+            "{\"score\": 0.8, \"satisfied\": true, \"missing\": \"\"}",
+        ).unwrap();
+        assert!(v.satisfied);
+        assert!(v.rule_results.is_empty());
+    }
+
+    #[test]
+    fn thai_text_survives_verdict_parse() {
+        // Thai text in notes/missing must round-trip without byte-slice panics.
+        let v = parse_graph_verdict(
+            "score: 0.3\nsatisfied: false\nmissing: \"ขาดกราฟแท่งที่ผู้ใช้ขอ และคำอธิบายภาษาไทย\"\nrevise: \"เพิ่มกราฟ\"\n",
+        ).unwrap();
+        assert!(v.missing.contains("กราฟ"));
+        // truncate_utf8 on a boundary inside a Thai char must not panic.
+        let _ = crate::util::truncate_utf8(&v.missing, 10);
+    }
+
+    #[test]
+    fn garbage_fails_open() {
+        assert!(parse_graph_verdict("I think it looks fine!").is_none());
+        assert!(parse_graph_verdict("").is_none());
+    }
+
+    #[test]
+    fn prose_with_colon_is_not_a_verdict() {
+        assert!(parse_graph_verdict("Note: the answer is fine").is_none());
+    }
+
+    #[test]
+    fn all_pass_policy_requires_every_judge() {
+        let judges = vec![judge("a", 1.0, None), judge("b", 1.0, None)];
+        let both = vec![(0usize, verdict(0.9, true)), (1usize, verdict(0.8, true))];
+        let (pass, _, _) = aggregate_verdicts(&judges, &both, "all_pass", 0.75);
+        assert!(pass);
+        let one_fail = vec![(0usize, verdict(0.9, true)), (1usize, verdict(0.3, false))];
+        let (pass, _, yaml) = aggregate_verdicts(&judges, &one_fail, "all_pass", 0.75);
+        assert!(!pass);
+        assert!(yaml.contains("pass: false"));
+    }
+
+    #[test]
+    fn majority_policy() {
+        let judges = vec![judge("a", 1.0, None), judge("b", 1.0, None), judge("c", 1.0, None)];
+        let two_of_three = vec![
+            (0usize, verdict(0.9, true)),
+            (1usize, verdict(0.8, true)),
+            (2usize, verdict(0.2, false)),
+        ];
+        let (pass, _, _) = aggregate_verdicts(&judges, &two_of_three, "majority", 0.75);
+        assert!(pass);
+        let one_of_three = vec![
+            (0usize, verdict(0.9, true)),
+            (1usize, verdict(0.2, false)),
+            (2usize, verdict(0.2, false)),
+        ];
+        let (pass, _, _) = aggregate_verdicts(&judges, &one_of_three, "majority", 0.75);
+        assert!(!pass);
+    }
+
+    #[test]
+    fn weighted_average_policy() {
+        let judges = vec![judge("a", 3.0, None), judge("b", 1.0, None)];
+        // (3*0.9 + 1*0.4) / 4 = 0.775 >= 0.75
+        let vs = vec![(0usize, verdict(0.9, false)), (1usize, verdict(0.4, false))];
+        let (pass, score, _) = aggregate_verdicts(&judges, &vs, "weighted_average", 0.75);
+        assert!(pass);
+        assert!((score - 0.775).abs() < 1e-9);
+        // Flip the weights: (1*0.9 + 3*0.4) / 4 = 0.525 < 0.75
+        let judges = vec![judge("a", 1.0, None), judge("b", 3.0, None)];
+        let (pass, _, _) = aggregate_verdicts(&judges, &vs, "weighted_average", 0.75);
+        assert!(!pass);
+    }
+
+    #[test]
+    fn per_judge_threshold_override() {
+        // Judge passes on score with its own lenient threshold.
+        let judges = vec![judge("a", 1.0, Some(0.5))];
+        let vs = vec![(0usize, verdict(0.6, false))];
+        let (pass, _, _) = aggregate_verdicts(&judges, &vs, "all_pass", 0.75);
+        assert!(pass);
+    }
+
+    #[test]
+    fn zero_weight_judges_are_ignored_unless_all_zero() {
+        // Weight-0 blocker is ignored when another judge counts.
+        let judges = vec![judge("a", 1.0, None), judge("b", 0.0, None)];
+        let vs = vec![(0usize, verdict(0.9, true)), (1usize, verdict(0.1, false))];
+        let (pass, _, _) = aggregate_verdicts(&judges, &vs, "all_pass", 0.75);
+        assert!(pass);
+        // All-zero weights: everyone counts with weight 1 (no silent pass-all).
+        let judges = vec![judge("a", 0.0, None), judge("b", 0.0, None)];
+        let (pass, score, _) = aggregate_verdicts(&judges, &vs, "all_pass", 0.75);
+        assert!(!pass);
+        assert!((score - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn revise_collects_failing_judges_only() {
+        let judges = vec![judge("style", 1.0, None), judge("facts", 1.0, None)];
+        let mut bad = verdict(0.2, false);
+        bad.judge = "facts".to_string();
+        bad.revise = "cite the source".to_string();
+        let mut good = verdict(0.9, true);
+        good.judge = "style".to_string();
+        good.revise = "n/a".to_string();
+        let vs = vec![(0usize, good), (1usize, bad)];
+        let (_, _, yaml) = aggregate_verdicts(&judges, &vs, "all_pass", 0.75);
+        assert!(yaml.contains("[facts] cite the source"));
+        assert!(!yaml.contains("[style] n/a"));
+    }
+}

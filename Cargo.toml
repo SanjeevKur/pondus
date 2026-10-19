@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["engine", "core", "app", "tigrimos"]
+# `cargo build --release` builds Pondus, its core, the vendored Stabileo engine and the
+# TigrimOS agent CLI (tigrim) together
+default-members = ["engine", "core", "app", "tigrimos"]
+
+[profile.release]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 2
