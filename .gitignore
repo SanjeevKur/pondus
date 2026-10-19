@@ -13,3 +13,5 @@
 
 # third-party reference material kept locally only (cited by URL in calibration/NOTES_*.md)
 /calibration/sources/
+/dist/
+/target-win/
