@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" alt="Pondus" width="480"></p>
+
 # Pondus
 
 **Licence: [GNU AGPL-3.0-only](LICENSE)** · **Source: https://github.com/Sompote/pondus** · Copyright © 2026 Sompote Youwai · includes the [Stabileo](https://github.com/lambdaclass/stabileo) engine (AGPL-3.0) · see [NOTICE.md](NOTICE.md)
