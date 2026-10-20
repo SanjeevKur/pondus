@@ -216,7 +216,8 @@ fn run_inner(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
                     let ok_k = kind.is_none_or(|k| m.kind(x) == k);
                     let ok_z = z.is_none_or(|z| [x.i, x.j].iter().all(|n| m.node(*n).is_some_and(|n| (n.z - z).abs() < 0.05)));
                     let ok_s = sec.as_ref().is_none_or(|s| m.section(x.section).is_some_and(|q| q.name.to_lowercase().replace(' ', "") == *s));
-                    if ok_k && ok_z && ok_s {
+                    // a selection by kind, height or section is of frame members, not the walls' piers and arms
+                    if ok_k && ok_z && ok_s && x.role.is_frame() {
                         sel.push(x.id);
                     }
                 }
@@ -411,7 +412,8 @@ fn run_inner(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
                         };
                         let mut targets = ids(l, "members");
                         if let Some(z) = num(l, "z") {
-                            targets.extend(m.members.iter().filter(|x| m.kind(x) == MemberKind::Beam && [x.i, x.j].iter().all(|n| m.node(*n).is_some_and(|n| (n.z - z).abs() < 0.05))).map(|x| x.id));
+                            // the walls' rigid arms are no floor beams: a load by height goes to frame beams only
+                            targets.extend(m.members.iter().filter(|x| x.role.is_frame() && m.kind(x) == MemberKind::Beam && [x.i, x.j].iter().all(|n| m.node(*n).is_some_and(|n| (n.z - z).abs() < 0.05))).map(|x| x.id));
                         }
                         if targets.is_empty() {
                             return Err("a line load needs members [ids] or z (all beams at that height)".into());

@@ -20,6 +20,7 @@ mod chat;
 mod edit_ui;
 mod icon_data;
 mod icons;
+mod macopen;
 mod markdown;
 mod seismic_ui;
 mod section_ui;
@@ -86,8 +87,11 @@ fn main() {
                 Err(_) => v,
             }
         },
+        // on the screen, wherever the last window was
+        centered: true,
         ..Default::default()
     };
+    macopen::install();
     if let Err(e) = eframe::run_native("Pondus", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, open))))) {
         eprintln!("pondus: {e}");
     }

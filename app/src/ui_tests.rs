@@ -245,3 +245,34 @@ fn ui_wall_tool() {
     a.set_tool(Tool::Select);
     shot(&mut h, "21-shear-wall");
 }
+
+/// Pictures of any model file in the real window: PONDUS_OPEN=model.pondus PONDUS_SNAPSHOTS=dir
+/// cargo test -p pondus --release ui_open_file -- --ignored. The model is shown, analysed, and its
+/// plan and first two mode shapes drawn with the earthquake table.
+#[test]
+#[ignore]
+fn ui_open_file() {
+    let Some(path) = std::env::var_os("PONDUS_OPEN").map(std::path::PathBuf::from) else { return };
+    let z: f64 = std::env::var("PONDUS_PLAN_Z").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| App::new(cc, Some(path.clone())));
+    h.state_mut().view.fit = true;
+    shot(&mut h, "open-1-model");
+    h.state_mut().test_analyze();
+    h.state_mut().spec.view = "plan".into();
+    h.state_mut().spec.z = Some(z);
+    h.state_mut().view.set_preset("plan");
+    h.state_mut().view.fit = true;
+    shot(&mut h, "open-2-plan");
+    for (k, name) in [(0usize, "open-3-mode1"), (1, "open-4-mode2")] {
+        let a = h.state_mut();
+        a.spec.view = "3d".into();
+        a.spec.z = None;
+        a.view.set_preset("3d");
+        a.view.fit = true;
+        a.spec.diagram = pondus_core::scene::Diagram::Mode;
+        a.spec.mode = k;
+        a.animate = false;
+        a.bottom = crate::app::BottomTab::Seismic;
+        shot(&mut h, name);
+    }
+}

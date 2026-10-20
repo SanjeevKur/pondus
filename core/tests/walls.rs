@@ -149,3 +149,19 @@ fn walls_follow_new_floors_and_delete() {
     run(&mut m, "delete", &json!({"walls": [1]})).unwrap();
     assert!(m.walls.is_empty() && m.members.iter().all(|x| x.role.is_frame()), "{:?}", m.members.iter().map(|x| x.role).collect::<Vec<_>>());
 }
+
+#[test]
+fn loads_by_height_skip_wall_arms() {
+    // a floor beam meeting a wall, and a line load on "all beams at z": the wall's rigid arms at
+    // that level are no floor beams and must not take the load
+    use pondus_core::commands::run;
+    use pondus_core::model::*;
+    use serde_json::json;
+    let mut m = Model::new("arms");
+    run(&mut m, "add_walls", &json!({"walls": [{"from": [0.0, 0.0], "to": [4.0, 0.0], "t": 0.3, "z0": 0.0, "z1": 3.0}], "levels": [0.0, 3.0]})).unwrap();
+    run(&mut m, "add_members", &json!({"members": [{"from": [2.0, 0.0, 3.0], "to": [2.0, 6.0, 3.0], "section": "300 x 600", "kind": "beam"}, {"from": [2.0, 6.0, 0.0], "to": [2.0, 6.0, 3.0], "section": "400 x 400", "kind": "column"}]})).unwrap();
+    run(&mut m, "add_loads", &json!({"case": "D", "loads": [{"type": "line", "z": 3.0, "w": [0.0, 0.0, -10.0]}]})).unwrap();
+    let loaded: Vec<Id> = m.loads.iter().filter_map(|l| match l.kind { LoadKind::Line { member, .. } => Some(member), _ => None }).collect();
+    assert_eq!(loaded.len(), 1, "{loaded:?}");
+    assert!(m.member(loaded[0]).unwrap().role.is_frame());
+}

@@ -703,16 +703,16 @@ impl Model {
     }
 
     pub fn node(&self, id: Id) -> Option<&Node> {
-        self.nodes.iter().find(|n| n.id == id)
+        by_id(&self.nodes, id, |n| n.id)
     }
     pub fn member(&self, id: Id) -> Option<&Member> {
-        self.members.iter().find(|m| m.id == id)
+        by_id(&self.members, id, |m| m.id)
     }
     pub fn section(&self, id: Id) -> Option<&Section> {
-        self.sections.iter().find(|s| s.id == id)
+        by_id(&self.sections, id, |s| s.id)
     }
     pub fn material(&self, id: Id) -> Option<&Material> {
-        self.materials.iter().find(|s| s.id == id)
+        by_id(&self.materials, id, |s| s.id)
     }
     pub fn case(&self, id: Id) -> Option<&LoadCase> {
         self.cases.iter().find(|s| s.id == id)
@@ -874,4 +874,17 @@ pub fn parse_rect(s: &str) -> Option<(f64, f64)> {
     let b: f64 = parts[0].parse().ok()?;
     let h: f64 = parts[1].parse().ok()?;
     (b > 50.0 && h > 50.0 && b < 5000.0 && h < 5000.0).then_some((b / 1000.0, h / 1000.0))
+}
+
+/// An item by its id. Ids are handed out in increasing order and lists keep that order, so the
+/// item is usually at index id - 1, or else found by bisection; a list out of order falls back to
+/// a scan. On a 7000-member tower the linear search alone made every redraw take about 2 s.
+fn by_id<T>(v: &[T], id: Id, key: impl Fn(&T) -> Id) -> Option<&T> {
+    if let Some(x) = id.checked_sub(1).and_then(|k| v.get(k)).filter(|x| key(x) == id) {
+        return Some(x);
+    }
+    if let Ok(k) = v.binary_search_by_key(&id, &key) {
+        return Some(&v[k]);
+    }
+    v.iter().find(|x| key(x) == id)
 }

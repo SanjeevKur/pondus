@@ -1571,6 +1571,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        // a file macOS asked to open (double click in Finder, the Dock icon, `open f.pondus`)
+        if let Some(p) = crate::macopen::take().into_iter().last() {
+            self.open_path(p);
+        }
         // a Pondus file opens; images and documents go to the chat
         let (models, files): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|p| crate::attach::is_model(p));
         if let Some(p) = models.into_iter().next() {
