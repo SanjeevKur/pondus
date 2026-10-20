@@ -46,7 +46,7 @@ fn attach_console() {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     #[cfg(windows)]
-    if args.get(1).is_some_and(|a| matches!(a.as_str(), "design" | "--help" | "-h" | "--about" | "--license" | "--version")) {
+    if args.get(1).is_some_and(|a| matches!(a.as_str(), "design" | "bench" | "--gpu" | "--help" | "-h" | "--about" | "--license" | "--version")) {
         attach_console();
     }
     if args.iter().any(|a| a == "--mcp") {
@@ -67,8 +67,35 @@ fn main() {
             }
             return;
         }
+        Some("--gpu") => {
+            println!("{}", pondus_core::compute::summary());
+            return;
+        }
+        Some("bench") if args.len() == 3 => {
+            // analyse a model and report the time, where it ran and the results to compare
+            let r = Model::load(std::path::Path::new(&args[2])).and_then(|m| {
+                let g0 = pondus_core::compute::factorisations();
+                let t0 = std::time::Instant::now();
+                let a = pondus_core::analysis::analyze(&m)?;
+                let secs = t0.elapsed().as_secs_f64();
+                let modes: Vec<serde_json::Value> = a.seismic.as_ref().map(|s| s.modes.iter().take(6).map(|md| serde_json::json!({"T_s": md.period, "mass_xyz": md.mass_ratio})).collect()).unwrap_or_default();
+                let reactions: Vec<[f64; 3]> = a.cases.iter().map(|c| { let r = c.reaction_sum(); [r[0], r[1], r[2]] }).collect();
+                let umax = a.cases.first().map(|c| c.displacements.values().map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()).fold(0.0, f64::max)).unwrap_or(0.0);
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "model": args[2], "nodes": m.nodes.len(), "members": m.members.len(), "elements": a.elements,
+                    "seconds": secs, "gpu_factorisations": pondus_core::compute::factorisations() - g0, "compute": pondus_core::compute::summary(),
+                    "modes": modes, "reactions_by_case_kN": reactions, "max_displacement_case1_m": umax,
+                })).unwrap_or_default());
+                Ok(())
+            });
+            if let Err(e) = r {
+                eprintln!("pondus: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Some("--help") | Some("-h") => {
-            println!("pondus [file]                               the app (file: .pondus or a Stabileo/Aedifex .json)\npondus --mcp [--open f] [--autosave f]      MCP server on stdio\npondus design in.(pondus|json) out.json    design (resize + select) and write the BIM JSON\npondus --about                              licence, copyright and source link\n\n{}", pondus_core::about::short());
+            println!("pondus [file]                               the app (file: .pondus or a Stabileo/Aedifex .json)\npondus --mcp [--open f] [--autosave f]      MCP server on stdio\npondus design in.(pondus|json) out.json    design (resize + select) and write the BIM JSON\npondus bench model.pondus                   analyse and report the time, CPU or GPU, periods and reactions\npondus --gpu                                whether an NVIDIA GPU (CUDA, cuDSS) is used\npondus --about                              licence, copyright and source link\n\n{}", pondus_core::about::short());
             return;
         }
         Some("--about") | Some("--license") | Some("--version") => {

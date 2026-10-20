@@ -166,8 +166,14 @@ impl Server {
         match name {
             "analyze" => {
                 self.analysis = None;
+                let before = dedaliano_engine::linalg::gpu::factorisations();
+                let t0 = std::time::Instant::now();
                 let a = self.analysis()?.clone();
-                Ok(text(analysis_summary(&self.model, &a)))
+                let mut v = analysis_summary(&self.model, &a);
+                // where the large factorisations ran: the NVIDIA GPU (cuDSS) when there is one
+                let on_gpu = dedaliano_engine::linalg::gpu::factorisations() - before;
+                v["compute"] = json!({"seconds": (t0.elapsed().as_secs_f64() * 100.0).round() / 100.0, "gpu_factorisations": on_gpu, "device": dedaliano_engine::linalg::gpu::summary()});
+                Ok(text(v))
             }
             "get_results" => {
                 let a = self.analysis()?.clone();

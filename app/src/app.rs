@@ -284,12 +284,14 @@ impl App {
 
     pub(crate) fn analyze(&mut self) {
         let t0 = std::time::Instant::now();
+        let gpu0 = pondus_core::compute::factorisations();
         match pondus_core::analysis::analyze(&self.model) {
             Ok(a) => {
                 let s = pondus_core::mcp::analysis_summary(&self.model, &a);
                 let ok = s["cases"].as_array().is_some_and(|c| c.iter().all(|c| c["balanced"] == true));
                 self.messages = a.warnings.clone();
-                self.status = format!("Analysed {} elements in {:.0} ms; reactions {} the applied loads; slab load on beams {:.1} of {:.1} kN (dead)", a.elements, t0.elapsed().as_secs_f64() * 1000.0, if ok { "balance" } else { "DO NOT balance" }, a.slab_applied[0], a.slab_expected[0]);
+                let gpu = pondus_core::compute::factorisations() - gpu0;
+                self.status = format!("Analysed {} elements in {:.0} ms{}; reactions {} the applied loads; slab load on beams {:.1} of {:.1} kN (dead)", a.elements, t0.elapsed().as_secs_f64() * 1000.0, if gpu > 0 { format!(" ({gpu} factorisations on the GPU)") } else { String::new() }, if ok { "balance" } else { "DO NOT balance" }, a.slab_applied[0], a.slab_expected[0]);
                 self.report = Some(design::design_pass(&self.model, &a, &design::Options::default()));
                 self.analysis = Some(a);
                 if self.spec.diagram == Diagram::None {

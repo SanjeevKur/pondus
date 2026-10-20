@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use crate::types::*;
+use crate::linalg::gpu::SpdFactor;
 use crate::linalg::*;
 use crate::element;
 use std::rc::Rc;
@@ -1976,7 +1977,8 @@ struct DensePrepared3D {
 struct SparsePrepared3D {
     k_ff: CscMatrix,
     k_full: CscMatrix,
-    num: NumericCholesky,
+    /// [Pondus] on the GPU for a large system when one is there (linalg::gpu)
+    num: SpdFactor,
     /// True when K_ff needed a diagonal shift to factor (drilling stabilization).
     regularized: bool,
     max_perturbation: f64,
@@ -2259,44 +2261,55 @@ pub fn prepare_static_3d(input: &SolverInput3D) -> Result<PreparedStatic3D, Stri
             });
         }
 
-        // Symbolic + numeric factorization of K_ff (split phases, K-only)
-        let t0 = now_micros();
-        let sym = Rc::new(symbolic_cholesky(&stiff.k_ff));
-        let symbolic_us = now_micros().saturating_sub(t0);
+        // [Pondus] a large system is factorised on the GPU when one is there (linalg::gpu). A
+        // matrix the GPU cannot factorise as positive definite, or a GPU failure, takes the CPU
+        // way below unchanged (its diagonal shift and pivot check included); the GPU's pivots
+        // are not inspected, as in the constrained path.
         let nnz_kff = stiff.k_ff.col_ptr[nf]; // total nnz in lower triangle
-        let nnz_l = sym.l_nnz;
-
-        // Try strict Cholesky first; if it fails (shell drilling DOFs),
-        // regularize K_ff with a diagonal shift and retry.
         let t0 = now_micros();
-        let num_result = numeric_cholesky(&sym, &stiff.k_ff);
-        let numeric_us = now_micros().saturating_sub(t0);
-
-        let num = if let Some(n) = num_result {
-            Some((n, false, 0.0))
+        let gpu = if crate::linalg::gpu::use_for(nf) { crate::linalg::gpu::Factor::new(&stiff.k_ff).ok() } else { None };
+        let (num, symbolic_us, numeric_us, nnz_l) = if let Some(g) = gpu {
+            (Some((SpdFactor::Gpu(g), false, 0.0)), 0, now_micros().saturating_sub(t0), 0)
         } else {
-            // Regularize: clone K_ff and add a diagonal shift to make it SPD.
-            // Try increasing shifts until Cholesky succeeds.
-            let max_d = stiff.max_diag_k;
-            let mut factored = None;
-            let mut shift = 0.0;
-            for &alpha in &[1e-6, 1e-4, 1e-2, 1e-1, 1.0, 10.0] {
-                shift = alpha * max_d;
-                let mut k_reg = stiff.k_ff.clone();
-                for j in 0..nf {
-                    for p in k_reg.col_ptr[j]..k_reg.col_ptr[j + 1] {
-                        if k_reg.row_idx[p] == j {
-                            k_reg.values[p] += shift;
-                            break;
+            // Symbolic + numeric factorization of K_ff (split phases, K-only)
+            let t0 = now_micros();
+            let sym = Rc::new(symbolic_cholesky(&stiff.k_ff));
+            let symbolic_us = now_micros().saturating_sub(t0);
+            let nnz_l = sym.l_nnz;
+
+            // Try strict Cholesky first; if it fails (shell drilling DOFs),
+            // regularize K_ff with a diagonal shift and retry.
+            let t0 = now_micros();
+            let num_result = numeric_cholesky(&sym, &stiff.k_ff);
+            let numeric_us = now_micros().saturating_sub(t0);
+
+            let num = if let Some(n) = num_result {
+                Some((n, false, 0.0))
+            } else {
+                // Regularize: clone K_ff and add a diagonal shift to make it SPD.
+                // Try increasing shifts until Cholesky succeeds.
+                let max_d = stiff.max_diag_k;
+                let mut factored = None;
+                let mut shift = 0.0;
+                for &alpha in &[1e-6, 1e-4, 1e-2, 1e-1, 1.0, 10.0] {
+                    shift = alpha * max_d;
+                    let mut k_reg = stiff.k_ff.clone();
+                    for j in 0..nf {
+                        for p in k_reg.col_ptr[j]..k_reg.col_ptr[j + 1] {
+                            if k_reg.row_idx[p] == j {
+                                k_reg.values[p] += shift;
+                                break;
+                            }
                         }
                     }
+                    if let Some(n) = numeric_cholesky(&sym, &k_reg) {
+                        factored = Some(n);
+                        break;
+                    }
                 }
-                if let Some(n) = numeric_cholesky(&sym, &k_reg) {
-                    factored = Some(n);
-                    break;
-                }
-            }
-            factored.map(|n| (n, true, shift))
+                factored.map(|n| (n, true, shift))
+            };
+            (num.map(|(n, r, m)| (SpdFactor::Cpu(n), r, m)), symbolic_us, numeric_us, nnz_l)
         };
 
         let has_prescribed = u_r.iter().any(|v| v.abs() > 1e-15);
@@ -2307,8 +2320,8 @@ pub fn prepare_static_3d(input: &SolverInput3D) -> Result<PreparedStatic3D, Stri
                     pre_solve_diags.push(super::definiteness::not_positive_definite(&format!(
                         "Cholesky needed a diagonal shift of {max_perturbation:.2e}"
                     )));
-                } else {
-                    pre_solve_diags.extend(super::definiteness::sparse_pivot_check(&num, &stiff.k_ff));
+                } else if let SpdFactor::Cpu(num) = &num {
+                    pre_solve_diags.extend(super::definiteness::sparse_pivot_check(num, &stiff.k_ff));
                 }
                 if regularized {
                     solver_diags_base.push(SolverDiagnostic {
@@ -2795,7 +2808,7 @@ impl PreparedStatic3D {
 
         // Triangular solve with the precomputed sparse Cholesky factor
         let t0 = now_micros();
-        let mut u = sparse_cholesky_solve(&p.num, &f_f);
+        let mut u = p.num.solve(&f_f);
 
         // Iterative refinement against the ORIGINAL K_ff to correct for
         // the regularization shift. Up to 5 steps of residual correction.
@@ -2813,7 +2826,7 @@ impl PreparedStatic3D {
                 if res2.sqrt() / f2.sqrt().max(1e-30) < 1e-10 {
                     break;
                 }
-                let du = sparse_cholesky_solve(&p.num, &residual);
+                let du = p.num.solve(&residual);
                 for i in 0..nf {
                     u[i] += du[i];
                 }

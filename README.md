@@ -22,6 +22,7 @@ Ask an AI agent to build, analyse and design a building, then check every number
 - **Design:** reinforced concrete beams, slabs, columns, walls and footings to **ACI 318-19**, and steel to **AISC 360-16** or **Eurocode 3**, with the bars and sizes chosen for you.
 - **Report:** a complete calculation report as a PDF, ready to check and submit.
 - **Exchange:** Excel, DXF (AutoCAD) and IFC (Revit and BIM).
+- **Fast on large models:** a 156-storey tower with 41,000 elements and 60 earthquake modes analyses in about a minute on a 16-core computer, and Windows and Linux machines with an NVIDIA GPU factorise the large stiffness matrices on the card, with the same answers.
 - **Checked against published results:** 470 comparisons with textbooks and design-code examples, 430 of them within 0.5 %, plus a check against a full-scale building tested on a shake table ([paper](paper/paper.pdf)).
 
 ## Features
@@ -166,6 +167,24 @@ With `resize`, failing concrete beams are deepened in 50 mm steps and failing sl
 </details>
 
 <details>
+<summary><b>Speed and the NVIDIA GPU</b></summary>
+
+Pondus factorises a large stiffness matrix on an NVIDIA GPU when the computer has one, using cuDSS, NVIDIA's sparse direct solver, and on the CPU otherwise. The CUDA runtime and cuDSS are loaded when the program starts rather than linked in, so the same binary runs everywhere, and on macOS, or on a machine without the libraries, everything stays on the CPU with unchanged results. The GPU takes systems of 20,000 unknowns or more (`PONDUS_GPU_MIN`), because smaller ones are faster on the CPU than the copy to the card, and it serves the linear static solve, the solve with rigid diaphragms and the shift-invert step of the modal and buckling analyses. `PONDUS_GPU=0` switches it off, `pondus --gpu` reports whether it is used, the status line and the MCP `analyze` result count the factorisations done on the card, and `pondus bench model.pondus` (or `cargo run --release -p pondus-core --example bench -- model.pondus` on a headless server) prints the time with the periods, base shears, drifts and reactions for comparing the two.
+
+To use it, install the CUDA 12 runtime and cuDSS 0.8 or later, for example with `pip install nvidia-cudss-cu12`, and put their library folders on `LD_LIBRARY_PATH` (Linux) or `PATH` (Windows), or name the files with `PONDUS_CUDART` and `PONDUS_CUDSS`. cuDSS runs in its deterministic mode, so a model gives identical results on every run.
+
+The GPU was tested on an NVIDIA A100 (40 GB) with a 16-core CPU. With every factorisation forced onto the card (`PONDUS_GPU_MIN=0`) the whole test suite passes, and the GPU agrees with the CPU Cholesky to 1e-8 or better on the calibration frames and the bridge. On models with shear walls the two differ by up to 2e-5, and on the Burj Khalifa example by 8e-4 in the second period, because the rigid wall arms (1000 times the wall's modulus) make the stiffness matrix ill-conditioned, so any two direct solvers round differently there. On the wall calibration cases the GPU result is the closer one to the closed-form reference in 23 of 33 (`core/tests/gpu.rs` checks the GPU against the CPU where a GPU is present).
+
+| Model | CPU before | CPU now | GPU now |
+|---|---|---|---|
+| Burj Khalifa example: 41,056 elements, 216,588 unknowns, static and 60-mode response spectrum | 290 s | 60 s | 54 s |
+| 12 × 12-bay, 20-storey frame without diaphragms: 56,680 elements, static | – | 30 s | 14.5 s |
+
+Most of the speed came from the CPU rather than the card. Profiling the tower showed that the factorisations took about 2 s of the original 290 s, whereas the Lanczos reorthogonalisation ran on one core (71 s), the Ritz vectors were assembled with a cache-hostile loop order (71 s) and the response spectrum recovered every mode's member forces once per direction, in sequence (58 s). The reorthogonalisation now uses classical Gram–Schmidt applied twice in parallel, the Ritz vectors are summed by blocks of rows, and each mode's forces are found once in parallel and scaled by Γ·Sd for each direction, which leaves the results unchanged to 6e-11 and speeds up every computer, with or without a GPU. On the tower the GPU now saves only about 10 %, because the remaining time is in assembly and the vector work of the modal analysis, which still runs on the CPU, whereas a large static model is about twice as fast on the card.
+
+</details>
+
+<details>
 <summary><b>Limits</b></summary>
 
 These limits matter for the results:
@@ -225,6 +244,8 @@ cargo build --release          # target/release/pondus and target/release/tigrim
 target/release/pondus          # the app
 target/release/pondus --mcp [--open model.pondus] [--autosave model.pondus]
 target/release/pondus design in.(pondus|json) out-bim.json
+target/release/pondus bench model.pondus     # analysis time, CPU or GPU, periods and reactions
+target/release/pondus --gpu  # whether an NVIDIA GPU (CUDA, cuDSS) is used
 target/release/pondus --about  # the licence notice and the source link
 ```
 
@@ -232,7 +253,7 @@ The chat needs an OpenAI-compatible provider (OpenRouter by default), whose URL,
 
 | Crate | What it holds |
 |---|---|
-| `engine/` | The Stabileo engine (`dedaliano-engine`), copied from `lambdaclass/stabileo` commit `7985e8c` with its manifest trimmed to a native library and three source changes marked `[Pondus]`. The first fixes the sign of the w–θy coupling of the vertical Winkler foundation in `solver/winkler.rs`, without which a uniformly loaded beam on a uniform foundation settled unevenly. The second, in `solver/plastic_3d.rs`, tries a sparse Cholesky factorisation before the dense rank test that checks for a mechanism at every hinge event; it gives the same answer and cut the test building's pushover from 28 s to 3.7 s. The third, in `solver/moving_loads.rs`, keeps the moving-load envelope at each end of an element as well as over the element, so that an envelope read at a point does not carry the value one element away (AGPL-3.0). |
+| `engine/` | The Stabileo engine (`dedaliano-engine`), copied from `lambdaclass/stabileo` commit `7985e8c` with its manifest trimmed to a native library and its source changes marked `[Pondus]`. The first fixes the sign of the w–θy coupling of the vertical Winkler foundation in `solver/winkler.rs`, without which a uniformly loaded beam on a uniform foundation settled unevenly. The second, in `solver/plastic_3d.rs`, tries a sparse Cholesky factorisation before the dense rank test that checks for a mechanism at every hinge event; it gives the same answer and cut the test building's pushover from 28 s to 3.7 s. The third, in `solver/moving_loads.rs`, keeps the moving-load envelope at each end of an element as well as over the element, so that an envelope read at a point does not carry the value one element away. The rest add the GPU factorisation (`linalg/gpu.rs`, used from `solver/linear.rs`, `solver/constraints.rs` and `linalg/lanczos.rs`) and make the Lanczos reorthogonalisation and Ritz vectors parallel, with rayon now a plain dependency (AGPL-3.0). |
 | `core/` | The model, the analysis wrapper, the design codes, the advanced analyses, the scene for the views, the PDF report, the Stabileo, BIM, Excel, DXF and IFC exchange, the editing transforms and the MCP server. |
 | `app/` | The egui window in PhotoCraft's Pro theme through `craft-ui` (storytold/craft-libs), with the chat, the 3D view, diagrams and the design table. |
 | `tigrimos/` | The TigrimOS agent harness vendored from TigrimOSR, plus the MCP-timeout and vision patches that Aedifex also carries. |

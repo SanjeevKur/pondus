@@ -24,6 +24,7 @@ use dedaliano_engine::solver::dof::DofNumbering;
 use dedaliano_engine::solver::linear::compute_internal_forces_3d_with_loads;
 use dedaliano_engine::solver::modal::{solve_modal_3d, ModalResult3D};
 use dedaliano_engine::types::*;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{member_results, Analysis, Assembly, CaseResult};
@@ -236,19 +237,18 @@ pub(crate) fn run(model: &Model, asm: &Assembly, a: &Analysis) -> Result<Seismic
     let hn = levels.last().copied().unwrap_or(0.0) - levels.first().copied().unwrap_or(0.0);
     let ta = sc.ct * hn.max(0.0).powf(sc.x);
     let mut dirs = vec![];
-    for (d, name) in [(0usize, "Ex"), (1, "Ey")] {
-        // per mode: u = Γ Sd φ, the members' stations and the storey displacements
-        let mut per_mode: Vec<CaseResult> = vec![];
-        let mut v_mode = vec![];
-        for m in &modal.modes {
-            let gamma = [m.participation_x, m.participation_y, m.participation_z][d];
-            let meff = [m.effective_mass_x, m.effective_mass_y, m.effective_mass_z][d];
-            let sa = sc.spectrum.sa(m.period) * G * sc.ie / sc.r;
-            let sd = if m.omega > 1e-10 { sa / (m.omega * m.omega) } else { 0.0 };
+    // per mode: the members' stations and node displacements for the mode shape φ, found once
+    // and in parallel; a direction's mode result is that one times Γ·Sd (the recovery is linear
+    // in u). It was recomputed for each direction, serially, at 0.5 s a mode on a 41,000-element
+    // tower.
+    let unit: Vec<CaseResult> = modal
+        .modes
+        .par_iter()
+        .map(|m| {
             let mut u = vec![0.0; dof.n_total];
             let mut disp: HashMap<usize, [f64; 6]> = HashMap::new();
             for dd in &m.displacements {
-                let vals = [dd.ux, dd.uy, dd.uz, dd.rx, dd.ry, dd.rz].map(|v| v * gamma * sd);
+                let vals = [dd.ux, dd.uy, dd.uz, dd.rx, dd.ry, dd.rz];
                 for (i, v) in vals.iter().enumerate() {
                     if let Some(&idx) = dof.map.get(&(dd.node_id, i)) {
                         u[idx] = *v;
@@ -258,12 +258,23 @@ pub(crate) fn run(model: &Model, asm: &Assembly, a: &Analysis) -> Result<Seismic
             }
             let ef = compute_internal_forces_3d_with_loads(&input, &[], &dof, &u);
             let forces: HashMap<usize, &ElementForces3D> = ef.iter().map(|f| (f.element_id, f)).collect();
-            let mut cr = CaseResult { name: name.into(), ..Default::default() };
-            cr.members = member_results(model, asm.pieces, &forces, &disp);
+            let mut cr = CaseResult { members: member_results(model, asm.pieces, &forces, &disp), ..Default::default() };
             for nd in &model.nodes {
                 cr.displacements.insert(nd.id, disp.get(&asm.node_of[&nd.id]).copied().unwrap_or([0.0; 6]));
             }
-            per_mode.push(cr);
+            cr
+        })
+        .collect();
+    for (d, name) in [(0usize, "Ex"), (1, "Ey")] {
+        // u = Γ Sd φ: the factor on each mode's unit result
+        let mut fac = vec![];
+        let mut v_mode = vec![];
+        for m in &modal.modes {
+            let gamma = [m.participation_x, m.participation_y, m.participation_z][d];
+            let meff = [m.effective_mass_x, m.effective_mass_y, m.effective_mass_z][d];
+            let sa = sc.spectrum.sa(m.period) * G * sc.ie / sc.r;
+            let sd = if m.omega > 1e-10 { sa / (m.omega * m.omega) } else { 0.0 };
+            fac.push(gamma * sd);
             // the engine works in kN, m and t: effective masses come out in t, so Meff·Sa is kN
             v_mode.push(meff * sa);
         }
@@ -285,11 +296,12 @@ pub(crate) fn run(model: &Model, asm: &Assembly, a: &Analysis) -> Result<Seismic
         let v_elf = cs * weight;
         let scale = if v_rsa > 1e-9 && v_rsa < sc.elf_ratio * v_elf { sc.elf_ratio * v_elf / v_rsa } else { 1.0 };
         // CQC at every station and node, scaled
-        let mut env = per_mode[0].clone();
+        let mut env = unit[0].clone();
+        env.name = name.into();
         env.applied = [0.0; 3];
-        for (mi, mr) in env.members.iter_mut().enumerate() {
+        env.members.par_iter_mut().enumerate().for_each(|(mi, mr)| {
             for (si, st) in mr.stations.iter_mut().enumerate() {
-                let get = |f: &dyn Fn(&crate::analysis::Station) -> f64| cqc(&per_mode.iter().map(|c| f(&c.members[mi].stations[si])).collect::<Vec<_>>(), &corr) * scale;
+                let get = |f: &dyn Fn(&crate::analysis::Station) -> f64| cqc(&unit.iter().zip(&fac).map(|(c, k)| k * f(&c.members[mi].stations[si])).collect::<Vec<_>>(), &corr) * scale;
                 st.n = get(&|s| s.n);
                 st.vy = get(&|s| s.vy);
                 st.vz = get(&|s| s.vz);
@@ -300,10 +312,10 @@ pub(crate) fn run(model: &Model, asm: &Assembly, a: &Analysis) -> Result<Seismic
                     st.u[q] = get(&|s| s.u[q]);
                 }
             }
-        }
+        });
         for (id, v) in env.displacements.iter_mut() {
             for q in 0..6 {
-                *v.get_mut(q).unwrap() = cqc(&per_mode.iter().map(|c| c.displacements[id][q]).collect::<Vec<_>>(), &corr) * scale;
+                *v.get_mut(q).unwrap() = cqc(&unit.iter().zip(&fac).map(|(c, k)| k * c.displacements[id][q]).collect::<Vec<_>>(), &corr) * scale;
             }
         }
         // storey drifts: per mode the mean displacement of each level, its differences, CQC
@@ -317,7 +329,7 @@ pub(crate) fn run(model: &Model, asm: &Assembly, a: &Analysis) -> Result<Seismic
             }
         };
         for w in levels.windows(2) {
-            let per: Vec<f64> = per_mode.iter().map(|c| level_disp(c, w[1]) - level_disp(c, w[0])).collect();
+            let per: Vec<f64> = unit.iter().zip(&fac).map(|(c, k)| k * (level_disp(c, w[1]) - level_disp(c, w[0]))).collect();
             let delta_e = cqc(&per, &corr);
             let delta = sc.cd * delta_e / sc.ie;
             let allowed = sc.drift_limit * (w[1] - w[0]);

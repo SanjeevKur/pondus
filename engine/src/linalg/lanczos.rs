@@ -1,8 +1,11 @@
 use super::cholesky::{cholesky_decompose, forward_solve, back_solve};
 use super::jacobi::{jacobi_eigen, solve_generalized_eigen, EigenResult};
 use super::sparse::CscMatrix;
-use super::sparse_chol::{symbolic_cholesky, numeric_cholesky, sparse_cholesky_solve};
-use std::rc::Rc;
+use rayon::prelude::*;
+
+/// [Pondus] rows per parallel task in the reorthogonalisation and the Ritz vectors.
+const CHUNK: usize = 8192;
+const ROWS: usize = 256;
 
 /// Parameters for Lanczos iteration.
 pub struct LanczosParams {
@@ -186,14 +189,21 @@ fn lanczos_tridiag(
             }
         }
 
-        // Full reorthogonalization (double CGS), B-orthogonally
+        // Full reorthogonalization, B-orthogonally. [Pondus] classical Gram-Schmidt applied
+        // twice (CGS2: all coefficients from the same w, then one update), in parallel; it keeps
+        // the orthogonality of the modified form it replaces and was the serial bottleneck of a
+        // large modal analysis (71 of 155 s on a 216,588-unknown tower). Each coefficient and
+        // each entry of w is summed in a fixed order, so the result does not depend on threads.
         for _pass in 0..2 {
-            for k in 0..=j {
-                let d = dot(&bq[k * n..(k + 1) * n], &w);
-                for i in 0..n {
-                    w[i] -= d * q[k * n + i];
+            let d: Vec<f64> = (0..=j).into_par_iter().map(|k| dot(&bq[k * n..(k + 1) * n], &w)).collect();
+            w.par_chunks_mut(CHUNK).enumerate().for_each(|(c, wc)| {
+                let (i0, len) = (c * CHUNK, wc.len());
+                for (k, dk) in d.iter().enumerate() {
+                    for (wi, qi) in wc.iter_mut().zip(&q[k * n + i0..k * n + i0 + len]) {
+                        *wi -= dk * qi;
+                    }
                 }
-            }
+            });
         }
 
         op.b_mul(&w, &mut scratch);
@@ -435,15 +445,21 @@ fn lanczos_irlm(
         let nk = k.min(actual_m);
 
         // Compute Ritz vectors for selected eigenvalues
+        // [Pondus] by blocks of rows, in parallel: the column-by-column loop wrote with a stride
+        // of nk and spent as long as the Lanczos steps themselves. Same sums in the same order.
         let mut ritz_vecs = vec![0.0; n * nk];
-        for (out_col, t_col) in (start..start + nk).enumerate() {
+        ritz_vecs.par_chunks_mut(nk * ROWS).enumerate().for_each(|(c, rc)| {
+            let i0 = c * ROWS;
+            let rows = rc.len() / nk;
             for j in 0..actual_m {
-                let coeff = t_vecs[j * actual_m + t_col];
-                for i in 0..n {
-                    ritz_vecs[i * nk + out_col] += coeff * q_mat[j * n + i];
+                let tj = &t_vecs[j * actual_m + start..j * actual_m + start + nk];
+                for (r, &qv) in q_mat[j * n + i0..j * n + i0 + rows].iter().enumerate() {
+                    for (x, &t) in rc[r * nk..(r + 1) * nk].iter_mut().zip(tj) {
+                        *x += t * qv;
+                    }
                 }
             }
-        }
+        });
 
         let selected_vals: Vec<f64> = t_vals[start..start + nk].to_vec();
 
@@ -694,7 +710,8 @@ impl<'a> MatVecOp for SparseSymMatVec<'a> {
 /// triangular solve. B is typically the mass matrix M (modal) or -Kg
 /// (buckling) — both element-sparse.
 pub struct SparseShiftInvertOp<'a> {
-    factor: super::sparse_chol::NumericCholesky,
+    // [Pondus] on the GPU for a large system when one is there (linalg::gpu)
+    factor: super::gpu::SpdFactor,
     b_csc: &'a CscMatrix,
     /// The matrix defining the inner product the Lanczos recurrence runs in.
     ///
@@ -726,8 +743,7 @@ impl<'a> SparseShiftInvertOp<'a> {
     /// B is the mass matrix. For an indefinite B use `new_k_inner_product`.
     pub fn new(k_csc: &'a CscMatrix, b_csc: &'a CscMatrix) -> Option<Self> {
         assert_eq!(k_csc.n, b_csc.n, "K and B must have the same dimension");
-        let sym = Rc::new(symbolic_cholesky(k_csc));
-        let factor = numeric_cholesky(&sym, k_csc)?;
+        let factor = super::gpu::SpdFactor::new(k_csc)?;
         Some(Self { factor, b_csc, inner: b_csc })
     }
 
@@ -737,8 +753,7 @@ impl<'a> SparseShiftInvertOp<'a> {
     /// whatever the sign content of B.
     pub fn new_k_inner_product(k_csc: &'a CscMatrix, b_csc: &'a CscMatrix) -> Option<Self> {
         assert_eq!(k_csc.n, b_csc.n, "K and B must have the same dimension");
-        let sym = Rc::new(symbolic_cholesky(k_csc));
-        let factor = numeric_cholesky(&sym, k_csc)?;
+        let factor = super::gpu::SpdFactor::new(k_csc)?;
         Some(Self { factor, b_csc, inner: k_csc })
     }
 }
@@ -748,7 +763,7 @@ impl<'a> MatVecOp for SparseShiftInvertOp<'a> {
         // tmp = B * x (sparse, O(nnz))
         let tmp = self.b_csc.sym_mat_vec(x);
         // y = K⁻¹ tmp (sparse Cholesky solve)
-        let result = sparse_cholesky_solve(&self.factor, &tmp);
+        let result = self.factor.solve(&tmp);
         y[..self.b_csc.n].copy_from_slice(&result);
     }
     fn dim(&self) -> usize { self.b_csc.n }
@@ -915,6 +930,7 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linalg::sparse_chol::{symbolic_cholesky, numeric_cholesky, sparse_cholesky_solve};
 
     /// Buckling must stay on the SPARSE path when -Kg is indefinite.
     ///

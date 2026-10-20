@@ -2174,23 +2174,36 @@ pub fn solve_constrained_3d(input: &ConstrainedInput3D) -> Result<AnalysisResult
     let f_reduced = fcs.reduce_vector(&f_f);
 
     let mut used_fallback = false;
-    // `sparse_cholesky_solve_full`, unrolled to inspect the factor's pivots.
-    let factor = numeric_cholesky(&std::rc::Rc::new(symbolic_cholesky(&k_reduced)), &k_reduced);
-    let definiteness = match &factor {
-        Some(num) => super::definiteness::sparse_pivot_check(num, &k_reduced),
-        None => Some(super::definiteness::not_positive_definite(
-            "constrained CᵀKC: Cholesky failed; solved by dense LU",
-        )),
+    // [Pondus] a large system goes to the GPU when one is there (linalg::gpu). A matrix the GPU
+    // cannot factorise as positive definite goes the CPU way below, which reports it as before;
+    // the GPU's pivots are not inspected, so the near-singular pivot warning is the CPU's only.
+    let on_gpu = if crate::linalg::gpu::use_for(k_reduced.n) {
+        crate::linalg::gpu::Factor::new(&k_reduced).ok().and_then(|g| g.solve(&f_reduced).ok())
+    } else {
+        None
     };
-    let u_indep = match factor.map(|num| sparse_cholesky_solve(&num, &f_reduced)) {
-        Some(u) => u,
-        None => {
-            used_fallback = true;
-            let mut k_work = k_reduced.to_dense_symmetric();
-            let mut f_work = f_reduced.clone();
-            lu_solve(&mut k_work, &mut f_work, n_free_indep)
-                .ok_or("Singular stiffness in 3D constrained system")?
-        }
+    let (definiteness, u_indep) = if let Some(u) = on_gpu {
+        (None, u)
+    } else {
+        // `sparse_cholesky_solve_full`, unrolled to inspect the factor's pivots.
+        let factor = numeric_cholesky(&std::rc::Rc::new(symbolic_cholesky(&k_reduced)), &k_reduced);
+        let definiteness = match &factor {
+            Some(num) => super::definiteness::sparse_pivot_check(num, &k_reduced),
+            None => Some(super::definiteness::not_positive_definite(
+                "constrained CᵀKC: Cholesky failed; solved by dense LU",
+            )),
+        };
+        let u_indep = match factor.map(|num| sparse_cholesky_solve(&num, &f_reduced)) {
+            Some(u) => u,
+            None => {
+                used_fallback = true;
+                let mut k_work = k_reduced.to_dense_symmetric();
+                let mut f_work = f_reduced.clone();
+                lu_solve(&mut k_work, &mut f_work, n_free_indep)
+                    .ok_or("Singular stiffness in 3D constrained system")?
+            }
+        };
+        (definiteness, u_indep)
     };
 
     let mut u_f = fcs.expand_solution(&u_indep);

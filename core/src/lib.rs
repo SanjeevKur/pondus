@@ -37,4 +37,8 @@ pub mod timehistory;
 pub mod transform;
 pub mod walls;
 
+/// Where the large factorisations run: an NVIDIA GPU (CUDA and cuDSS, loaded at run time) when
+/// one is there, else the CPU. See the engine's `linalg::gpu`.
+pub use dedaliano_engine::linalg::gpu as compute;
+
 pub use model::*;

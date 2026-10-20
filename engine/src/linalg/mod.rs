@@ -9,6 +9,8 @@ pub mod sparse_chol;
 pub mod lanczos;
 pub mod preconditioner;
 pub mod pcg;
+// [Pondus] the sparse factorisation on an NVIDIA GPU (cuDSS) when one is there
+pub mod gpu;
 
 pub use dense::*;
 pub use cholesky::*;

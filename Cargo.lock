@@ -1340,6 +1340,7 @@ name = "dedaliano-engine"
 version = "0.2.0"
 dependencies = [
  "console_error_panic_hook",
+ "libloading",
  "num-bigint",
  "num-integer",
  "num-rational",
@@ -4499,6 +4500,7 @@ dependencies = [
  "dedaliano-engine",
  "krilla",
  "png 0.17.16",
+ "rayon",
  "rust_xlsxwriter",
  "serde",
  "serde_json",
