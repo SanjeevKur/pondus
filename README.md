@@ -19,6 +19,21 @@
 
 All versions and their checksums are on the [releases page](https://github.com/Sompote/pondus/releases). On macOS, unzip and move `Pondus.app` to Applications, and the first time right-click it and choose Open, because the app is not notarised. On Windows, unzip and run `pondus.exe` with `tigrim.exe` beside it, and if SmartScreen warns about an unsigned app choose More info › Run anyway. The chat needs an OpenAI-compatible provider, set under Agent › Settings.
 
+## Use it from Claude Desktop, ChatGPT and other agents
+
+Pondus runs as an MCP server (`pondus --mcp`), so any agent that speaks the Model Context Protocol can build, analyse and design structures with it. Claude Desktop and Claude Code start it directly from a few lines of configuration, ChatGPT reaches it through an HTTP bridge and a tunnel, and every change is saved to a `.pondus` file that you then open in the app to check. The steps for each are in **[docs/mcp.md](docs/mcp.md)**. For Claude Desktop on macOS the whole configuration is:
+
+```json
+{
+  "mcpServers": {
+    "pondus": {
+      "command": "/Applications/Pondus.app/Contents/MacOS/pondus",
+      "args": ["--mcp", "--autosave", "/Users/you/Pondus/model.pondus"]
+    }
+  }
+}
+```
+
 ## Paper
 
 **[Calibrating an agentic structural analysis and design program against published benchmarks](paper/paper.pdf)** (S. Youwai, October 2026) reports how Pondus was checked against reference values from textbooks, software verification manuals and the published worked examples of the design codes. Every comparison goes through Pondus's own model, analysis wrapper and design code. Of 396 comparisons over 219 cases, 367 agree within 0.5 % and 379 within 1 %, and each of the other 17 is explained by mesh convergence, the conservative load contour for biaxial bending or the rounded SI constants of ACI 318. The calibration and the closed-form tests before it found twelve defects, six of them unconservative, and eleven of the twelve lay in the code that prepares the inputs of a kernel or a check rather than in the kernels. The paper's tables and figure are generated from the test output (`calibration/*.csv`), and `paper/build.sh` rebuilds the PDF (pandoc and tectonic).
