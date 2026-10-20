@@ -16,3 +16,6 @@
 /dist/
 /target-win/
 /paper/arxiv/build/
+/examples/**/.pictures/
+/examples/**/.pictures.jsonl
+/examples/**/build.log
