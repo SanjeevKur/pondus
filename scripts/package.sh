@@ -11,13 +11,19 @@ DIST=dist
 mkdir -p "$DIST"
 
 echo "== macOS x86_64 and arm64"
-cargo build --release --target x86_64-apple-darwin
-cargo build --release --target aarch64-apple-darwin
+# the native architecture builds in target/release, the other one with --target
+if [ "$(uname -m)" = "arm64" ]; then
+  cargo build --release && X86=target/x86_64-apple-darwin/release ARM=target/release
+  cargo build --release --target x86_64-apple-darwin
+else
+  cargo build --release && X86=target/release ARM=target/aarch64-apple-darwin/release
+  cargo build --release --target aarch64-apple-darwin
+fi
 APP="$DIST/Pondus.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 for bin in pondus tigrim; do
-  lipo -create -output "$APP/Contents/MacOS/$bin" "target/x86_64-apple-darwin/release/$bin" "target/aarch64-apple-darwin/release/$bin"
+  lipo -create -output "$APP/Contents/MacOS/$bin" "$X86/$bin" "$ARM/$bin"
 done
 cp app/assets/Pondus.icns "$APP/Contents/Resources/Pondus.icns"
 cp LICENSE NOTICE.md "$APP/Contents/Resources/"

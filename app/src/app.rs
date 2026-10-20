@@ -357,8 +357,12 @@ impl App {
         match pondus_core::report::write_pdf(&self.model, &a, self.report.as_ref(), &opts, &p) {
             Ok(r) => {
                 self.status = format!("Wrote the calculation report ({} pages): {}", r.pages, p.display());
-                #[cfg(not(test))]
+                #[cfg(all(not(test), target_os = "macos"))]
                 let _ = std::process::Command::new("open").arg(&p).spawn();
+                #[cfg(all(not(test), windows))]
+                let _ = std::process::Command::new("cmd").args(["/C", "start", ""]).arg(&p).spawn();
+                #[cfg(all(not(test), target_os = "linux"))]
+                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
             }
             Err(e) => self.status = format!("Report: {e}"),
         }

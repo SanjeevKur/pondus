@@ -190,6 +190,12 @@ fn run(bin: &std::path::Path, dir: &std::path::Path, me: &std::path::Path, provi
     let written = std::fs::read_to_string(&file).unwrap_or_default();
     let mut cmd = std::process::Command::new(bin);
     cmd.current_dir(dir).arg("--yes").arg("--cwd").arg(dir);
+    // no console window for the agent harness on Windows (CREATE_NO_WINDOW)
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
     if fresh {
         cmd.arg("--new");
     }

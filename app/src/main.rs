@@ -10,6 +10,9 @@
 //!   pondus design in.(pondus|json) out.json    analyse and design without the window, BIM JSON out
 //!   pondus --about                              the licence notice and the source link
 
+// a window, not a console, on Windows; the command-line modes attach to the parent console
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod advanced_ui;
 mod app;
 mod attach;
@@ -28,8 +31,23 @@ mod view;
 
 use pondus_core::model::Model;
 
+#[cfg(windows)]
+fn attach_console() {
+    extern "system" {
+        fn AttachConsole(id: u32) -> i32;
+    }
+    // ATTACH_PARENT_PROCESS: print to the terminal that started us (pipes stay as they are)
+    unsafe {
+        AttachConsole(u32::MAX);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(windows)]
+    if args.get(1).is_some_and(|a| matches!(a.as_str(), "design" | "--help" | "-h" | "--about" | "--license" | "--version")) {
+        attach_console();
+    }
     if args.iter().any(|a| a == "--mcp") {
         pondus_core::mcp::serve();
         return;
