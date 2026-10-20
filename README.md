@@ -11,7 +11,7 @@ Ask an AI agent to build, analyse and design a building, then check every number
 <a href="docs/mcp.md">Use with Claude or ChatGPT</a>
 </p>
 
-<p align="center"><img src="docs/screenshot.png" alt="Pondus with a simplified model of the Burj Khalifa" width="900"></p>
+<p align="center"><img src="docs/burj-khalifa.png" alt="Pondus with a simplified model of the Burj Khalifa" width="900"></p>
 <p align="center"><sub>A simplified model of the Burj Khalifa (586 m of concrete, 156 storeys, the buttressed core of a hexagonal hub, three wings, corridor and hammerhead walls, and setbacks), built in Pondus from published dimensions: 84 walls, 2,286 frame members and 5,061 nodes.</sub></p>
 
 ## What Pondus does for a civil engineer
