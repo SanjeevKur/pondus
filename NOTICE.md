@@ -30,6 +30,7 @@ As AGPL-3.0 section 5(a) asks, the modified files carry a prominent notice. Ever
 1. `engine/Cargo.toml`: the manifest was trimmed to a native library (no wasm `cdylib`, benches or dev-dependencies). October 2026.
 2. `engine/src/solver/winkler.rs`: the sign of the w–θy coupling of the vertical Winkler foundation matrix was corrected. Without it, a uniformly loaded beam on a uniform foundation settled unevenly. 19 October 2026.
 3. `engine/src/solver/plastic_3d.rs`: an unshifted sparse Cholesky test now runs before the dense rank test that checks for a mechanism at every hinge event. It gives the same answer and is faster. 20 October 2026.
+4. `engine/src/solver/moving_loads.rs`: the 3D moving-load envelope also keeps the extremes at each end of an element (`start_max`, `start_min`, `end_max`, `end_min`). The per-element extremes take both ends together, so a point read from them carried the value one element away. 20 October 2026.
 
 ## Disclaimer
 

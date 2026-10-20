@@ -34,8 +34,8 @@ pub fn notice() -> String {
          \n\
          Pondus includes the Stabileo analysis engine (dedaliano-engine), Copyright (C) the Stabileo\n\
          authors (Bautista Chesta, Diego Kingston, Federico Carrone and contributors at LambdaClass),\n\
-         AGPL-3.0-only, {ENGINE_URL} at commit {short_commit}, modified in solver/winkler.rs and\n\
-         solver/plastic_3d.rs (marked [Pondus]). It also includes TigrimOS (Apache-2.0), craft-ui\n\
+         AGPL-3.0-only, {ENGINE_URL} at commit {short_commit}, modified in solver/winkler.rs,\n\
+         solver/plastic_3d.rs and solver/moving_loads.rs (marked [Pondus]). It also includes TigrimOS (Apache-2.0), craft-ui\n\
          (MIT or Apache-2.0), Lucide icons (ISC) and the Inter, JetBrains Mono and Noto Sans Thai fonts\n\
          (SIL OFL 1.1). See NOTICE.md in the source.\n\
          \n\

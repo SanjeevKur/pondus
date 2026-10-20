@@ -1,8 +1,9 @@
 # Vendored from Stabileo (github.com/lambdaclass/stabileo, engine/ at commit
 # 7985e8c59605e26fcff75516ccf02f580809c570), AGPL-3.0-only. This manifest drops the wasm cdylib,
-# benches and dev-dependencies so Pondus builds it as a native library. Two source changes, marked
+# benches and dev-dependencies so Pondus builds it as a native library. Three source changes, marked
 # [Pondus]: solver/winkler.rs, the sign of the w-θy coupling of the z foundation matrix (a bug);
-# solver/plastic_3d.rs, a sparse Cholesky test before the dense rank test of each event (speed only).
+# solver/plastic_3d.rs, a sparse Cholesky test before the dense rank test of each event (speed only);
+# solver/moving_loads.rs, the 3D envelope also kept per element end (start/end max and min).
 [package]
 name = "dedaliano-engine"
 version = "0.2.0"

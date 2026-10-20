@@ -1,0 +1,25 @@
+case,source,quantity,unit,reference,pondus,error_pct,kind
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Panagiotou et al. (2010): V_b / C_s = 292 / 0.15","seismic weight W","kN",1946.6666666666667,1946.66666666667,0.0000,input
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Moaveni et al. (2011), JSE 137(6), Table 2 and text","f1, ambient vibration before testing (uncracked)","Hz",2.23,1.8455135238889222,-17.2415,measured
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T1, first 0.03 g RMS white-noise test","s",0.51,0.5418546041823468,6.2460,measured
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T1, designers' uncracked 3-D model","s",0.5,0.5418546041823468,8.3709,model
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Kelly (2007), Bull. NZSEE 40(3), Table 2","T1, blind-prediction model (ANSR-II)","s",0.557,0.5418546041823468,-2.7191,model
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Moaveni et al. (2011), JSE 137(6), Table 2 and text","f2, ambient vibration at state S0","Hz",10.53,10.622203625292801,0.8756,measured
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T2, low-amplitude tests","s",0.1,0.09414242423472982,-5.8576,measured
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Kelly (2007), Bull. NZSEE 40(3), Table 2","T2, blind-prediction model (ANSR-II)","s",0.094,0.09414242423472982,0.1515,model
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Moaveni et al. (2011), JSE 137(6), Table 2 and text","f3, ambient vibration at state S0","Hz",24.58,26.104762876936316,6.2033,measured
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Kelly (2007), Bull. NZSEE 40(3), Table 2","effective mass, mode 1","-",0.663,0.6255290202660211,-5.6517,model
+"web wall, gross section, E = 4700 sqrt(41.4) MPa","Kelly (2007), Bull. NZSEE 40(3), Table 2","effective mass, mode 2","-",0.175,0.21283042472211153,21.6174,model
+"web wall, gross section, E = 4700 sqrt(27.6) MPa (specified f'c)","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T1, first 0.03 g RMS white-noise test","s",0.51,0.5996566554736483,17.5797,measured
+"web wall, gross section, E = 4700 sqrt(27.6) MPa (specified f'c)","Moaveni et al. (2011), JSE 137(6), Table 2 and text","f1, ambient vibration before testing (uncracked)","Hz",2.23,1.6676209475406123,-25.2188,measured
+"web wall, gross section, E = 4700 sqrt(27.6) MPa (specified f'c)","Moaveni et al. (2011), JSE 137(6), Table 2 and text","f2, ambient vibration at state S0","Hz",10.53,9.59832920817322,-8.8478,measured
+"web wall, 0.70 Ig (ACI 318-19 6.6.3.1.1, uncracked wall), E from f'c 41.4 MPa","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T1, first 0.03 g RMS white-noise test","s",0.51,0.647639962634386,26.9882,measured
+"web wall, 0.70 Ig (ACI 318-19 6.6.3.1.1, uncracked wall), E from f'c 41.4 MPa","Moaveni et al. (2011), JSE 137(6), Table 2 and text","f1, ambient vibration before testing (uncracked)","Hz",2.23,1.5440677810126626,-30.7593,measured
+"web wall, 0.70 Ig (ACI 318-19 6.6.3.1.1, uncracked wall), E from f'c 41.4 MPa","Moaveni et al. (2011), JSE 137(6), Table 2 and text","f2, ambient vibration at state S0","Hz",10.53,8.887205319992509,-15.6011,measured
+"web wall, 0.70 Ig (ACI 318-19 6.6.3.1.1, uncracked wall), E from f'c 41.4 MPa","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T1 after test EQ1 (moderate, cracking)","s",0.65,0.647639962634386,-0.3631,measured
+"web wall, 0.35 Ig (ACI 318-19 6.6.3.1.1, cracked wall), E from f'c 41.4 MPa","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T1, first 0.03 g RMS white-noise test","s",0.51,0.9159007864433957,79.5884,measured
+"web wall, 0.35 Ig (ACI 318-19 6.6.3.1.1, cracked wall), E from f'c 41.4 MPa","Moaveni et al. (2011), JSE 137(6), Table 2 and text","f1, ambient vibration before testing (uncracked)","Hz",2.23,1.0918213138381248,-51.0394,measured
+"web wall, 0.35 Ig (ACI 318-19 6.6.3.1.1, cracked wall), E from f'c 41.4 MPa","Moaveni et al. (2011), JSE 137(6), Table 2 and text","f2, ambient vibration at state S0","Hz",10.53,6.284229714790573,-40.3207,measured
+"web wall, 0.35 Ig (ACI 318-19 6.6.3.1.1, cracked wall), E from f'c 41.4 MPa","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T1 after test EQ2","s",0.82,0.9159007864433957,11.6952,measured
+"web wall, 0.35 Ig (ACI 318-19 6.6.3.1.1, cracked wall), E from f'c 41.4 MPa","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T1 after test EQ3","s",0.88,0.9159007864433957,4.0796,measured
+"web wall, 0.35 Ig (ACI 318-19 6.6.3.1.1, cracked wall), E from f'c 41.4 MPa","Panagiotou et al. (2010), NZSEE Paper 03, Sec. 4.2.1","T1 after test EQ4 (Sylmar, near-fault)","s",1.16,0.9159007864433957,-21.0430,measured

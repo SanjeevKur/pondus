@@ -312,6 +312,17 @@ pub struct ElementEnvelope3D {
     pub mz_max_neg: f64,
     pub mx_max_pos: f64,
     pub mx_max_neg: f64,
+    /// [Pondus] The envelope at each END of the element, [n, vy, vz, mx, my, mz]: the fields above
+    /// take the extreme over both ends, so a point read from them carries the value one element
+    /// away (a design-example envelope came out 0.8 % high where it changes fast).
+    #[serde(default)]
+    pub start_max: [f64; 6],
+    #[serde(default)]
+    pub start_min: [f64; 6],
+    #[serde(default)]
+    pub end_max: [f64; 6],
+    #[serde(default)]
+    pub end_min: [f64; 6],
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -360,6 +371,7 @@ pub fn solve_moving_loads_3d(input: &MovingLoadInput3D) -> Result<MovingLoadEnve
             my_max_pos: 0.0, my_max_neg: 0.0,
             mz_max_pos: 0.0, mz_max_neg: 0.0,
             mx_max_pos: 0.0, mx_max_neg: 0.0,
+            start_max: [0.0; 6], start_min: [0.0; 6], end_max: [0.0; 6], end_min: [0.0; 6],
         });
     }
 
@@ -419,6 +431,14 @@ pub fn solve_moving_loads_3d(input: &MovingLoadInput3D) -> Result<MovingLoadEnve
                 env.mz_max_neg = env.mz_max_neg.min(ef.mz_start.min(ef.mz_end));
                 env.mx_max_pos = env.mx_max_pos.max(ef.mx_start.max(ef.mx_end));
                 env.mx_max_neg = env.mx_max_neg.min(ef.mx_start.min(ef.mx_end));
+                // [Pondus] per end
+                let (a, b) = ([ef.n_start, ef.vy_start, ef.vz_start, ef.mx_start, ef.my_start, ef.mz_start], [ef.n_end, ef.vy_end, ef.vz_end, ef.mx_end, ef.my_end, ef.mz_end]);
+                for k in 0..6 {
+                    env.start_max[k] = env.start_max[k].max(a[k]);
+                    env.start_min[k] = env.start_min[k].min(a[k]);
+                    env.end_max[k] = env.end_max[k].max(b[k]);
+                    env.end_min[k] = env.end_min[k].min(b[k]);
+                }
             }
         }
 

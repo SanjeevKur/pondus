@@ -30,25 +30,42 @@ use crate::model::*;
 use crate::rc;
 use crate::sections::bar_area;
 
-/// The material of the rigid arms: 1000 times stiffer than concrete, weightless.
-pub const ARM_E: f64 = 2.5e7;
+/// How much stiffer the rigid arms are than the wall they belong to. The arms' section is the
+/// wall's own (t × lw) and their modulus this many times the wall's, so they are rigid against
+/// the wall without the absolute, model-independent stiffness (E 2.5e7 MPa on I = 1 m⁴) they
+/// had before, which put a stiffness contrast of order 10⁹ into K and lost precision silently
+/// when a slender wall was coupled to soft frames.
+pub const ARM_FACTOR: f64 = 1000.0;
 
-fn arm_material(m: &mut Model) -> Id {
-    if let Some(x) = m.materials.iter().find(|x| x.name == "Rigid arm (wall)") {
+fn arm_material(m: &mut Model, wall_material: Id) -> Id {
+    let base = m.material(wall_material).map(|x| x.e).unwrap_or(25_000.0);
+    let e = ARM_FACTOR * base;
+    let name = format!("Rigid arm (wall, E {e:.0} MPa)");
+    if let Some(x) = m.materials.iter().find(|x| x.name == name) {
         return x.id;
     }
     let id = m.next_material_id();
-    m.materials.push(Material { id, name: "Rigid arm (wall)".into(), kind: MaterialKind::Other, e: ARM_E, nu: 0.2, gamma: 0.0, fc: 0.0, fy: 0.0, fu: 0.0, fb: 0.0, ft: 0.0, fv: 0.0, e_min: 0.0, alpha: 0.0 });
+    m.materials.push(Material { id, name, kind: MaterialKind::Other, e, nu: 0.2, gamma: 0.0, fc: 0.0, fy: 0.0, fu: 0.0, fb: 0.0, ft: 0.0, fv: 0.0, e_min: 0.0, alpha: 0.0 });
     id
 }
 
-fn arm_section(m: &mut Model) -> Id {
-    if let Some(x) = m.sections.iter().find(|x| x.name == "Rigid arm (wall)") {
+/// The arms' section: the wall's own in-plane inertia about both axes, so that they are
+/// rigid in and out of the wall's plane and in torsion.
+fn arm_section(m: &mut Model, t: f64, lw: f64) -> Id {
+    let name = format!("Rigid arm (wall {:.0} x {:.0} mm)", t * 1e3, lw * 1e3);
+    if let Some(x) = m.sections.iter().find(|x| x.name == name) {
         return x.id;
     }
+    let i = t * lw.powi(3) / 12.0;
     let id = m.sections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
-    m.sections.push(Section { id, name: "Rigid arm (wall)".into(), shape: Shape::General { a: 1.0, iy: 1.0, iz: 1.0, j: 1.0 } });
+    m.sections.push(Section { id, name, shape: Shape::General { a: t * lw, iy: i, iz: i, j: i } });
     id
+}
+
+/// Whether a wall's arms are of the current kind (models saved before ARM_FACTOR carry the
+/// old absolute arms, which `sync` then rebuilds).
+fn arms_ok(m: &Model, w: &Wall) -> bool {
+    m.members.iter().filter(|x| x.role == Role::WallLink(w.id)).all(|x| m.section(x.section).is_some_and(|s| s.name.starts_with("Rigid arm (wall ")) && m.material(x.material).is_some_and(|q| q.name.starts_with("Rigid arm (wall, E")))
 }
 
 /// The section of a wall's piers: a rectangle t × lw named after the wall.
@@ -86,7 +103,7 @@ pub fn sync(m: &mut Model) -> bool {
         let piers = m.members.iter().filter(|x| x.role == Role::WallPier(w.id)).count();
         let has = piers > 0 && piers + 1 == lv.len();
         let sec_ok = m.members.iter().filter(|x| x.role == Role::WallPier(w.id)).all(|x| m.section(x.section).is_some_and(|s| matches!(s.shape, Shape::Rect { b, h } if (b - w.t).abs() < 1e-6 && (h - w.length()).abs() < 1e-6)));
-        if has && lv == w.levels && sec_ok {
+        if has && lv == w.levels && sec_ok && arms_ok(m, w) {
             continue;
         }
         build(m, w, &lv);
@@ -101,6 +118,13 @@ pub fn sync(m: &mut Model) -> bool {
         m.delete_members(&gone);
         changed = true;
     }
+    // arm sections and materials no member uses any more (older arms, removed walls)
+    let used_s: std::collections::HashSet<Id> = m.members.iter().map(|x| x.section).collect();
+    let used_m: std::collections::HashSet<Id> = m.members.iter().map(|x| x.material).collect();
+    let (ns, nm) = (m.sections.len(), m.materials.len());
+    m.sections.retain(|x| !x.name.starts_with("Rigid arm (wall") || used_s.contains(&x.id));
+    m.materials.retain(|x| !x.name.starts_with("Rigid arm (wall") || used_m.contains(&x.id));
+    changed |= ns != m.sections.len() || nm != m.materials.len();
     changed
 }
 
@@ -125,7 +149,7 @@ fn build(m: &mut Model, w: &Wall, levels: &[f64]) {
         m.delete_members(&inside);
     }
     let sec = pier_section(m, w.t, lw);
-    let (arm_sec, arm_mat) = (arm_section(m), arm_material(m));
+    let (arm_sec, arm_mat) = (arm_section(m, w.t, lw), arm_material(m, w.material));
     let c = [(w.a[0] + w.b[0]) / 2.0, (w.a[1] + w.b[1]) / 2.0];
     // a column of roll 0 bends about its strong axis in the x-z plane: the wall's strong axis
     // turns with the wall

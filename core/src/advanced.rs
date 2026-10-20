@@ -274,23 +274,48 @@ pub fn moving_loads(model: &Model, a: &Analysis, spec: &MovingSpec) -> Result<(C
     let env = dedaliano_engine::solver::moving_loads::solve_moving_loads_3d(&mi).map_err(|e| format!("moving loads: {e}"))?;
     let mut hi = CaseResult { name: format!("{} max", spec.name), ..Default::default() };
     let mut lo = CaseResult { name: format!("{} min", spec.name), ..Default::default() };
-    // the envelope at x along a member: the extreme of the fine elements that touch x
+    // the envelope at x along a member: the extreme, at x, of the fine elements that start or end
+    // there (the engine's per-end envelope; its per-element extreme also holds the value one step
+    // away, which put a design example's envelope 0.8 % high where it changes fast), or between
+    // the ends of the element x lies in
     let at = |member: Id, x: f64| -> (Station, Station) {
         let (mut p, mut q) = (Station { x, ..Default::default() }, Station { x, ..Default::default() });
-        for (k, pc) in em.pieces.iter().enumerate().filter(|(_, pc)| pc.member == member && x >= pc.s0 - 1e-6 && x <= pc.s1 + 1e-6) {
-            if let Some(e) = env.elements.get(&(k + 1).to_string()) {
-                p.n = p.n.max(e.n_max_pos);
-                p.vy = p.vy.max(e.vy_max_pos);
-                p.vz = p.vz.max(e.vz_max_pos);
-                p.t = p.t.max(e.mx_max_pos);
-                p.my = p.my.max(e.my_max_pos);
-                p.mz = p.mz.max(e.mz_max_pos);
-                q.n = q.n.min(e.n_max_neg);
-                q.vy = q.vy.min(e.vy_max_neg);
-                q.vz = q.vz.min(e.vz_max_neg);
-                q.t = q.t.min(e.mx_max_neg);
-                q.my = q.my.min(e.my_max_neg);
-                q.mz = q.mz.min(e.mz_max_neg);
+        let mut put = |hi: &[f64; 6], lo: &[f64; 6]| {
+            // [n, vy, vz, mx, my, mz]
+            p.n = p.n.max(hi[0]);
+            p.vy = p.vy.max(hi[1]);
+            p.vz = p.vz.max(hi[2]);
+            p.t = p.t.max(hi[3]);
+            p.my = p.my.max(hi[4]);
+            p.mz = p.mz.max(hi[5]);
+            q.n = q.n.min(lo[0]);
+            q.vy = q.vy.min(lo[1]);
+            q.vz = q.vz.min(lo[2]);
+            q.t = q.t.min(lo[3]);
+            q.my = q.my.min(lo[4]);
+            q.mz = q.mz.min(lo[5]);
+        };
+        let mut found = false;
+        for (k, pc) in em.pieces.iter().enumerate().filter(|(_, pc)| pc.member == member) {
+            let Some(e) = env.elements.get(&(k + 1).to_string()) else { continue };
+            if (pc.s0 - x).abs() < 1e-6 {
+                put(&e.start_max, &e.start_min);
+                found = true;
+            }
+            if (pc.s1 - x).abs() < 1e-6 {
+                put(&e.end_max, &e.end_min);
+                found = true;
+            }
+        }
+        // a station inside an element of the train's model: between the envelopes at its two
+        // ends (the train stops at the element ends, so that is where its envelope is known)
+        if !found {
+            for (k, pc) in em.pieces.iter().enumerate().filter(|(_, pc)| pc.member == member && x > pc.s0 && x < pc.s1) {
+                if let Some(e) = env.elements.get(&(k + 1).to_string()) {
+                    let t = (x - pc.s0) / (pc.s1 - pc.s0);
+                    let mix = |a: &[f64; 6], b: &[f64; 6]| -> [f64; 6] { std::array::from_fn(|i| a[i] + t * (b[i] - a[i])) };
+                    put(&mix(&e.start_max, &e.end_max), &mix(&e.start_min, &e.end_min));
+                }
             }
         }
         (p, q)
@@ -304,6 +329,33 @@ pub fn moving_loads(model: &Model, a: &Analysis, spec: &MovingSpec) -> Result<(C
                 let (p, q) = at(m.id, pc.s0 + (pc.s1 - pc.s0) * t);
                 sh.stations.push(p);
                 sl.stations.push(q);
+            }
+        }
+        // a peak between two stations (an axle can stop anywhere, the absolute maximum moment of
+        // a simple span lies at L/2 - s/4): the nearer station takes it, so no extreme is missed
+        // while a station on a slope keeps its exact value
+        let fine: Vec<(f64, [f64; 6], [f64; 6])> = em.pieces.iter().enumerate().filter(|(_, pc)| pc.member == m.id).filter_map(|(k, pc)| env.elements.get(&(k + 1).to_string()).map(|e| (pc.s1, e.end_max, e.end_min))).collect();
+        let get = |st: &Station, k: usize| [st.n, st.vy, st.vz, st.t, st.my, st.mz][k];
+        let set = |st: &mut Station, k: usize, v: f64| match k {
+            0 => st.n = v,
+            1 => st.vy = v,
+            2 => st.vz = v,
+            3 => st.t = v,
+            4 => st.my = v,
+            _ => st.mz = v,
+        };
+        for j in 0..sh.stations.len().saturating_sub(1) {
+            let (xa, xb) = (sh.stations[j].x, sh.stations[j + 1].x);
+            for (x, fh, fl) in fine.iter().filter(|(x, _, _)| *x > xa + 1e-6 && *x < xb - 1e-6) {
+                let near = if x - xa <= xb - x { j } else { j + 1 };
+                for k in 0..6 {
+                    if fh[k] > get(&sh.stations[j], k).max(get(&sh.stations[j + 1], k)) {
+                        set(&mut sh.stations[near], k, fh[k]);
+                    }
+                    if fl[k] < get(&sl.stations[j], k).min(get(&sl.stations[j + 1], k)) {
+                        set(&mut sl.stations[near], k, fl[k]);
+                    }
+                }
             }
         }
         hi.members.push(sh);

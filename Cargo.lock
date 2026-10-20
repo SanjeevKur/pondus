@@ -4470,7 +4470,7 @@ checksum = "60f6ce597ecdcc9a098e7fddacb1065093a3d66446fa16c675e7e71d1b5c28e6"
 
 [[package]]
 name = "pondus"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "calamine",
  "craft-ui",
@@ -4490,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "pondus-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "calamine",
  "dedaliano-engine",

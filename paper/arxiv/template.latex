@@ -1,0 +1,62 @@
+\documentclass[11pt]{article}
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[utf8]{inputenc}
+\fi
+\usepackage[T1]{fontenc}
+\usepackage{newtxtext,newtxmath}
+\usepackage{microtype}
+\usepackage{arxiv}
+\usepackage{amsmath}
+\usepackage{longtable,booktabs,array}
+\usepackage{caption}
+\captionsetup[table]{skip=6pt,font=small}
+\captionsetup[figure]{font=small}
+\newcounter{none} % for unnumbered tables
+\usepackage{calc}
+\usepackage{etoolbox}
+\makeatletter
+\patchcmd\longtable{\par}{\if@noskipsec\mbox{}\fi\par}{}{}
+\makeatother
+\IfFileExists{footnotehyper.sty}{\usepackage{footnotehyper}}{\usepackage{footnote}}
+\makesavenoteenv{longtable}
+\usepackage{graphicx}
+\makeatletter
+\newsavebox\pandoc@box
+\newcommand*\pandocbounded[1]{%
+  \sbox\pandoc@box{#1}%
+  \Gscale@div\@tempa{\textheight}{\dimexpr\ht\pandoc@box+\dp\pandoc@box\relax}%
+  \Gscale@div\@tempb{\linewidth}{\wd\pandoc@box}%
+  \ifdim\@tempb\p@<\@tempa\p@\let\@tempa\@tempb\fi
+  \ifdim\@tempa\p@<\p@\scalebox{\@tempa}{\usebox\pandoc@box}%
+  \else\usebox{\pandoc@box}%
+  \fi}
+\def\fps@figure{htbp}
+\makeatother
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\setlength{\emergencystretch}{3em}
+\usepackage[numbers,square,sort&compress]{natbib}
+\bibliographystyle{unsrtnat}
+\setlength{\bibsep}{2pt plus 1pt}
+\usepackage[hyphens]{url}
+\usepackage[colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black,pdfusetitle]{hyperref}
+\urlstyle{same}
+\setcounter{secnumdepth}{2}
+\renewcommand{\shorttitle}{$shorttitle$}
+
+\title{$title$}
+$if(subtitle)$\subtitle{$subtitle$}$endif$
+\author{$authorblock$}
+\date{$date$}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+$abstract$
+\end{abstract}
+\keywords{$for(keywords)$$keywords$$sep$ $$\cdot$$ $endfor$}
+
+$body$
+
+\end{document}
