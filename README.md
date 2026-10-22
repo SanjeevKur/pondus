@@ -6,8 +6,13 @@
 Ask an AI agent to build, analyse and design a building, then check every number yourself in the same model.</p>
 
 <p align="center">
+<a href="https://doi.org/10.5281/zenodo.23581167"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.23581167.svg" alt="DOI 10.5281/zenodo.23581167"></a>
+</p>
+
+<p align="center">
 <a href="https://github.com/Sompote/pondus/releases/latest"><b>⬇ Download for macOS or Windows</b></a> ·
-<a href="paper/paper.pdf">Verification paper</a> ·
+<a href="https://doi.org/10.5281/zenodo.23581167">Paper (Zenodo)</a> ·
+<a href="paper/paper.pdf">Calibration report</a> ·
 <a href="docs/mcp.md">Use with Claude or ChatGPT</a>
 </p>
 
@@ -18,12 +23,37 @@ Ask an AI agent to build, analyse and design a building, then check every number
 
 - **Tell it what to build.** Type a request such as *"a 3-storey concrete frame, 3 bays of 6 m by 2 bays of 5 m, 150 mm slabs, office live load, design the beams and slabs"*. The agent builds the model, runs the analysis and designs it while you watch.
 - **Or draw it yourself.** Beams, columns, bays, slabs, walls, supports and loads are drawn and edited with the mouse, and you can switch between the agent and your own hand at any time.
-- **Analysis:** 3D frames with slabs, shear walls, earthquake (response spectrum), P-Delta and buckling, pushover, moving loads for bridges, construction stages and time history.
+- **Analysis:** 3D frames with slabs, shear walls, earthquake (response spectrum with CQC or SRSS, storey masses at the centre of mass), P-Delta and buckling, pushover, moving loads for bridges, construction stages and time history, with optional shear deformation of the members as in SAP2000 and ETABS.
 - **Design:** reinforced concrete beams, slabs, columns, walls and footings to **ACI 318-19**, and steel to **AISC 360-16** or **Eurocode 3**, with the bars and sizes chosen for you.
 - **Report:** a complete calculation report as a PDF, ready to check and submit.
 - **Exchange:** Excel, DXF (AutoCAD) and IFC (Revit and BIM).
 - **Fast on large models:** a 156-storey tower with 41,000 elements and 60 earthquake modes analyses in about a minute on a 16-core computer, and Windows and Linux machines with an NVIDIA GPU factorise the large stiffness matrices on the card, with the same answers.
-- **Checked against published results:** 470 comparisons with textbooks and design-code examples, 430 of them within 0.5 %, plus a check against a full-scale building tested on a shake table ([paper](paper/paper.pdf)), and 199 comparisons with the SAP2000 and ETABS verification problems of CSI, 177 of them within 0.5 % ([notes](calibration/NOTES_csi.md)).
+- **Checked against published results:** 470 comparisons with textbooks and design-code examples, 430 of them within 0.5 %, plus a check against a full-scale building tested on a shake table ([calibration report](paper/paper.pdf)), and 199 comparisons with the verification problems of SAP2000 and ETABS, 177 of them within 0.5 % ([paper](https://doi.org/10.5281/zenodo.23581167), [notes](calibration/NOTES_csi.md)).
+
+## The paper
+
+**[Pondus: an agentic structural analysis and design program](https://doi.org/10.5281/zenodo.23581167)** (S. Youwai, October 2026, Zenodo, DOI [10.5281/zenodo.23581167](https://doi.org/10.5281/zenodo.23581167); also in this repository as [paper/pondus-agentic.pdf](paper/pondus-agentic.pdf)) describes:
+- **The agent:** how it is set up, in the built-in chat and from Claude Desktop, Claude Code and ChatGPT through the MCP server.
+- **The analysis and design:** how the agent builds, analyses and designs a structure.
+- **The engine:** how Pondus connects to the Stabileo engine and to the Stabileo and Aedifex model files.
+- **Two recorded agent runs:** a two-storey frame in 105 s, and a five-storey wall-frame building with an earthquake analysis and a calculation report in 382 s. The agent's answers are audited against the program and hand checks: every number was right, but four descriptions were wrong.
+- **Both calibrations:** against 470 published benchmarks, and against 199 verification problems of SAP2000 and ETABS.
+
+The detailed report of the first calibration, with every comparison listed, is [paper/paper.pdf](paper/paper.pdf).
+
+If you use Pondus in your work, please cite:
+
+```bibtex
+@misc{youwai2026pondus,
+  author    = {Youwai, Sompote},
+  title     = {Pondus: an agentic structural analysis and design program},
+  year      = {2026},
+  publisher = {Zenodo},
+  version   = {v1},
+  doi       = {10.5281/zenodo.23581167},
+  url       = {https://doi.org/10.5281/zenodo.23581167}
+}
+```
 
 ## Features
 
@@ -94,7 +124,9 @@ You can also let **Claude Desktop, Claude Code or ChatGPT** drive Pondus directl
 The sections below hold the technical details. Click a heading to open it.
 
 <details>
-<summary><b>Verification and the paper</b></summary>
+<summary><b>Verification and the papers</b></summary>
+
+**[Pondus: an agentic structural analysis and design program](https://doi.org/10.5281/zenodo.23581167)** (S. Youwai, October 2026, DOI 10.5281/zenodo.23581167, [PDF](paper/pondus-agentic.pdf)) is the main paper. It covers the agent, the link to Stabileo, two audited agent runs, and both calibrations: Section 8.2 summarises the benchmark calibration, and Section 8.4 the SAP2000 and ETABS calibration with its eight defects.
 
 **[Calibrating an agentic structural analysis and design program against published benchmarks](paper/paper.pdf)** (S. Youwai, October 2026) reports how Pondus was checked against reference values from textbooks, software verification manuals and the published worked examples of the design codes. Every comparison goes through Pondus's own model, analysis wrapper and design code. Of 470 comparisons over 229 cases, 430 agree within 0.5 % and 449 within 1 %, and each of the other 21 is explained by mesh convergence, the conservative load contour for biaxial bending, the rounded SI constants of ACI 318 or the shear deformation of walls that Euler–Bernoulli references leave out. Shear walls under earthquake and dynamic loading are checked against the cantilever frequencies of Clough and Penzien, the wall-frame continuum of Heidebrecht and Stafford Smith, a one-storey system with torsional coupling and a step response by modal superposition. Moving loads are checked against the HL-93 envelopes of the FHWA two-span continuous steel girder bridge (Design Example 2A), within 0.16 % for the vehicles and 0.65 % with the lane load. The calibration and the closed-form tests before it found fourteen defects, six of them unconservative, and thirteen of the fourteen lay in the code that prepares the inputs of a kernel or a check rather than in the kernels. A separate validation against the full-scale 7-storey wall building tested on the UCSD–NEES shake table (`core/tests/validation_ucsd.rs`) gives the measured first period within 6.2 % and the second-mode frequency within 0.9 % with gross sections, and the ACI 318 effective stiffnesses bracket the periods measured after the earthquake tests. The paper's tables and figures are generated from the test output (`calibration/*.csv`, `calibration/validation/`), and `paper/build.sh` rebuilds the PDF in arXiv format (pandoc and tectonic) together with the arXiv submission package `paper/arxiv/submission.tar.gz`.
 
