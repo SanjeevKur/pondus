@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use dedaliano_engine::solver::dof::DofNumbering;
 use dedaliano_engine::solver::linear::compute_internal_forces_3d_with_loads;
-use dedaliano_engine::solver::modal::{solve_modal_3d, ModalResult3D};
+use dedaliano_engine::solver::modal::{solve_modal_3d_with_masses, ModalResult3D};
 use dedaliano_engine::types::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,8 @@ pub struct Seismic {
     pub damping: f64,
     /// Modes until this share of the mass takes part in x and y.
     pub mass_target: f64,
+    /// The modal combination: "cqc" (default) or "srss".
+    pub combination: String,
     pub max_modes: usize,
     /// The response spectrum base shear is scaled up to this share of the ELF base shear.
     pub elf_ratio: f64,
@@ -115,7 +117,7 @@ pub struct Seismic {
 
 impl Default for Seismic {
     fn default() -> Self {
-        Seismic { enabled: false, spectrum: Spectrum::Code { sds: 0.5, sd1: 0.3, tl: 6.0 }, r: 8.0, ie: 1.0, cd: 5.5, omega0: 3.0, rho: 1.0, live_mass: 0.25, damping: 0.05, mass_target: 0.9, max_modes: 60, elf_ratio: 1.0, ct: 0.0466, x: 0.9, cu: 1.4, drift_limit: 0.020, live_in_e: 1.0 }
+        Seismic { enabled: false, spectrum: Spectrum::Code { sds: 0.5, sd1: 0.3, tl: 6.0 }, r: 8.0, ie: 1.0, cd: 5.5, omega0: 3.0, rho: 1.0, live_mass: 0.25, damping: 0.05, mass_target: 0.9, combination: "cqc".into(), max_modes: 60, elf_ratio: 1.0, ct: 0.0466, x: 0.9, cu: 1.4, drift_limit: 0.020, live_in_e: 1.0 }
     }
 }
 
@@ -196,11 +198,12 @@ pub(crate) fn run(model: &Model, asm: &Assembly, a: &Analysis) -> Result<Seismic
         return Err("seismic: R and Ie must be positive".into());
     }
     let (input, densities, weight, mut w2) = mass_model(model, asm.input, asm.pieces, asm.quads, asm.gravity, &asm.point_cases)?;
+    let lumped = nodal_masses(model, asm.node_of);
     warnings.append(&mut w2);
     // modes until mass_target in x and y
     let mut n = 12usize.min(sc.max_modes.max(1));
     let modal: ModalResult3D = loop {
-        let r = solve_modal_3d(&input, &densities, n).map_err(|e| format!("modal analysis: {e}"))?;
+        let r = solve_modal_3d_with_masses(&input, &densities, &lumped, n).map_err(|e| format!("modal analysis: {e}"))?;
         let mx: f64 = r.modes.iter().map(|m| m.mass_ratio_x).sum();
         let my: f64 = r.modes.iter().map(|m| m.mass_ratio_y).sum();
         let got = r.modes.len();
@@ -227,7 +230,8 @@ pub(crate) fn run(model: &Model, asm: &Assembly, a: &Analysis) -> Result<Seismic
         })
         .collect();
     let omegas: Vec<f64> = modal.modes.iter().map(|m| m.omega).collect();
-    let corr: Vec<Vec<f64>> = omegas.iter().map(|wi| omegas.iter().map(|wj| rho_cqc(*wi, *wj, sc.damping)).collect()).collect();
+    let srss = sc.combination.eq_ignore_ascii_case("srss");
+    let corr: Vec<Vec<f64>> = omegas.iter().enumerate().map(|(i, wi)| omegas.iter().enumerate().map(|(j, wj)| if srss { if i == j { 1.0 } else { 0.0 } } else { rho_cqc(*wi, *wj, sc.damping) }).collect()).collect();
     let dof = DofNumbering::build_3d(&input);
     let mass_t = weight / G;
     // the storeys: levels with columns
@@ -385,10 +389,27 @@ pub(crate) fn mass_model(model: &Model, input0: &SolverInput3D, pieces: &[crate:
     for m in input.materials.keys().cloned().collect::<Vec<_>>() {
         densities.entry(m).or_insert(1.0);
     }
+    // the lumped masses' weight (their larger horizontal mass)
+    weight += model.masses.iter().map(|m| m.m[0].max(m.m[1]) * G).sum::<f64>();
     if weight <= 0.0 {
-        return Err("seismic: the model has no mass (no dead load, self-weight or slabs)".into());
+        return Err("seismic: the model has no mass (no dead load, self-weight, slabs or lumped masses)".into());
     }
     Ok((input, densities, weight, warnings))
+}
+
+/// The model's lumped masses by engine node: [mx, my, mz, Ixx, Iyy, Izz] in t and t·m².
+pub(crate) fn nodal_masses(model: &Model, node_of: &HashMap<Id, usize>) -> HashMap<usize, [f64; 6]> {
+    let mut out: HashMap<usize, [f64; 6]> = HashMap::new();
+    for nm in &model.masses {
+        if let Some(&g) = node_of.get(&nm.node) {
+            let e = out.entry(g).or_insert([0.0; 6]);
+            for k in 0..3 {
+                e[k] += nm.m[k];
+                e[k + 3] += nm.r[k];
+            }
+        }
+    }
+    out
 }
 
 /// The seismic strength combinations (ASCE 7-22 2.3.6 with E = ρQE ± 0.2·SDS·D):

@@ -1,0 +1,112 @@
+case,quantity,unit,independent,program,program_value,pondus
+"ETABS 15a wall L = 120 in, 6 storeys","top displacement","in",2.4287,"ETABS",2.3921,2.448001839054326
+"ETABS 15a wall L = 360 in, 6 storeys","top displacement","in",0.1031,"ETABS",0.0986,0.10489029055783261
+"ETABS 15a wall L = 720 in, 6 storeys","top displacement","in",0.0186,"ETABS",0.0172,0.0191125024163048
+"ETABS 15a wall L = 120 in, 3 storeys","top displacement","in",0.3205,"ETABS",0.3071,0.32400143656485497
+"ETABS 15a wall L = 360 in, 3 storeys","top displacement","in",0.0187,"ETABS",0.017,0.01911250243800065
+"ETABS 15a wall L = 720 in, 3 storeys","top displacement","in",0.0052,"ETABS",0.0046,0.0053902784714987455
+"ETABS 15a wall L = 120 in, 1 storeys","top displacement","in",0.0185,"ETABS",0.0145,0.0191125025013658
+"ETABS 15a wall L = 360 in, 1 storeys","top displacement","in",0.0029,"ETABS",0.0025,0.0030795785864648952
+"ETABS 15a wall L = 720 in, 1 storeys","top displacement","in",0.0013,"ETABS",0.0011,0.0013861627302697724
+"SAP2000 1-001 three-member frame, load case 1","Uz joint 3","in",-0.02639,"SAP2000",-0.02639,-0.026389711787708596
+"SAP2000 1-001 three-member frame, load case 2","Uz joint 3","in",0.06296,"SAP2000",0.06296,0.06295961935193693
+"SAP2000 1-001 three-member frame, load case 3","Uz joint 3","in",0.06296,"SAP2000",0.06296,0.06295961935194416
+"SAP2000 1-001 three-member frame, load case 4","Uz joint 3","in",-0.2963,"SAP2000",-0.2963,-0.2963018906372301
+"SAP2000 1-001 three-member frame, load case 5","Ux joint 2","in",0.3125,"SAP2000",0.3125,0.31250189276028967
+"SAP2000 1-001 three-member frame, load case 6","Ux joint 2","in",0.11556,"SAP2000",0.11556,0.11555584031175332
+"SAP2000 1-001 three-member frame, load case 7","Ux joint 2","in",0.00651,"SAP2000",0.00651,0.006511372381813523
+"SAP2000 1-002 model A, case 1","Ux free end","in",0.0013,"SAP2000",0.0013,0.0012999999999999982
+"SAP2000 1-002 model A, case 2","Ux free end","in",0.00065,"SAP2000",0.00065,0.0006499999999999976
+"SAP2000 1-002 model A, case 3","Uz free end","in",-0.0065,"SAP2000",-0.0065,-0.006499999999998445
+"SAP2000 1-002 model B, case 1","Fx at the prop","kip",-22.62,"SAP2000",-22.62,-22.61999708171813
+"SAP2000 1-002 model B, case 2","Fx at the prop","kip",-11.31,"SAP2000",-11.31,-11.309998540859059
+"SAP2000 1-002 model B, case 3","Fz at the prop","kip",2.545,"SAP2000",2.545,2.544749671693287
+"SAP2000 1-005 model A (settlement 0.5 in)","Fz joint 1","kip",6.293,"SAP2000",6.293,6.2934021508563
+"SAP2000 1-005 model A (settlement 0.5 in)","My joint 1","kip-in",-906.25,"SAP2000",-906.25,-906.2498177018824
+"SAP2000 1-005 model B (spring end displaced 0.2 in)","Fz joint 1","kip",1.115,"SAP2000",1.115,1.1145272264944739
+"SAP2000 1-005 model B (spring end displaced 0.2 in)","My joint 1","kip-in",-160.492,"SAP2000",-160.492,-160.49190431869198
+"SAP2000 1-005 model C (rotation 0.01 rad of joint 1)","Fz joint 1","kip",-18.125,"SAP2000",-18.125,-18.124996354036764
+"SAP2000 1-005 model C (rotation 0.01 rad of joint 1)","My joint 1","kip-in",2610,"SAP2000",2610,2609.999916681766
+"SAP2000 1-005 model D (rotational spring end rotated 0.01 rad)","My joint 1","kip-in",-473.469,"SAP2000",-473.469,-473.4692979167445
+"SAP2000 1-005 model D (rotational spring end rotated 0.01 rad)","Ry joint 4","rad",0.00408,"SAP2000",0.00408,0.00408163285940794
+"SAP2000 1-013 beam on elastic foundation","Uz at mid-span (100 elements)","in",-0.08933,"SAP2000",-0.08933,-0.0893327370528885
+"SAP2000 1-013 beam on elastic foundation","My at mid-span (100 elements)","kip-in",17698,"SAP2000",17698,17697.74927184913
+"SAP2000 1-014 cantilever","T1 (bending)","s",0.038005,"SAP2000 (96 elements)",0.038003,0.037975961154246216
+"SAP2000 1-014 cantilever","T2 (bending)","s",0.025337,"SAP2000 (96 elements)",0.025335,0.02534500689687283
+"SAP2000 1-014 cantilever","T3 (bending)","s",0.006064,"SAP2000 (96 elements)",0.006065,0.006059773019806775
+"SAP2000 1-014 cantilever","T4 (bending)","s",0.004043,"SAP2000 (96 elements)",0.004043,0.004044268645600701
+"SAP2000 1-014 cantilever","T5 (bending)","s",0.002165,"SAP2000 (96 elements)",0.002166,0.002164177527646515
+"SAP2000 1-016 with 20.25 k tension (P-Delta)","My at mid-span (128 elements per member)","kip-in",11.498,"SAP2000 (16 elements)",11.498,11.498868008320473
+"SAP2000 1-018 model A bending + shear + axial","Uz joint 5","in",-2.77076,"SAP2000",-2.77076,-2.7707565943620365
+"SAP2000 1-018 model B bending only","Uz joint 5","in",-2.72361,"SAP2000",-2.72361,-2.7236107267941962
+"SAP2000 1-018 model C shear only","Uz joint 5","in",-0.03954,"SAP2000",-0.03954,-0.039542687601555236
+"SAP2000 1-018 model D axial only","Uz joint 5","in",-0.0076,"SAP2000",-0.0076,-0.0076045684956431185
+"SAP2000 1-019 pinned portal","Pcr (4 elements per member)","kip",280.19,"SAP2000",280.19,280.18560151275744
+"SAP2000 1-020 two-storey frame, SRSS","T1","s",1.562,"SAP2000",1.562,1.5624712620099532
+"SAP2000 1-020 two-storey frame, SRSS","T2","s",0.5868,"SAP2000",0.5868,0.5872365633381083
+"SAP2000 1-020 two-storey frame, SRSS","Ux joint 2","in",7.566,"SAP2000",7.576,7.579715975311258
+"SAP2000 1-020 two-storey frame, SRSS","Ux joint 3","in",18.81,"SAP2000",18.84,18.849116410597674
+"SAP2000 1-020 two-storey frame, SRSS","M first-storey column at joint 1","kip-in",12624,"SAP2000",12636,12640.874964864079
+"SAP2000 1-020 two-storey frame, SRSS","M first-storey column at joint 2","kip-in",6792,"SAP2000",6793,6794.655616994204
+"SAP2000 1-020 two-storey frame, SRSS","M second-storey column at joint 2","kip-in",6024,"SAP2000",6023,6025.3412969770225
+"SAP2000 1-020 two-storey frame, SRSS","M second-storey column at joint 3","kip-in",5220,"SAP2000",5222,5223.9487984389
+"SAP2000 1-020 two-storey frame, SRSS","M first-floor beam at joint 2","kip-in",9792,"SAP2000",9810,9812.821844090702
+"SAP2000 1-020 two-storey frame, SRSS","M first-floor beam at joint 5","kip-in",9792,"SAP2000",9810,9812.821844092381
+"SAP2000 1-020 two-storey frame, SRSS","M roof beam at joint 3","kip-in",5220,"SAP2000",5222,5223.936441137919
+"SAP2000 1-020 two-storey frame, SRSS","M roof beam at joint 6","kip-in",5220,"SAP2000",5222,5223.936441138411
+"SAP2000 1-021 / ETABS 6 Bathe-Wilson frame","eigenvalue ω²1","rad²/s²",0.589541,"SAP2000",0.589541,0.589823926509089
+"SAP2000 1-021 / ETABS 6 Bathe-Wilson frame","eigenvalue ω²1","rad²/s²",0.589541,"ETABS",0.5895,0.589823926509089
+"SAP2000 1-021 / ETABS 6 Bathe-Wilson frame","eigenvalue ω²2","rad²/s²",5.52695,"SAP2000",5.52696,5.549993408872818
+"SAP2000 1-021 / ETABS 6 Bathe-Wilson frame","eigenvalue ω²2","rad²/s²",5.52695,"ETABS",5.527,5.549993408872818
+"SAP2000 1-021 / ETABS 6 Bathe-Wilson frame","eigenvalue ω²3","rad²/s²",16.5878,"SAP2000",16.5879,16.770636247026196
+"SAP2000 1-021 / ETABS 6 Bathe-Wilson frame","eigenvalue ω²3","rad²/s²",16.5878,"ETABS",16.5879,16.770636247026196
+"SAP2000 1-022 / ETABS 7 seven-storey frame, static LAT","Ux joint 22 (roof)","in",1.45076,"SAP2000",1.45076,1.450757192571308
+"SAP2000 1-022 / ETABS 7 seven-storey frame, static LAT","axial force, column 1","kip",69.99,"SAP2000",69.99,69.98673407252201
+"SAP2000 1-022 / ETABS 7 seven-storey frame, static LAT","moment, column 1 at joint 1","kip-in",2324.68,"SAP2000",2324.68,2324.6772929118333
+"SAP2000 1-022 / ETABS 7 seven-storey frame, modes","T1","s",1.2732,"SAP2000",1.2732,1.2732170720506837
+"SAP2000 1-022 / ETABS 7 seven-storey frame, modes","T2","s",0.4313,"SAP2000",0.4313,0.43128073112996
+"SAP2000 1-022 / ETABS 7 seven-storey frame, modes","T3","s",0.242,"SAP2000",0.242,0.24204446848811773
+"SAP2000 1-022 / ETABS 7 seven-storey frame, modes","T4","s",0.1602,"SAP2000",0.1602,0.1601796603073718
+"SAP2000 1-022 / ETABS 7 seven-storey frame, modes","T5","s",0.119,"SAP2000",0.119,0.11899010352319962
+"SAP2000 1-022 / ETABS 7 seven-storey frame, modes","T6","s",0.0951,"SAP2000",0.0951,0.0950642453566809
+"SAP2000 1-022 / ETABS 7 seven-storey frame, modes","T7","s",0.0795,"SAP2000",0.0795,0.07951511494815505
+"SAP2000 1-022 / ETABS 7 seven-storey frame, response spectrum SRSS","Ux joint 22 (roof)","in",5.438,"SAP2000",5.436,5.434226784578562
+"SAP2000 1-022 / ETABS 7 seven-storey frame, response spectrum SRSS","axial force, column 1","kip",261.8,"SAP2000",261.7,261.59368560407495
+"SAP2000 1-022 / ETABS 7 seven-storey frame, response spectrum SRSS","moment, column 1 at joint 1","kip-in",9868,"SAP2000",9864,9859.887954598993
+"SAP2000 1-022 / ETABS 7 seven-storey frame, response spectrum CQC","Ux joint 22 (roof)","in",5.438,"SAP2000",5.431,5.428854955558645
+"SAP2000 1-022 / ETABS 7 seven-storey frame, response spectrum CQC","axial force, column 1","kip",261.8,"SAP2000",261.5,261.39573603212796
+"SAP2000 1-022 / ETABS 7 seven-storey frame, response spectrum CQC","moment, column 1 at joint 1","kip-in",9868,"SAP2000",9916,9911.606099903513
+"SAP2000 1-024 / ETABS 8 two-storey 3D frame, modes","T1","s",0.2271,"ETABS",0.22708,0.22712421411587674
+"SAP2000 1-024 / ETABS 8 two-storey 3D frame, modes","T2","s",0.2156,"ETABS",0.21565,0.21568183946668046
+"SAP2000 1-024 / ETABS 8 two-storey 3D frame, modes","T3","s",0.0733,"ETABS",0.07335,0.07336680275984446
+"SAP2000 1-024 / ETABS 8 two-storey 3D frame, modes","T4","s",0.072,"ETABS",0.07201,0.07202503765346473
+"SAP2000 1-024 / ETABS 8 two-storey 3D frame, constant 0.4 g, CQC","Ux at the roof centre of mass","ft",0.02014,"SAP2000",0.02014,0.02014720811583136
+"SAP2000 1-024 / ETABS 8 two-storey 3D frame, constant 0.4 g, SRSS","Ux at the roof centre of mass","ft",0.02012,"SAP2000",0.02012,0.020123050116576613
+"SAP2000 1-025 / ETABS 5 braced L building, modes","f1","Hz",3.0592,"ETABS",3.0594138163127944,3.058982589129096
+"SAP2000 1-025 / ETABS 5 braced L building, modes","f2","Hz",3.1188,"ETABS",3.1190543027354107,3.1187563601631365
+"SAP2000 1-025 / ETABS 5 braced L building, CQC","Ux roof centre of mass","in",1.0329,"SAP2000",1.0329,1.032323465584492
+"SAP2000 1-025 / ETABS 5 braced L building, CQC","Uy roof centre of mass","in",0.1414,"SAP2000",0.1414,0.1417728946690123
+"SAP2000 1-025 / ETABS 5 braced L building, CQC","Rz roof","rad",0.000252,"SAP2000",0.000252,0.000251850978113912
+"SAP2000 1-025 / ETABS 5 braced L building, CQC","axial column C1, storey 1 (frame 1)","kip",279.48,"SAP2000",279.48,279.3366896068119
+"SAP2000 1-025 / ETABS 5 braced L building, CQC","axial brace D1, storey 1 (frame 4)","kip",194.5,"SAP2000",194.5,194.40253144686992
+"SAP2000 1-025 / ETABS 5 braced L building, CQC","axial brace D3, storey 1 (frame 6)","kip",120.52,"SAP2000",120.52,120.46046655094915
+"SAP2000 1-025 / ETABS 5 braced L building, SRSS","Ux roof centre of mass","in",0.7372,"SAP2000",0.7372,0.7367781358747073
+"SAP2000 1-025 / ETABS 5 braced L building, SRSS","axial column C1, storey 1 (frame 1)","kip",200.55,"SAP2000",200.55,200.41313391563037
+"SAP2000 1-025 / ETABS 5 braced L building, SRSS","axial brace D1, storey 1 (frame 4)","kip",139.57,"SAP2000",139.57,139.4762023255111
+"SAP2000 1-025 / ETABS 5 braced L building, SRSS","axial brace D3, storey 1 (frame 6)","kip",86.48,"SAP2000",86.48,86.42566687725603
+"ETABS ACI 318-14 Ex. 001, 10x16 beam","As required","in²",2.37,"ETABS",2.37,2.3705941929680847
+"ETABS ACI 318-14 Ex. 001, 10x16 beam","Av/s","in²/in",0.041,"ETABS",0.041,0.04052123359859339
+"ETABS ACI 318-14 Ex. 002, 14x22 column","demand/capacity","-",1,"ETABS",1,0.9993045723849514
+"ETABS ACI 318-14 Wall-001, 12x60 pier","demand/capacity","-",1,"ETABS",1.007,1.009235647460748
+"ETABS AISC 360-10 Ex. 001, W18X50","Cb, Lb = 35 ft","-",1.136,"ETABS",1.138,1.1363636363636365
+"ETABS AISC 360-10 Ex. 001, W18X50","φbMn, Lb = 5 ft, Cb 1.002","kip-ft",378.75,"ETABS",378.75,378.7499511361956
+"ETABS AISC 360-10 Ex. 001, W18X50","φbMn, Lb = 11.667 ft, Cb 1.014","kip-ft",306.657,"ETABS",307.124,306.82965569206306
+"ETABS AISC 360-10 Ex. 001, W18X50","φbMn, Lb = 35 ft, Cb 1.136","kip-ft",94.218,"ETABS",94.377,94.21275516781054
+"ETABS EN 2-2004 Ex. 001, 230x550 beam","Asw/s","mm²/m",249.5,"ETABS",249.5,249.45578231292512
+"ETABS EN 3-2005 Ex. 001, IPE 200","D/C axial","-",0.334,"ETABS",0.334,0.3341874275248286
+"ETABS EN 3-2005 Ex. 001, IPE 200","interaction (example: Annex A 0.980 total; Pondus: Annex B)","-",0.98,"ETABS",0.9830000000000001,0.8735520355377415
+"ETABS EN 3-2005 Ex. 002, 406x178x74 UB","Vpl,Rd (example η = 1.2: Av = 4341 mm²)","kN",689.2,"ETABS",689.2,664.5070038122268
+"ETABS EN 3-2005 Ex. 002, 406x178x74 UB","Mc,y,Rd","kN·m",412.8,"ETABS",412.8,412.72164741273957
+"ETABS EN 3-2005 Ex. 002, 406x178x74 UB","My,V,Rd (example η = 1.2, ρ = 0.27)","kN·m",386.8,"ETABS",386.8,380.8485664585383
+"ETABS EN 3-2005 Ex. 003, 457x191x98 UB","Mpl,y,Rd","kN·m",524.5,"ETABS",524.1,524.6162663210459
+"ETABS EN 3-2005 Ex. 003, 457x191x98 UB","MN,y,Rd","kN·m",342.2,"ETABS",341.9,343.169278079577

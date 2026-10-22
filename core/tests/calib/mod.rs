@@ -42,3 +42,22 @@ pub fn check(r: Row) {
     }
     assert!(err.abs() <= r.tol, "{} / {}: {} = {} vs {} ({:+.3} % > {} %)", r.aspect, r.case, r.quantity, r.pondus, r.reference, err, r.tol);
 }
+
+/// Records, without asserting, what the other program printed for a quantity next to the
+/// independent value and Pondus (`<dir>/programs.csv`): the CSI verification manuals print
+/// SAP2000's or ETABS's own result beside the hand or textbook value.
+#[allow(clippy::too_many_arguments)]
+pub fn program(case: &str, quantity: &str, unit: &str, independent: f64, program: &str, program_value: f64, pondus: f64) {
+    eprintln!("  [{program}] {case} | {quantity}: independent {independent}, {program} {program_value}, Pondus {pondus:.6} {unit}");
+    if let Some(dir) = std::env::var_os("PONDUS_CALIB") {
+        let p = std::path::Path::new(&dir).join("programs.csv");
+        let new = !p.exists();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            if new {
+                let _ = writeln!(f, "case,quantity,unit,independent,program,program_value,pondus");
+            }
+            let q = |s: &str| format!("\"{}\"", s.replace('"', "'"));
+            let _ = writeln!(f, "{},{},{},{},{},{},{}", q(case), q(quantity), q(unit), independent, q(program), program_value, pondus);
+        }
+    }
+}

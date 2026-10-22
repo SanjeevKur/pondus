@@ -185,6 +185,8 @@ pub fn check_ec3(member: crate::model::Id, bim_id: Option<String>, name: &str, m
     for (combo, st) in &dem.uls {
         let c1 = ec3_c1(dem, st);
         let ltb = ec3_ltb(dem, st);
+        // Table B.3 from this combination's moment diagrams (1.0 used to be taken throughout)
+        let cm = ec3_cm(dem, st);
         let members: Vec<Ec3MemberData> = st
             .iter()
             .enumerate()
@@ -192,12 +194,25 @@ pub fn check_ec3(member: crate::model::Id, bim_id: Option<String>, name: &str, m
                 let mut m = mk(k + 1, c1);
                 m.section_class = ec3_class_nm(h, p, fy, -s.1 * 1e3, s.4 * 1e6).1;
                 m.ltb = ltb.clone();
+                m.interaction = Some(cm.clone());
+                // 6.2.8: with VEd over half of Vpl,Rd the web takes (1 − ρ) fy, so the major-axis
+                // moduli lose ρ Aw²/4tw (plastic, 6.2.8(5)) and ρ tw hw²/6 (elastic)
+                let rho = shear_rho(&m, s.3.abs().max(s.2.abs()) * 1e3);
+                if rho > 0.0 {
+                    let (tw, hw) = (h.tw / 1e3, (h.d - 2.0 * h.tf) / 1e3);
+                    m.wpl_y = (m.wpl_y - rho * (hw * tw).powi(2) / (4.0 * tw)).max(0.0);
+                    m.wel_y = (m.wel_y - rho * tw * hw * hw / 6.0).max(0.0);
+                }
                 m
             })
             .collect();
+        let section_nm: Vec<Option<(f64, String)>> = st.iter().zip(&members).map(|(s, m)| section_n_m(m, h, s.1 * 1e3, s.4 * 1e3, s.5 * 1e3)).collect();
         let forces: Vec<Ec3DesignForces> = st.iter().enumerate().map(|(k, s)| Ec3DesignForces { element_id: k + 1, n_ed: Some(s.1 * 1e3), my_ed: Some(s.4 * 1e3), mz_ed: Some(s.5 * 1e3), v_ed: Some(s.3.abs().max(s.2.abs()) * 1e3) }).collect();
-        for (r, s) in check_ec3_members(&Ec3CheckInput { members, forces }).iter().zip(st) {
+        for ((r, s), nm) in check_ec3_members(&Ec3CheckInput { members, forces }).iter().zip(st).zip(&section_nm) {
             let at = format!("{combo}, x = {:.2} m", s.0);
+            if let Some((ratio, how)) = nm {
+                worst("cross-section N + M (6.2.9.1)", *ratio, format!("{at}: {how}"));
+            }
             worst("axial (6.2.3 / 6.3.1)", r.compression_ratio.max(r.tension_ratio), format!("{at}: NEd {:.0} kN, Nb,Rd {:.0} kN (χy {:.2}, χz {:.2})", s.1, r.nb_rd / 1e3, r.chi_y, r.chi_z));
             // the net section in tension, 6.2.3(2)b: Nu,Rd = 0.9 Anet fu / γM2 (γM2 = 1.25)
             if let (Some(t), true) = (&dem.tension, s.1 > 0.0) {
@@ -217,6 +232,106 @@ pub fn check_ec3(member: crate::model::Id, bim_id: Option<String>, name: &str, m
     worst("deflection (service)", (dem.defl_live * 1000.0 / lim_l).max(dem.defl_total * 1000.0 / lim_t), format!("live {:.1} mm (limit {lim_l:.1}), total {:.1} mm (limit {lim_t:.1})", dem.defl_live * 1000.0, dem.defl_total * 1000.0));
     let (ratio, governs) = checks.iter().map(|c| (c.ratio, c.name.clone())).fold((0.0, String::new()), |a, b| if b.0 > a.0 { b } else { a });
     SteelDesign { member, bim_id, section: name.into(), mass, length: dem.length, ratio, governs, ok: ratio <= set.target_ratio + 1e-9, checks, notes: vec![format!("EN 1993-1-1, Class {cls}, γM0 = γM1 = 1.0, curves y {cy:?} z {cz:?} LT {clt:?}")] }
+}
+
+/// The equivalent uniform moment factors Cmy, Cmz and CmLT of EN 1993-1-1 Table B.3 from a
+/// combination's moment diagrams over the member (the member is the segment between braced
+/// points, as Pondus's buckling lengths assume): the end moments Mh (ψ = the smaller over the
+/// larger, with its sign) and the largest span moment Ms. With no span moment, Cm = 0.6 + 0.4ψ
+/// ≥ 0.4; with one, the uniform-load column, the larger of the two load columns: 0.2 + 0.8αs
+/// (αs = Ms/Mh ≥ 0), 0.1(1 − ψ) − 0.8αs or 0.1 − 0.8αs (αs < 0), 0.95 + 0.05αh (αh = Mh/Ms,
+/// with αh(1 + 2ψ) when ψ < 0), each ≥ 0.4. A sway member (k > 1) takes 0.9 for y and z.
+pub fn ec3_cm(dem: &SteelDemand, st: &[(f64, f64, f64, f64, f64, f64)]) -> Ec3InteractionData {
+    let cm_of = |vals: Vec<(f64, f64)>| -> f64 {
+        if vals.len() < 2 || dem.cantilever {
+            return 1.0;
+        }
+        let (ma, mb) = (vals[0].1, vals[vals.len() - 1].1);
+        let (mh, other) = if ma.abs() >= mb.abs() { (ma, mb) } else { (mb, ma) };
+        let l = vals[vals.len() - 1].0 - vals[0].0;
+        // the span moment: the largest departure from the straight line between the ends
+        let (mut ms, mut dev) = (0.0f64, 0.0f64);
+        for &(x, m) in &vals {
+            let lin = ma + (mb - ma) * if l > 0.0 { (x - vals[0].0) / l } else { 0.0 };
+            if (m - lin).abs() > dev.abs() {
+                dev = m - lin;
+                ms = m;
+            }
+        }
+        let big = mh.abs().max(ms.abs());
+        if big < 1e-9 {
+            return 1.0;
+        }
+        if dev.abs() <= 1e-3 * big {
+            // linear diagram
+            let psi = if mh.abs() > 1e-12 { other / mh } else { 1.0 };
+            return (0.6 + 0.4 * psi).clamp(0.4, 1.0);
+        }
+        let psi = if mh.abs() > 1e-12 { (other / mh).clamp(-1.0, 1.0) } else { 0.0 };
+        let c = if mh.abs() >= ms.abs() {
+            let a_s = ms / mh;
+            if a_s >= 0.0 {
+                0.2 + 0.8 * a_s
+            } else if psi >= 0.0 {
+                0.1 - 0.8 * a_s
+            } else {
+                0.1 * (1.0 - psi) - 0.8 * a_s
+            }
+        } else {
+            let a_h = mh / ms;
+            if a_h >= 0.0 || psi >= 0.0 {
+                0.95 + 0.05 * a_h
+            } else {
+                0.95 + 0.05 * a_h * (1.0 + 2.0 * psi)
+            }
+        };
+        c.clamp(0.4, 1.0)
+    };
+    let my: Vec<(f64, f64)> = st.iter().map(|s| (s.0, s.4)).collect();
+    let mz: Vec<(f64, f64)> = st.iter().map(|s| (s.0, s.5)).collect();
+    let sway = dem.k > 1.0 + 1e-9;
+    let (cmy, cmz) = if sway { (0.9, 0.9) } else { (cm_of(my.clone()), cm_of(mz)) };
+    Ec3InteractionData { cmy: Some(cmy), cmz: Some(cmz), cm_lt: Some(cm_of(my)), hollow: None }
+}
+
+/// ρ of 6.2.8(3) for a shear VEd (N) on a member: 0 up to half of Vpl,Rd = Av fy/√3 (γM0 = 1),
+/// then (2 VEd/Vpl,Rd − 1)².
+fn shear_rho(m: &Ec3MemberData, v_ed: f64) -> f64 {
+    let vpl = m.av.unwrap_or(0.0) * m.fy / 3f64.sqrt();
+    if vpl <= 0.0 || v_ed <= 0.5 * vpl {
+        return 0.0;
+    }
+    (2.0 * v_ed / vpl - 1.0).min(1.0).powi(2)
+}
+
+/// The plastic cross-section check under axial force and bending of a Class 1 or 2 I section
+/// (6.2.9.1(4) – (6), γM0 = 1) with the moduli as the member carries them (reduced for shear
+/// when 6.2.8 applies): MN,y,Rd = Mpl,y,Rd (1 − n)/(1 − 0.5a) ≤ Mpl,y,Rd, MN,z,Rd = Mpl,z,Rd for
+/// n ≤ a and Mpl,z,Rd [1 − ((n − a)/(1 − a))²] above, a = (A − 2 b tf)/A ≤ 0.5, no reduction
+/// while NEd stays within 0.25 Npl,Rd and 0.5 hw tw fy (y) or hw tw fy (z), and the biaxial
+/// criterion (6.41) with α = 2, β = 5n ≥ 1. Returns the ratio and how, or None for Class 3 / 4
+/// sections and members without axial force (the engine checks those).
+fn section_n_m(m: &Ec3MemberData, h: HDims, n_ed: f64, my_ed: f64, mz_ed: f64) -> Option<(f64, String)> {
+    if n_ed == 0.0 || !matches!(m.section_class, SectionClass::Class1 | SectionClass::Class2) {
+        return None;
+    }
+    let (b, tf, tw) = (h.bf / 1e3, h.tf / 1e3, h.tw / 1e3);
+    let hw = h.d / 1e3 - 2.0 * tf;
+    let npl = m.a * m.fy;
+    let n = (n_ed.abs() / npl).min(1.0);
+    let a = ((m.a - 2.0 * b * tf) / m.a).clamp(0.0, 0.5);
+    let (mply, mplz) = (m.wpl_y * m.fy, m.wpl_z * m.fy);
+    let mny = if n_ed.abs() <= 0.25 * npl && n_ed.abs() <= 0.5 * hw * tw * m.fy { mply } else { (mply * (1.0 - n) / (1.0 - 0.5 * a)).min(mply) };
+    let mnz = if n_ed.abs() <= hw * tw * m.fy || n <= a { mplz } else { mplz * (1.0 - ((n - a) / (1.0 - a)).powi(2)) };
+    let (ry, rz) = (my_ed.abs() / mny.max(1e-9), mz_ed.abs() / mnz.max(1e-9));
+    let ratio = if rz < 1e-9 {
+        ry
+    } else if ry < 1e-9 {
+        rz
+    } else {
+        ry.powi(2) + rz.powf((5.0 * n).max(1.0))
+    };
+    Some((ratio, format!("NEd {:.0} kN (n {n:.3}), MN,y,Rd {:.1} kN·m, MN,z,Rd {:.1} kN·m", n_ed / 1e3, mny / 1e3, mnz / 1e3)))
 }
 
 /// The EC2 flexure and shear ratios of a beam ACI 318 designed (fck from f'c, fyk = fy, the

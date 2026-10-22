@@ -623,20 +623,40 @@ pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analy
     let piers = crate::walls::pier_sections(model);
     for s in &model.sections {
         let p = s.props();
-        // wall piers deform in shear too (5/6 of the area, a rectangle)
-        let shear = piers.contains(&s.id).then_some(5.0 / 6.0 * p.a);
-        input.sections.insert(s.id.to_string(), SolverSection3D { id: s.id, name: Some(s.name.clone()), a: p.a, iy: p.iy, iz: p.iz, j: p.j.max(1e-12), cw: None, as_y: shear, as_z: shear });
+        // wall piers deform in shear (5/6 of the area, a rectangle); frame members too when
+        // the analysis includes shear deformation. The engine's as_y belongs to bending about
+        // local y, i.e. to shear along local z (the web of an H shape), and as_z to shear
+        // along local y.
+        let (as_y, as_z) = if piers.contains(&s.id) {
+            (Some(5.0 / 6.0 * p.a), Some(5.0 / 6.0 * p.a))
+        } else if model.design.shear_deformation {
+            match s.shape {
+                Shape::Rect { .. } => (Some(5.0 / 6.0 * p.a), Some(5.0 / 6.0 * p.a)),
+                Shape::H { d, bf, tw, tf, .. } => (Some(d * tw), Some(5.0 / 3.0 * bf * tf)),
+                Shape::General { shear: Some([sy, sz]), .. } => ((sz > 0.0).then_some(sz), (sy > 0.0).then_some(sy)),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        input.sections.insert(s.id.to_string(), SolverSection3D { id: s.id, name: Some(s.name.clone()), a: p.a, iy: p.iy, iz: p.iz, j: p.j.max(1e-12), cw: None, as_y, as_z });
     }
+    // a truss model with rigid diaphragms needs the rotation about z, which the engine numbers
+    // only when there is a frame element: its truss members then become frames pinned at both
+    // ends (bending released, so they still carry axial force only)
+    let pinned_frames = !model.diaphragms.is_empty() && !model.members.iter().any(|m| !m.axial_only()) && meshes.is_empty();
     for (k, pc) in pieces.iter().enumerate() {
         let m = model.member(pc.member).unwrap();
         let first = pc.s0 < 1e-9;
         let last = (pc.s1 - model.length(m)).abs() < 1e-6;
+        let as_pinned_frame = pinned_frames && m.truss && m.behaviour == Behaviour::Normal;
         input.elements.insert(
             (k + 1).to_string(),
             SolverElement3D {
                 id: k + 1,
                 elem_type: match (m.behaviour, m.truss) {
                     (Behaviour::Cable, _) => "cable".into(),
+                    _ if as_pinned_frame => "frame".into(),
                     (Behaviour::TensionOnly | Behaviour::CompressionOnly, _) | (_, true) => "truss".into(),
                     _ => "frame".into(),
                 },
@@ -644,10 +664,10 @@ pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analy
                 node_j: pc.nj,
                 material_id: m.material,
                 section_id: m.section,
-                release_my_start: m.hinge_i && first,
-                release_my_end: m.hinge_j && last,
-                release_mz_start: m.hinge_i && first,
-                release_mz_end: m.hinge_j && last,
+                release_my_start: (m.hinge_i && first) || as_pinned_frame,
+                release_my_end: (m.hinge_j && last) || as_pinned_frame,
+                release_mz_start: (m.hinge_i && first) || as_pinned_frame,
+                release_mz_end: (m.hinge_j && last) || as_pinned_frame,
                 release_t_start: false,
                 release_t_end: false,
                 local_yx: None,
@@ -688,6 +708,35 @@ pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analy
             }
         }
     }
+    // a node joined only by axial members has no rotational stiffness when the engine numbers
+    // rotations (any frame or shell element): its rotations are held, except the rotation about
+    // z on a diaphragm level, which the diaphragm ties to its master
+    if input.elements.values().any(|e| e.elem_type == "frame") || !input.quads.is_empty() {
+        for n in &model.nodes {
+            let at: Vec<&Member> = model.members.iter().filter(|m| m.i == n.id || m.j == n.id).collect();
+            if at.is_empty() || !at.iter().all(|m| m.axial_only()) {
+                continue;
+            }
+            let on_diaphragm = model.diaphragms.iter().any(|z| (n.z - z).abs() < 0.005);
+            let g = node_of[&n.id];
+            let sid = input.supports.len() + 600_000 + g;
+            input.supports.insert(sid.to_string(), SolverSupport3D { node_id: g, rx: false, ry: false, rz: false, rrx: true, rry: true, rrz: !on_diaphragm, kx: None, ky: None, kz: None, krx: None, kry: None, krz: None, dx: None, dy: None, dz: None, drx: None, dry: None, drz: None, rw: None, kw: None, normal_x: None, normal_y: None, normal_z: None, is_inclined: None });
+        }
+    }
+    // a node that carries only a lumped mass (a floor's centre of mass) moves with its
+    // diaphragm in plan; its other DOFs have no stiffness, so they are held
+    for nm in &model.masses {
+        if model.members.iter().any(|m| m.i == nm.node || m.j == nm.node) || model.supports.iter().any(|s| s.node == nm.node) {
+            continue;
+        }
+        let Some(n) = model.node(nm.node) else { continue };
+        if !model.diaphragms.iter().any(|z| (n.z - z).abs() < 0.005) {
+            return Err(format!("the mass at node {} is on no member and on no diaphragm: put it on a member's node or a diaphragm level", nm.node));
+        }
+        let g = node_of[&nm.node];
+        let sid = input.supports.len() + 500_000 + g;
+        input.supports.insert(sid.to_string(), SolverSupport3D { node_id: g, rx: false, ry: false, rz: true, rrx: true, rry: true, rrz: false, kx: None, ky: None, kz: None, krx: None, kry: None, krz: None, dx: None, dy: None, dz: None, drx: None, dry: None, drz: None, rw: None, kw: None, normal_x: None, normal_y: None, normal_z: None, is_inclined: None });
+    }
     // rigid floor diaphragms: the nodes of each level follow one master in plan
     for z in &model.diaphragms {
         let at_level: Vec<&Node> = model.nodes.iter().filter(|n| (n.z - z).abs() < 0.005 && !model.supports.iter().any(|s| s.node == n.id)).collect();
@@ -696,7 +745,17 @@ pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analy
             continue;
         }
         let (cx, cy) = (at_level.iter().map(|n| n.x).sum::<f64>() / at_level.len() as f64, at_level.iter().map(|n| n.y).sum::<f64>() / at_level.len() as f64);
-        let master = at_level.iter().min_by(|a, b| ((a.x - cx).hypot(a.y - cy)).total_cmp(&(b.x - cx).hypot(b.y - cy))).unwrap().id;
+        // the engine ties a slave's translations to the master but not its rotation about z,
+        // so a node that carries only a lumped mass (the floor's centre of mass, with its
+        // rotational inertia) must be the master: as a slave its rotation would be free
+        let mass_only = |n: &Node| model.masses.iter().any(|x| x.node == n.id) && !model.members.iter().any(|m| m.i == n.id || m.j == n.id);
+        let master = match at_level.iter().find(|n| mass_only(n)) {
+            Some(n) => n.id,
+            None => at_level.iter().min_by(|a, b| ((a.x - cx).hypot(a.y - cy)).total_cmp(&(b.x - cx).hypot(b.y - cy))).unwrap().id,
+        };
+        if at_level.iter().filter(|n| mass_only(n)).count() > 1 {
+            warnings.push(format!("diaphragm at z = {z:.2}: more than one node carries only a mass; give each floor's mass at one node"));
+        }
         input.constraints.push(Constraint::Diaphragm(DiaphragmConstraint { master_node: node_of[&master], slave_nodes: at_level.iter().filter(|n| n.id != master).map(|n| node_of[&n.id]).collect(), plane: "XY".into() }));
     }
     let constrained = !input.constraints.is_empty();
@@ -716,7 +775,11 @@ pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analy
     if special.nonlinear() && model.design.second_order {
         warnings.push("P-Delta is not combined with cables, one-way members or lift-off supports: those combinations are solved without it".into());
     }
-    let prepared = if special.any() { None } else { Some(prepare_static_3d(&input).map_err(|e| format!("the structure cannot be solved: {e}. Check the supports (is it stable?) and that every member is connected."))?) };
+    // the unconstrained factorisation serves only the models without diaphragms: a diaphragm
+    // model is solved case by case on the constrained system, and a node that gets its
+    // in-plane stiffness only through its diaphragm (a floor's centre of mass) would make the
+    // unconstrained matrix singular
+    let prepared = if special.any() || constrained { None } else { Some(prepare_static_3d(&input).map_err(|e| format!("the structure cannot be solved: {e}. Check the supports (is it stable?) and that every member is connected."))?) };
 
     let (mut slab_applied, mut slab_expected) = (slab_applied, slab_expected);
     if !quads.is_empty() {

@@ -72,7 +72,7 @@ fn slice(fc: f64, ie: f64) -> (Model, f64) {
     let id = m.next_material_id();
     m.materials.push(Material { id, name: "weightless rigid".into(), kind: MaterialKind::Other, e: 2.0e6, nu: 0.2, gamma: 0.0, fc: 0.0, fy: 0.0, fu: 0.0, fb: 0.0, ft: 0.0, fv: 0.0, e_min: 0.0, alpha: 0.0 });
     let sid = m.next_section_id();
-    m.sections.push(Section { id: sid, name: "stub".into(), shape: Shape::General { a: 0.05, iy: 0.01, iz: 0.01, j: 0.01 } });
+    m.sections.push(Section { id: sid, name: "stub".into(), shape: Shape::General { a: 0.05, iy: 0.01, iz: 0.01, j: 0.01, shear: None } });
     let c = LW / 2.0;
     for (k, t) in slab.iter().enumerate() {
         let z = (k + 1) as f64 * H;

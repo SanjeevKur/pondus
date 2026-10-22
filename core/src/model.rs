@@ -118,7 +118,16 @@ pub enum Shape {
     /// Cold-formed lipped channel: outer depth h, flange b, lip d, thickness t (m).
     #[serde(rename = "lippedc")]
     LippedC { h: f64, b: f64, d: f64, t: f64 },
-    General { a: f64, iy: f64, iz: f64, j: f64 },
+    General {
+        a: f64,
+        iy: f64,
+        iz: f64,
+        j: f64,
+        /// Shear areas [Asy, Asz] (m²) for shear along local y and local z, used when the
+        /// analysis includes shear deformation (`DesignSettings::shear_deformation`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shear: Option<[f64; 2]>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -167,7 +176,7 @@ impl Section {
                     Err(_) => Props::default(),
                 }
             }
-            Shape::General { a, iy, iz, j } => Props { a, iy, iz, j, ry: (iy / a).sqrt(), rz: (iz / a).sqrt(), ..Default::default() },
+            Shape::General { a, iy, iz, j, .. } => Props { a, iy, iz, j, ry: (iy / a).sqrt(), rz: (iz / a).sqrt(), ..Default::default() },
         }
     }
 }
@@ -433,6 +442,11 @@ pub struct DesignSettings {
     /// Analyse every ULS combination second order (P-Delta): column moments are then not
     /// magnified for slenderness.
     pub second_order: bool,
+    /// Include the shear deformation of frame members in the analysis (Timoshenko beams), as
+    /// SAP2000 and ETABS do by default: shear areas 5A/6 for rectangles, d·tw (major) and
+    /// 5/3 bf tf (minor) for H shapes, and the given ones for general sections. Off by default
+    /// (Euler-Bernoulli frames); wall piers always deform in shear.
+    pub shear_deformation: bool,
     /// Spread footings under the concrete columns: soil and geometry.
     pub footing: crate::footing::FootingSettings,
     /// The steel code (AISC 360-16 or EN 1993-1-1), and whether concrete beams are also
@@ -558,6 +572,7 @@ impl Default for DesignSettings {
             slab_method: Default::default(),
             slab_mesh: 0.5,
             second_order: false,
+            shear_deformation: false,
             footing: Default::default(),
             steel_code: Default::default(),
             ec2_check: false,
@@ -595,6 +610,19 @@ pub struct Model {
     pub seismic: crate::seismic::Seismic,
     /// Structural walls (shear walls), each analysed as piers with rigid arms (`walls.rs`).
     pub walls: Vec<Wall>,
+    /// Lumped masses at nodes, for the modal, response spectrum and seismic weight; a node
+    /// that carries only a mass (a floor's centre of mass) must lie on a rigid diaphragm.
+    pub masses: Vec<NodalMass>,
+}
+
+/// A lumped mass at a node: translational mass in x, y and z (t) and rotational inertia about
+/// x, y and z (t·m²), in global axes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NodalMass {
+    pub node: Id,
+    pub m: [f64; 3],
+    #[serde(default)]
+    pub r: [f64; 3],
 }
 
 /// A structural wall: a straight line in plan from `a` to `b`, from `z0` to `z1`, of thickness
@@ -680,6 +708,7 @@ impl Model {
             design: DesignSettings::default(),
             seismic: Default::default(),
             walls: vec![],
+            masses: vec![],
         }
     }
 
@@ -839,11 +868,12 @@ impl Model {
         self.nodes.retain(|n| !ids.contains(&n.id));
         self.supports.retain(|s| !ids.contains(&s.node));
         self.loads.retain(|l| !matches!(&l.kind, LoadKind::Nodal { node, .. } if ids.contains(node)));
+        self.masses.retain(|m| !ids.contains(&m.node));
     }
 
-    /// Nodes not used by any member, support or load.
+    /// Nodes not used by any member, support, load or mass.
     pub fn purge_nodes(&mut self) {
-        let used: std::collections::HashSet<Id> = self.members.iter().flat_map(|m| [m.i, m.j]).chain(self.supports.iter().map(|s| s.node)).chain(self.loads.iter().filter_map(|l| if let LoadKind::Nodal { node, .. } = l.kind { Some(node) } else { None })).collect();
+        let used: std::collections::HashSet<Id> = self.members.iter().flat_map(|m| [m.i, m.j]).chain(self.supports.iter().map(|s| s.node)).chain(self.loads.iter().filter_map(|l| if let LoadKind::Nodal { node, .. } = l.kind { Some(node) } else { None })).chain(self.masses.iter().map(|m| m.node)).collect();
         self.nodes.retain(|n| used.contains(&n.id));
     }
 }

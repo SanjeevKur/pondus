@@ -79,7 +79,7 @@ pub fn import(v: &Value) -> Result<(Model, ImportReport), String> {
             Shape::Rect { b: num(s, "b"), h: num(s, "h") }
         } else {
             steel_sections.push(sid);
-            Shape::General { a: num(s, "a"), iy: num(s, "iy"), iz: num(s, "iz"), j: num(s, "j") }
+            Shape::General { a: num(s, "a"), iy: num(s, "iy"), iz: num(s, "iz"), j: num(s, "j"), shear: None }
         };
         m.sections.push(Section { id: sid, name, shape });
     }

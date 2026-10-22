@@ -58,7 +58,7 @@ fn arm_section(m: &mut Model, t: f64, lw: f64) -> Id {
     }
     let i = t * lw.powi(3) / 12.0;
     let id = m.sections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
-    m.sections.push(Section { id, name, shape: Shape::General { a: t * lw, iy: i, iz: i, j: i } });
+    m.sections.push(Section { id, name, shape: Shape::General { a: t * lw, iy: i, iz: i, j: i, shear: None } });
     id
 }
 

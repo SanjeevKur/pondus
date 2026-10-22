@@ -14,7 +14,7 @@ fn square(mesh: f64) -> Model {
     m.materials[0].e = 25_000.0;
     m.materials[0].nu = 0.2;
     let sid = m.next_section_id();
-    m.sections.push(Section { id: sid, name: "rigid".into(), shape: Shape::General { a: 10.0, iy: 1e3, iz: 1e3, j: 1e-9 } });
+    m.sections.push(Section { id: sid, name: "rigid".into(), shape: Shape::General { a: 10.0, iy: 1e3, iz: 1e3, j: 1e-9, shear: None } });
     let c = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 4.0, 0.0], [0.0, 4.0, 0.0]];
     for k in 0..4 {
         let (a, b) = (m.node_at(c[k]), m.node_at(c[(k + 1) % 4]));

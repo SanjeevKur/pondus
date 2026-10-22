@@ -849,6 +849,21 @@ pub fn lanczos_generalized_eigen_sparse(
     // Fallback to dense
     let k_dense = k_ff.to_dense_symmetric();
     let m_dense = m_ff.to_dense_symmetric();
+    // [Pondus] a mass matrix that is only semidefinite (lumped masses on a few DOFs, nearly
+    // massless elements) can stall the shift-invert iteration, and the dense Lanczos below
+    // needs M positive definite: for a moderate size the semidefinite dense solver is used
+    if n <= 3000 {
+        if let Some(full) = dense_generalized_eigen_semidefinite(&k_dense, &m_dense, n) {
+            let nk = k.min(full.values.len());
+            let mut vectors = vec![0.0; n * nk];
+            for col in 0..nk {
+                for row in 0..n {
+                    vectors[row * nk + col] = full.vectors[row * n + col];
+                }
+            }
+            return Some(EigenResult { values: full.values[..nk].to_vec(), vectors });
+        }
+    }
     lanczos_generalized_eigen(&k_dense, &m_dense, n, k, sigma)
 }
 

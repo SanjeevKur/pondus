@@ -31,6 +31,9 @@ As AGPL-3.0 section 5(a) asks, the modified files carry a prominent notice. Ever
 2. `engine/src/solver/winkler.rs`: the sign of the w–θy coupling of the vertical Winkler foundation matrix was corrected. Without it, a uniformly loaded beam on a uniform foundation settled unevenly. 19 October 2026.
 3. `engine/src/solver/plastic_3d.rs`: an unshifted sparse Cholesky test now runs before the dense rank test that checks for a mechanism at every hinge event. It gives the same answer and is faster. 20 October 2026.
 4. `engine/src/solver/moving_loads.rs`: the 3D moving-load envelope also keeps the extremes at each end of an element (`start_max`, `start_min`, `end_max`, `end_min`). The per-element extremes take both ends together, so a point read from them carried the value one element away. 20 October 2026.
+5. `engine/src/linalg/gpu.rs` (new), `engine/src/linalg/mod.rs`, `engine/src/solver/linear.rs`, `engine/src/solver/constraints.rs` and `engine/src/linalg/lanczos.rs`: the sparse factorisation on an NVIDIA GPU through cuDSS, loaded at run time, and a parallel reorthogonalisation and Ritz-vector assembly in the Lanczos solver. The results are unchanged to 6e-11. 20 October 2026.
+6. `engine/src/solver/modal.rs`: `solve_modal_3d_with_masses`, the 3D modal analysis with lumped nodal masses (translations and rotational inertia) added to the diagonal of the mass matrix, with the mass ratios taken against each direction's own total. `solve_modal_3d` calls it with no nodal masses. 23 October 2026.
+7. `engine/src/linalg/lanczos.rs`: when the sparse shift-invert iteration does not converge, a system of up to 3000 DOFs falls back to the dense solver for a semidefinite mass matrix instead of the dense Lanczos, which needs M positive definite and failed with lumped masses only. 23 October 2026.
 
 ## Disclaimer
 

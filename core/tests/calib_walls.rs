@@ -39,7 +39,7 @@ fn weightless(m: &mut Model, e: f64) -> Id {
 
 fn general(m: &mut Model, a: f64, iy: f64, iz: f64, j: f64) -> Id {
     let id = m.next_section_id();
-    m.sections.push(Section { id, name: format!("G{id}"), shape: Shape::General { a, iy, iz, j } });
+    m.sections.push(Section { id, name: format!("G{id}"), shape: Shape::General { a, iy, iz, j, shear: None } });
     id
 }
 

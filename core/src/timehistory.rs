@@ -123,6 +123,9 @@ pub struct ThResult {
 
 pub fn run(model: &Model, a: &Analysis, rec: &Record, st: &Settings) -> std::result::Result<ThResult, String> {
     let em = a.engine.as_ref().ok_or("analyse first")?;
+    if !model.masses.is_empty() {
+        return Err("time history: lumped nodal masses are not taken by the time-history solver yet; give the mass as loads of the D case instead".into());
+    }
     let (input, densities, weight, warnings) = crate::seismic::mass_model(model, &em.input, &em.pieces, &em.quads, &em.gravity, &em.point_cases)?;
     if rec.accel.len() < 2 || rec.dt <= 0.0 {
         return Err("the record is empty".into());

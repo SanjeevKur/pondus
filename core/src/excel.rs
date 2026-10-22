@@ -183,7 +183,7 @@ pub fn export(model: &Model, a: Option<&Analysis>, rep: Option<&Report>, path: &
                     v[7] = n(t);
                     "lippedc"
                 }
-                Shape::General { a, iy, iz, j } => {
+                Shape::General { a, iy, iz, j, .. } => {
                     v[8] = n(a);
                     v[9] = n(iy);
                     v[10] = n(iz);
@@ -431,7 +431,7 @@ pub fn import(path: &Path) -> Result<Model, String> {
                 Some(t) if t == "rect" => Shape::Rect { b: g("b"), h: g("h") },
                 Some(t) if t == "h" => Shape::H { d: g("d"), bf: g("bf"), tw: g("tw"), tf: g("tf"), r: g("r") },
                 Some(t) if t == "lippedc" => Shape::LippedC { h: g("h"), b: g("b"), d: g("d"), t: g("t") },
-                Some(t) if t == "general" => Shape::General { a: g("a"), iy: g("iy"), iz: g("iz"), j: g("j") },
+                Some(t) if t == "general" => Shape::General { a: g("a"), iy: g("iy"), iz: g("iz"), j: g("j"), shear: None },
                 _ => {
                     // no shape: parse the name as add_members would
                     let mut tmp = Model::new("");

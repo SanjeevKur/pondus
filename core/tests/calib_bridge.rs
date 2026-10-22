@@ -49,7 +49,7 @@ fn girder(spans: usize) -> Model {
     m.materials.push(Material { id, name: "steel (weightless)".into(), kind: MaterialKind::Other, e: 199_948.0, nu: 0.3, gamma: 0.0, fc: 0.0, fy: 0.0, fu: 0.0, fb: 0.0, ft: 0.0, fv: 0.0, e_min: 0.0, alpha: 0.0 });
     let mut sec = |m: &mut Model, i: f64| {
         let s = m.next_section_id();
-        m.sections.push(Section { id: s, name: format!("I {:.0} in4", i / IN4), shape: Shape::General { a: 0.06, iy: i, iz: i, j: 1e-4 } });
+        m.sections.push(Section { id: s, name: format!("I {:.0} in4", i / IN4), shape: Shape::General { a: 0.06, iy: i, iz: i, j: 1e-4, shear: None } });
         s
     };
     let (s1, s2) = (sec(&mut m, 48_806.0 * IN4), sec(&mut m, 50_027.0 * IN4));

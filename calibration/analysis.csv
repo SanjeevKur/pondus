@@ -1,7 +1,7 @@
 aspect,case,source,quantity,unit,reference,pondus,error_pct,tol_pct,kind
 "cables","horizontal stay 50 m, H = 100 kN","Ernst (1965), Der E-Modul von Seilen; Irvine, Cable Structures (1981)","elongation","mm",31.176041666666666,31.171824295223974,-0.0135,0.1,closed-form
 "cables","horizontal stay 50 m, H = 100 kN","statics","tension","kN",100,99.99999999999054,-0.0000,0.01,closed-form
-"seismic","3-storey RC frame","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","T used (min(T1, Cu·Ta))","s",0.47890694172144144,0.47890694172144144,0.0000,0.000001,closed-form
+"seismic","3-storey RC frame","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","T used (min(T1, Cu·Ta))","s",0.47890694172144155,0.47890694172144155,0.0000,0.000001,closed-form
 "seismic","3-storey RC frame","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","Cs","–",0.125,0.125,0.0000,0.000001,closed-form
 "seismic","3-storey RC frame","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","V_ELF = Cs·W","kN",64.80000000000003,64.80000000000003,0.0000,0.000001,closed-form
 "seismic","stiff 1-storey frame (T < T0)","ASCE 7-22 §12.8, Eqs. 12.8-1 to 12.8-7","T used (min(T1, Cu·Ta))","s",0.03807858833227435,0.03807858833227435,0.0000,0.000001,closed-form
@@ -18,9 +18,9 @@ aspect,case,source,quantity,unit,reference,pondus,error_pct,tol_pct,kind
 "linear statics","Gerber beam with hinge","STAAD.Pro Verification V7 type (Gerber beam), statics","M_A","kN·m",-200,-200.00000000004573,-0.0000,0.0001,closed-form
 "linear statics","Gerber beam with hinge","STAAD.Pro Verification V7 type (Gerber beam), statics","M at hinge","kN·m",0,0,0.0000,0.000001,closed-form
 "modal","uniform cantilever, 32 elements","Clough & Penzien 3e, Table 18-1 (βnL of a cantilever)","f1 (lateral)","Hz",8.259539379705371,8.259575291564234,0.0004,0.3,published
-"modal","uniform cantilever, 32 elements","Clough & Penzien 3e, Table 18-1 (βnL of a cantilever)","f2 (lateral)","Hz",51.762069920545585,51.76189098050575,-0.0003,0.3,published
-"modal","uniform cantilever, 32 elements","Clough & Penzien 3e, Table 18-1 (βnL of a cantilever)","f3 (lateral)","Hz",144.9363177371937,144.93511110370622,-0.0008,0.3,published
-"modal","two-storey shear building","Chopra, Dynamics of Structures 5e, Ch. 10 (two-storey shear frame)","f1","Hz",3.3539771704408263,3.3519186950819324,-0.0614,0.2,closed-form
+"modal","uniform cantilever, 32 elements","Clough & Penzien 3e, Table 18-1 (βnL of a cantilever)","f2 (lateral)","Hz",51.762069920545585,51.76189098050573,-0.0003,0.3,published
+"modal","uniform cantilever, 32 elements","Clough & Penzien 3e, Table 18-1 (βnL of a cantilever)","f3 (lateral)","Hz",144.9363177371937,144.93511110370616,-0.0008,0.3,published
+"modal","two-storey shear building","Chopra, Dynamics of Structures 5e, Ch. 10 (two-storey shear frame)","f1","Hz",3.3539771704408263,3.3519186950819315,-0.0614,0.2,closed-form
 "modal","two-storey shear building","Chopra, Dynamics of Structures 5e, Ch. 10 (two-storey shear frame)","f2","Hz",8.780826229705283,8.776071753171257,-0.0541,0.2,closed-form
 "modal","two-storey shear building","Chopra, Dynamics of Structures 5e, Ch. 10 (two-storey shear frame)","first-mode effective mass ratio","–",0.947213595499958,0.9468266757577911,-0.0408,0.1,closed-form
 "seismic","two-storey shear building, flat spectrum","Chopra 5e Ch. 13 (RSA); Der Kiureghian (1981) CQC","base shear V_RSA","kN",284.74497613278686,285.1871695641422,0.1553,0.2,closed-form

@@ -317,6 +317,19 @@ pub fn solve_modal_3d(
     densities: &HashMap<String, f64>,
     num_modes: usize,
 ) -> Result<ModalResult3D, String> {
+    solve_modal_3d_with_masses(input, densities, &HashMap::new(), num_modes)
+}
+
+/// [Pondus] The 3D modal analysis with lumped masses at nodes as well as the elements'
+/// consistent mass: `nodal_masses` maps a node id to [mx, my, mz, Ixx, Iyy, Izz] in tonnes and
+/// t·m² (global axes), added to the diagonal of M on the node's free DOFs. The mass ratios
+/// take each direction's own total (element mass + that direction's nodal masses).
+pub fn solve_modal_3d_with_masses(
+    input: &SolverInput3D,
+    densities: &HashMap<String, f64>,
+    nodal_masses: &HashMap<usize, [f64; 6]>,
+    num_modes: usize,
+) -> Result<ModalResult3D, String> {
     // Curved beams become segments first, as in `solve_3d`: assembled from the
     // unexpanded model they were silently left out.
     let input = &super::linear::expand_curved_beams_3d(input);
@@ -336,7 +349,11 @@ pub fn solve_modal_3d(
 
     if nf == 0 { return Err("No free DOFs".into()); }
 
-    let total_mass = compute_total_mass_3d(input, densities);
+    let element_mass = compute_total_mass_3d(input, densities);
+    // [Pondus] each direction's total mass: the elements' and the lumped masses'
+    let lumped = |d: usize| nodal_masses.values().map(|m| m[d]).sum::<f64>();
+    let totals = [element_mass + lumped(0), element_mass + lumped(1), element_mass + lumped(2)];
+    let total_mass = totals[0].max(totals[1]).max(totals[2]);
     if total_mass < 1e-20 {
         return Err("No mass assigned — set material densities".into());
     }
@@ -352,7 +369,23 @@ pub fn solve_modal_3d(
     // reduce as sparse triple products, no dense n² allocation anywhere.
     // In the inclined-support frames K was assembled in.
     let its = &sasm.inclined_transforms;
-    let m_sparse_ff = assemble_mass_matrix_3d_sparse_inclined(input, &dof_num, densities, its);
+    let mut m_sparse_ff = assemble_mass_matrix_3d_sparse_inclined(input, &dof_num, densities, its);
+    // [Pondus] lumped nodal masses on the diagonal of the free block
+    if !nodal_masses.is_empty() {
+        let (mut rows, mut vals) = (vec![], vec![]);
+        for (node, m) in nodal_masses {
+            for (k, v) in m.iter().enumerate() {
+                if let Some(&d) = dof_num.map.get(&(*node, k)) {
+                    if d < nf && *v != 0.0 {
+                        rows.push(d);
+                        vals.push(*v);
+                    }
+                }
+            }
+        }
+        let diag = CscMatrix::from_triplets(nf, &rows, &rows, &vals);
+        m_sparse_ff = CscMatrix::linear_combination(1.0, &m_sparse_ff, 1.0, &diag);
+    }
 
     // Reduced-space matrices owned here so both branches can borrow them.
     let k_red;
@@ -422,9 +455,9 @@ pub fn solve_modal_3d(
         let meff_x = gamma_x * gamma_x * phi_m_phi;
         let meff_y = gamma_y * gamma_y * phi_m_phi;
         let meff_z = gamma_z * gamma_z * phi_m_phi;
-        let mrx = if total_mass > 1e-20 { meff_x / total_mass } else { 0.0 };
-        let mry = if total_mass > 1e-20 { meff_y / total_mass } else { 0.0 };
-        let mrz = if total_mass > 1e-20 { meff_z / total_mass } else { 0.0 };
+        let mrx = if totals[0] > 1e-20 { meff_x / totals[0] } else { 0.0 };
+        let mry = if totals[1] > 1e-20 { meff_y / totals[1] } else { 0.0 };
+        let mrz = if totals[2] > 1e-20 { meff_z / totals[2] } else { 0.0 };
         cum_mrx += mrx;
         cum_mry += mry;
         cum_mrz += mrz;
