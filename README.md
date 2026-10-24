@@ -107,8 +107,8 @@ One click writes the PDF: basis of design, loads and their balance, diagrams, ev
 
 | Computer | Download |
 |---|---|
-| macOS 11 or later (Apple Silicon and Intel) | [Pondus-0.1.3-macos-universal.zip](https://github.com/Sompote/pondus/releases/download/v0.1.3/Pondus-0.1.3-macos-universal.zip) |
-| Windows 10 or later | [Pondus-0.1.3-windows-x64.zip](https://github.com/Sompote/pondus/releases/download/v0.1.3/Pondus-0.1.3-windows-x64.zip) |
+| macOS 11 or later (Apple Silicon and Intel) | [Pondus-0.1.4-macos-universal.zip](https://github.com/Sompote/pondus/releases/download/v0.1.4/Pondus-0.1.4-macos-universal.zip) |
+| Windows 10 or later | [Pondus-0.1.4-windows-x64.zip](https://github.com/Sompote/pondus/releases/download/v0.1.4/Pondus-0.1.4-windows-x64.zip) |
 
 - **macOS:** unzip, move `Pondus.app` to Applications, and the first time right-click it and choose **Open**.
 - **Windows:** unzip and run `pondus.exe`. If Windows warns about an unknown app, choose **More info › Run anyway**.
