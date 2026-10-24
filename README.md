@@ -11,7 +11,7 @@ Ask an AI agent to build, analyse and design a building, then check every number
 
 <p align="center">
 <a href="https://github.com/Sompote/pondus/releases/latest"><b>⬇ Download for macOS or Windows</b></a> ·
-<a href="https://sompote.github.io/pondus/">Website and manual</a> ·
+<a href="https://strpondus.github.io/">Website and manual</a> ·
 <a href="https://doi.org/10.5281/zenodo.23581167">Paper (Zenodo)</a> ·
 <a href="paper/paper.pdf">Calibration report</a> ·
 <a href="docs/mcp.md">Use with Claude or ChatGPT</a>
