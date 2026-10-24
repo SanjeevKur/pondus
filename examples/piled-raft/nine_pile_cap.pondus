@@ -1,0 +1,468 @@
+{
+  "name": "A. Nine-pile cap, 3 x 3 at 1.2 m, 0.7 m thick, 100 t at the centre",
+  "materials": [
+    {
+      "id": 1,
+      "name": "Concrete f'c 24 MPa",
+      "kind": "concrete",
+      "e": 23025.0,
+      "nu": 0.2,
+      "gamma": 24.0,
+      "fc": 24.0,
+      "fy": 0.0,
+      "fu": 0.0,
+      "fb": 0.0,
+      "ft": 0.0,
+      "fv": 0.0,
+      "e_min": 0.0,
+      "alpha": 0.0
+    },
+    {
+      "id": 2,
+      "name": "Steel SS400",
+      "kind": "steel",
+      "e": 200000.0,
+      "nu": 0.3,
+      "gamma": 77.0,
+      "fc": 0.0,
+      "fy": 245.0,
+      "fu": 400.0,
+      "fb": 0.0,
+      "ft": 0.0,
+      "fv": 0.0,
+      "e_min": 0.0,
+      "alpha": 0.0
+    }
+  ],
+  "sections": [],
+  "nodes": [
+    {
+      "id": 1,
+      "x": -1.2,
+      "y": -1.2,
+      "z": 0.0
+    },
+    {
+      "id": 2,
+      "x": -1.2,
+      "y": 0.0,
+      "z": 0.0
+    },
+    {
+      "id": 3,
+      "x": -1.2,
+      "y": 1.2,
+      "z": 0.0
+    },
+    {
+      "id": 4,
+      "x": 0.0,
+      "y": -1.2,
+      "z": 0.0
+    },
+    {
+      "id": 5,
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    },
+    {
+      "id": 6,
+      "x": 0.0,
+      "y": 1.2,
+      "z": 0.0
+    },
+    {
+      "id": 7,
+      "x": 1.2,
+      "y": -1.2,
+      "z": 0.0
+    },
+    {
+      "id": 8,
+      "x": 1.2,
+      "y": 0.0,
+      "z": 0.0
+    },
+    {
+      "id": 9,
+      "x": 1.2,
+      "y": 1.2,
+      "z": 0.0
+    }
+  ],
+  "members": [],
+  "supports": [
+    {
+      "node": 1,
+      "fix": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "springs": [
+        0.0,
+        0.0,
+        100000.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "uplift": false
+    },
+    {
+      "node": 2,
+      "fix": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "springs": [
+        0.0,
+        0.0,
+        100000.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "uplift": false
+    },
+    {
+      "node": 3,
+      "fix": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "springs": [
+        0.0,
+        0.0,
+        100000.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "uplift": false
+    },
+    {
+      "node": 4,
+      "fix": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "springs": [
+        0.0,
+        0.0,
+        100000.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "uplift": false
+    },
+    {
+      "node": 5,
+      "fix": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "springs": [
+        0.0,
+        0.0,
+        100000.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "uplift": false
+    },
+    {
+      "node": 6,
+      "fix": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "springs": [
+        0.0,
+        0.0,
+        100000.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "uplift": false
+    },
+    {
+      "node": 7,
+      "fix": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "springs": [
+        0.0,
+        0.0,
+        100000.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "uplift": false
+    },
+    {
+      "node": 8,
+      "fix": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "springs": [
+        0.0,
+        0.0,
+        100000.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "uplift": false
+    },
+    {
+      "node": 9,
+      "fix": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "springs": [
+        0.0,
+        0.0,
+        100000.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "uplift": false
+    }
+  ],
+  "cases": [
+    {
+      "id": 1,
+      "name": "D",
+      "kind": "D",
+      "self_weight": true
+    },
+    {
+      "id": 2,
+      "name": "L",
+      "kind": "L",
+      "self_weight": false
+    }
+  ],
+  "loads": [
+    {
+      "case": 1,
+      "type": "nodal",
+      "node": 5,
+      "f": [
+        0.0,
+        0.0,
+        -981.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "combos": [
+    {
+      "id": 1,
+      "name": "ULS 1.4D",
+      "kind": "uls",
+      "factors": [
+        [
+          1,
+          1.4
+        ]
+      ]
+    },
+    {
+      "id": 2,
+      "name": "ULS 1.2D + 1.6L",
+      "kind": "uls",
+      "factors": [
+        [
+          1,
+          1.2
+        ],
+        [
+          2,
+          1.6
+        ]
+      ]
+    },
+    {
+      "id": 3,
+      "name": "SLS D + L",
+      "kind": "sls",
+      "factors": [
+        [
+          1,
+          1.0
+        ],
+        [
+          2,
+          1.0
+        ]
+      ]
+    }
+  ],
+  "slabs": [
+    {
+      "id": 1,
+      "name": "Pile cap",
+      "x0": -1.7999999999999998,
+      "y0": -1.7999999999999998,
+      "x1": 1.7999999999999998,
+      "y1": 1.7999999999999998,
+      "z": 0.0,
+      "h": 0.7,
+      "dead": 0.0,
+      "live": 0.0,
+      "subgrade": 0.0,
+      "mat": true,
+      "support_size": 0.3
+    }
+  ],
+  "diaphragms": [],
+  "moving": null,
+  "stages": [],
+  "design": {
+    "fy": 390.0,
+    "fyt": 235.0,
+    "cover_beam": 0.03,
+    "cover_slab": 0.02,
+    "beam_bars": [
+      12.0,
+      16.0,
+      20.0,
+      25.0,
+      28.0,
+      32.0
+    ],
+    "stirrup_bars": [
+      9.0,
+      12.0
+    ],
+    "slab_bars": [
+      9.0,
+      12.0,
+      16.0
+    ],
+    "aggregate": 20.0,
+    "defl_live": 360.0,
+    "defl_total": 240.0,
+    "steel_shapes": [],
+    "target_ratio": 1.0,
+    "slab_method": "plate",
+    "slab_mesh": 0.3,
+    "second_order": false,
+    "shear_deformation": false,
+    "footing": {
+      "q_allow": 150.0,
+      "depth": 1.5,
+      "gamma_soil": 18.0,
+      "mu": 0.5,
+      "min_h": 0.3,
+      "bars": [
+        12.0,
+        16.0,
+        20.0,
+        25.0
+      ],
+      "cover": 0.075
+    },
+    "steel_code": "aisc",
+    "ec2_check": false,
+    "steel_min_depth": 0.0,
+    "steel_max_depth": 0.0,
+    "connection": {
+      "bolt_d": 20.0,
+      "fnv": 372.0,
+      "plate_t": 10.0,
+      "plate_fy": 245.0,
+      "plate_fu": 400.0,
+      "pitch": 75.0,
+      "edge": 40.0,
+      "e": 75.0,
+      "weld": 6.0,
+      "fexx": 482.0
+    },
+    "vibration_hz": 3.0,
+    "tension_connection": {
+      "kind": "bolted",
+      "connected": "flanges",
+      "bolt_d": 20.0,
+      "holes_flange": 2,
+      "holes_web": 0,
+      "bolts_per_line": 3,
+      "length": 0.0
+    }
+  },
+  "seismic": {
+    "enabled": false,
+    "spectrum": {
+      "kind": "code",
+      "sds": 0.5,
+      "sd1": 0.3,
+      "tl": 6.0
+    },
+    "r": 8.0,
+    "ie": 1.0,
+    "cd": 5.5,
+    "omega0": 3.0,
+    "rho": 1.0,
+    "live_mass": 0.25,
+    "damping": 0.05,
+    "mass_target": 0.9,
+    "combination": "cqc",
+    "max_modes": 60,
+    "elf_ratio": 1.0,
+    "ct": 0.0466,
+    "x": 0.9,
+    "cu": 1.4,
+    "drift_limit": 0.02,
+    "live_in_e": 1.0
+  },
+  "walls": [],
+  "masses": []
+}

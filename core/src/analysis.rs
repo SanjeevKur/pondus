@@ -225,10 +225,12 @@ pub(crate) fn case_from(model: &Model, pieces: &[Piece], quads: &[Quad], node_of
             let back: HashMap<usize, Id> = node_of.iter().map(|(a, b)| (*b, *a)).collect();
             // the soil springs under a mat sit at plate nodes that are no model node: their
             // reactions are summed under node 0 (the subgrade), so the balance still shows
+            // (a soil spring under a model node that has no support of its own, e.g. a column's
+            // load point on a raft, is soil too)
             let mut soil = [0.0; 6];
             let mut any_soil = false;
             for re in &r.reactions {
-                if let Some(id) = back.get(&re.node_id) {
+                if let Some(id) = back.get(&re.node_id).filter(|id| model.supports.iter().any(|s| s.node == **id)) {
                     cr.reactions.push((*id, [re.fx, re.fy, re.fz, re.mx, re.my, re.mz]));
                 } else {
                     for (k, v) in [re.fx, re.fy, re.fz, re.mx, re.my, re.mz].into_iter().enumerate() {
