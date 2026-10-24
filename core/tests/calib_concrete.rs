@@ -84,7 +84,7 @@ fn method2_table_every_entry() {
 }
 
 fn slab(lx: f64, ly: f64, h: f64) -> Slab {
-    Slab { id: 1, name: "S".into(), x0: 0.0, y0: 0.0, x1: lx, y1: ly, z: 3.0, h, dead: 0.0, live: 0.0, bim_id: None }
+    Slab { id: 1, name: "S".into(), x0: 0.0, y0: 0.0, x1: lx, y1: ly, z: 3.0, h, dead: 0.0, live: 0.0, bim_id: None, ..Default::default() }
 }
 
 #[test]

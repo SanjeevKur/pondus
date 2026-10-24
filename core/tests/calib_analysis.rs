@@ -362,7 +362,7 @@ fn slab_tributary_loads() {
     for p in c {
         sup(&mut m, p, FIXED);
     }
-    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: ly, y1: lx, z: 3.0, h: 0.15, dead: 0.0, live: q, bim_id: None });
+    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: ly, y1: lx, z: 3.0, h: 0.15, dead: 0.0, live: q, bim_id: None, ..Default::default() });
     let a = analyze(&m).unwrap();
     let cr = a.case(2).unwrap();
     let load = |id: Id| {
@@ -398,7 +398,7 @@ fn slab_one_way() {
     for p in c {
         sup(&mut m, p, FIXED);
     }
-    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: ly, y1: lx, z: 3.0, h: 0.15, dead: 0.0, live: q, bim_id: None });
+    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: ly, y1: lx, z: 3.0, h: 0.15, dead: 0.0, live: q, bim_id: None, ..Default::default() });
     let a = analyze(&m).unwrap();
     let cr = a.case(2).unwrap();
     let load = |id: Id| {
@@ -431,7 +431,7 @@ fn plate(a: f64, b: f64, n: usize, clamped: bool) -> (Model, f64) {
         sup(&mut m, p, if clamped { FIXED } else { [true, true, true, false, false, true] });
     }
     let h = a / 100.0;
-    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: a, y1: b, z: 0.0, h, dead: 0.0, live: 10.0, bim_id: None });
+    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: a, y1: b, z: 0.0, h, dead: 0.0, live: 10.0, bim_id: None, ..Default::default() });
     let d = 25_000e3 * h.powi(3) / (12.0 * (1.0 - 0.09));
     (m, d)
 }

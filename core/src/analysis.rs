@@ -223,10 +223,22 @@ pub(crate) fn case_from(model: &Model, pieces: &[Piece], quads: &[Quad], node_of
     match r {
         Some(r) => {
             let back: HashMap<usize, Id> = node_of.iter().map(|(a, b)| (*b, *a)).collect();
+            // the soil springs under a mat sit at plate nodes that are no model node: their
+            // reactions are summed under node 0 (the subgrade), so the balance still shows
+            let mut soil = [0.0; 6];
+            let mut any_soil = false;
             for re in &r.reactions {
                 if let Some(id) = back.get(&re.node_id) {
                     cr.reactions.push((*id, [re.fx, re.fy, re.fz, re.mx, re.my, re.mz]));
+                } else {
+                    for (k, v) in [re.fx, re.fy, re.fz, re.mx, re.my, re.mz].into_iter().enumerate() {
+                        soil[k] += v;
+                    }
+                    any_soil = true;
                 }
+            }
+            if any_soil {
+                cr.reactions.push((0, soil));
             }
         }
         None => cr.reactions = model.supports.iter().map(|s| (s.node, [0.0; 6])).collect(),
@@ -507,10 +519,11 @@ pub fn analyze(model: &Model) -> Result<Analysis, String> {
 /// whose cost grows with the cube of the degrees of freedom.
 pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analysis, String> {
     let mut warnings = crate::check::problems(model);
-    if model.members.is_empty() {
-        return Err("the model has no members".into());
+    let plates_only = model.design.slab_method == crate::slabfe::SlabMethod::Plate && !model.slabs.is_empty();
+    if model.members.is_empty() && !plates_only {
+        return Err("the model has no members (a slab resting on supports alone needs slab_method 'plate')".into());
     }
-    if model.supports.is_empty() {
+    if model.supports.is_empty() && !(plates_only && model.slabs.iter().any(|s| s.subgrade > 0.0)) {
         return Err("the model has no supports".into());
     }
     let (mloads, points, slab_applied, slab_expected) = member_loads(model, &mut warnings);
@@ -706,6 +719,29 @@ pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analy
                 input.quads.insert(id.to_string(), SolverQuadElement { id, nodes: ids, material_id: concrete, thickness: sl.h });
                 quads.push(Quad { slab: sl.id, nodes: ids, c: [(me.xs[i] + me.xs[i + 1]) / 2.0, (me.ys[j] + me.ys[j + 1]) / 2.0], size: [me.xs[i + 1] - me.xs[i], me.ys[j + 1] - me.ys[j]], q: [gamma * sl.h + sl.dead, sl.live] });
             }
+        }
+    }
+    // the soil under a mat: a spring of ks × tributary area at every plate node of a slab with a
+    // subgrade modulus, vertical and (the soil's friction) in plan, except at a node that has a
+    // support of its own (a pile): the engine takes one support per node
+    {
+        let mut trib: HashMap<usize, f64> = HashMap::new();
+        for q in &quads {
+            let ks = model.slabs.iter().find(|s| s.id == q.slab).map(|s| s.subgrade).unwrap_or(0.0);
+            if ks <= 0.0 {
+                continue;
+            }
+            let k4 = ks * q.size[0] * q.size[1] / 4.0;
+            for n in q.nodes {
+                *trib.entry(n).or_insert(0.0) += k4;
+            }
+        }
+        let own: std::collections::HashSet<usize> = model.supports.iter().filter_map(|s| node_of.get(&s.node).copied()).collect();
+        let mut gs: Vec<usize> = trib.keys().copied().filter(|g| !own.contains(g)).collect();
+        gs.sort_unstable();
+        for g in gs {
+            let k = trib[&g];
+            input.supports.insert((700_000 + g).to_string(), SolverSupport3D { node_id: g, rx: false, ry: false, rz: false, rrx: false, rry: false, rrz: false, kx: Some(k), ky: Some(k), kz: Some(k), krx: None, kry: None, krz: None, dx: None, dy: None, dz: None, drx: None, dry: None, drz: None, rw: None, kw: None, normal_x: None, normal_y: None, normal_z: None, is_inclined: None });
         }
     }
     // a node joined only by axial members has no rotational stiffness when the engine numbers

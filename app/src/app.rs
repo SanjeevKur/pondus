@@ -701,13 +701,23 @@ impl App {
             ui.label(RichText::new(format!("Slab {}", s.name)).font(theme::medium_font(14.0)));
             let mut h = s.h * 1000.0;
             let (mut dead, mut live) = (s.dead, s.live);
+            let (mut subgrade, mut mat, mut support_size) = (s.subgrade, s.mat, s.support_size);
             let mut changed = false;
             egui::Grid::new("slab-props").num_columns(2).show(ui, |ui| {
                 ui.label("Plan");
                 ui.label(format!("({:.2}, {:.2}) – ({:.2}, {:.2}) m at z {:.2}", s.x0, s.y0, s.x1, s.y1, s.z));
                 ui.end_row();
                 ui.label("Thickness, mm");
-                changed |= ui.add(egui::DragValue::new(&mut h).speed(5.0).range(80.0..=500.0)).changed();
+                changed |= ui.add(egui::DragValue::new(&mut h).speed(5.0).range(80.0..=5000.0)).changed();
+                ui.end_row();
+                ui.label("Foundation mat");
+                changed |= ui.checkbox(&mut mat, "pile cap / raft").on_hover_text("Designed as a foundation: bars of each face over the whole panel, punching checked at every support and column. Needs the plate slab method.").changed();
+                ui.end_row();
+                ui.label("Subgrade, kN/m³");
+                changed |= ui.add(egui::DragValue::new(&mut subgrade).speed(250.0).range(0.0..=1.0e6)).on_hover_text("Winkler modulus of the soil under the panel (0: none): springs under every plate node").changed();
+                ui.end_row();
+                ui.label("Support width, m");
+                changed |= ui.add(egui::DragValue::new(&mut support_size).speed(0.05).range(0.0..=3.0)).on_hover_text("Pile or pedestal width for the punching check (0: 0.3 m)").changed();
                 ui.end_row();
                 ui.label("Superimposed dead, kPa");
                 changed |= ui.add(egui::DragValue::new(&mut dead).speed(0.1).range(0.0..=50.0)).changed();
@@ -722,6 +732,9 @@ impl App {
                     x.h = h / 1000.0;
                     x.dead = dead;
                     x.live = live;
+                    x.subgrade = subgrade;
+                    x.mat = mat;
+                    x.support_size = support_size;
                 }
             }
             // the plate results of this slab under the shown result

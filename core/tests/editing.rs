@@ -170,7 +170,7 @@ fn array_copy_joins_the_frame() {
     let again = move_members(&mut m, &p, [0.0, 5.0, 0.0], true, 1).unwrap();
     assert!(again.members.is_empty() && again.notes.len() == 3, "{:?}", again.notes);
     // a slab on the first bay goes with a copy of the bay's four beams
-    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: 6.0, y1: 5.0, z: 4.0, h: 0.15, dead: 1.5, live: 2.0, bim_id: None });
+    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: 6.0, y1: 5.0, z: 4.0, h: 0.15, dead: 1.5, live: 2.0, bim_id: None, ..Default::default() });
     let bay: Vec<Id> = m.members.iter().filter(|q| {
         let (a, b) = (m.node(q.i).unwrap(), m.node(q.j).unwrap());
         a.z == 4.0 && b.z == 4.0 && a.y.max(b.y) <= 5.0 && a.y.min(b.y) >= 0.0

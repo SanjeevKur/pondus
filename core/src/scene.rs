@@ -18,7 +18,8 @@ pub enum Prim {
     Line { a: [f64; 3], b: [f64; 3], color: Rgba, width: f32, member: Option<Id> },
     Poly { pts: Vec<[f64; 3]>, color: Rgba },
     Dot { p: [f64; 3], color: Rgba, r: f32 },
-    /// A value written at a point (the app draws it; the agent's pictures leave it out).
+    /// A value written at a point (the app draws it with its font, the agent's pictures with a
+    /// bitmap font).
     Text { p: [f64; 3], text: String, color: Rgba },
 }
 
@@ -247,7 +248,7 @@ pub fn build(model: &Model, analysis: Option<&Analysis>, report: Option<&Report>
             let (hx, hy) = (p.dx / 2.0, p.dy / 2.0);
             out.push(Prim::Poly { pts: vec![[p.x - hx, p.y - hy, s.z], [p.x + hx, p.y - hy, s.z], [p.x + hx, p.y + hy, s.z], [p.x - hx, p.y + hy, s.z]], color: diverging(v / vmax) });
             if spec.values {
-                out.push(Prim::Text { p: [p.x, p.y, s.z], text: format!("{v:.1}"), color: [20, 20, 22, 255] });
+                out.push(Prim::Text { p: [p.x, p.y, s.z], text: if v.abs() >= 10.0 { format!("{v:.0}") } else { format!("{v:.1}") }, color: [20, 20, 22, 255] });
             }
         }
     }

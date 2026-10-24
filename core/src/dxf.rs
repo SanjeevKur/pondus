@@ -163,7 +163,7 @@ pub fn apply(model: &mut Model, r: &ImportResult) -> Result<Applied, String> {
         for (k, p) in panels.into_iter().enumerate() {
             let id = model.next_slab_id();
             let name = if n == 1 { s.name.clone() } else { format!("{} ({})", s.name, k + 1) };
-            model.slabs.push(Slab { id, name: if name.is_empty() { format!("S{id}") } else { name }, x0: p.0, y0: p.1, x1: p.2, y1: p.3, z: s.z, h: s.h, dead: s.dead, live: s.live, bim_id: s.bim_id.clone() });
+            model.slabs.push(Slab { id, name: if name.is_empty() { format!("S{id}") } else { name }, x0: p.0, y0: p.1, x1: p.2, y1: p.3, z: s.z, h: s.h, dead: s.dead, live: s.live, bim_id: s.bim_id.clone(), ..Default::default() });
             out.slabs.push(id);
         }
     }

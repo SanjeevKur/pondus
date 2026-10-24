@@ -1,6 +1,6 @@
 # Connecting Pondus to Claude Desktop, ChatGPT and other agents (MCP)
 
-Pondus is built for agents to use, and every operation of the program, from `add_frame` and `add_walls` to `analyze`, `design`, `show_picture` and `write_report`, is a tool of its Model Context Protocol (MCP) server. The server starts with `pondus --mcp` and speaks MCP over standard input and output (stdio, protocol version 2025-06-18). It currently offers 45 tools, and its instructions tell the agent how to model, check and report. An agent connected to it works on one structural model, and with `--autosave` every change is written to a `.pondus` file that the engineer then opens in the Pondus app to check the work.
+Pondus is built for agents to use, and every operation of the program, from `add_frame` and `add_walls` to `analyze`, `design`, `show_picture` and `write_report`, is a tool of its Model Context Protocol (MCP) server. The server starts with `pondus --mcp` and speaks MCP over standard input and output (stdio, protocol version 2025-06-18). It currently offers 46 tools, and its instructions tell the agent how to model, check and report. An agent connected to it works on one structural model, and with `--autosave` every change is written to a `.pondus` file that the engineer then opens in the Pondus app to check the work.
 
 ```
 pondus --mcp [--open model.pondus] [--autosave model.pondus]

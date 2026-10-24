@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Sompote Youwai. Part of Pondus, https://github.com/Sompote/pondus
 
 //! The agent's pictures: the scene of `scene.rs` rasterised on the CPU (anti-aliased lines,
-//! filled polygons drawn far to near) into a PNG, on the app's dark canvas.
+//! filled polygons drawn far to near, values in a small bitmap font) into a PNG, on the app's
+//! dark canvas, with a colour-scale legend for the plate diagrams.
 
 use crate::scene::{bounds, Camera, Prim, Rgba};
 
@@ -108,6 +109,7 @@ pub fn render(prims: &[Prim], cam: &Camera, w: usize, h: usize) -> Image {
         })
         .collect();
     order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let n_text = prims.iter().filter(|p| matches!(p, Prim::Text { .. })).count();
     for (_, i) in order {
         match &prims[i] {
             Prim::Line { a, b, color, width, .. } => img.line(to(*a).0, to(*b).0, *color, *width * 1.3),
@@ -116,10 +118,142 @@ pub fn render(prims: &[Prim], cam: &Camera, w: usize, h: usize) -> Image {
                 let c = to(*p).0;
                 img.line(c, c, *color, *r * 2.0);
             }
-            Prim::Text { .. } => {}
+            Prim::Text { p, text, color } => {
+                // many values (a fine plate mesh) get the small size so they do not overlap
+                let scale = if n_text > 80 { 1 } else { 2 };
+                let c = to(*p).0;
+                let wpx = text_width(text, scale);
+                img.text(c.0 - wpx as f64 / 2.0, c.1 - 3.5 * scale as f64, text, *color, scale, Some([236, 236, 236, 170]));
+            }
         }
     }
     img
+}
+
+/// A 5 x 7 bitmap font (digits, capitals and the signs of a number): each glyph is seven rows
+/// of five bits, top row first. Lowercase letters are drawn as capitals.
+fn glyph(ch: char) -> Option<[u8; 7]> {
+    Some(match ch.to_ascii_uppercase() {
+        '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+        '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        '2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+        '3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+        '4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+        '5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+        '6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+        '7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+        '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+        'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
+        'C' => [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
+        'D' => [0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C],
+        'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+        'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
+        'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'I' => [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        'J' => [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C],
+        'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
+        'N' => [0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11],
+        'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        'Q' => [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
+        'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+        'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+        'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
+        'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A],
+        'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
+        'Y' => [0x11, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04],
+        'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
+        '-' | '−' | '–' => [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
+        '+' => [0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00],
+        '±' => [0x04, 0x04, 0x1F, 0x04, 0x04, 0x00, 0x1F],
+        '.' | '·' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
+        ',' => [0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08],
+        ':' => [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00],
+        '/' => [0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10],
+        '(' => [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02],
+        ')' => [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08],
+        '=' => [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00],
+        '%' => [0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03],
+        '²' => [0x0C, 0x02, 0x04, 0x08, 0x0E, 0x00, 0x00],
+        ' ' => [0; 7],
+        _ => return None,
+    })
+}
+
+/// The width of `text` in pixels at `scale` pixels per font cell.
+pub fn text_width(text: &str, scale: usize) -> usize {
+    text.chars().count() * 6 * scale
+}
+
+impl Image {
+    /// Writes `text` with its top-left corner at (x, y), `scale` pixels per font cell, on an
+    /// optional background box.
+    pub fn text(&mut self, x: f64, y: f64, text: &str, color: Rgba, scale: usize, bg: Option<Rgba>) {
+        let (x0, y0) = (x.round() as i64, y.round() as i64);
+        if let Some(bg) = bg {
+            let (w, h) = (text_width(text, scale) as i64 + 2, 7 * scale as i64 + 2);
+            for yy in y0 - 1..y0 - 1 + h {
+                for xx in x0 - 1..x0 - 1 + w {
+                    self.blend(xx, yy, bg, 1.0);
+                }
+            }
+        }
+        for (k, ch) in text.chars().enumerate() {
+            let Some(g) = glyph(ch) else { continue };
+            for (r, row) in g.iter().enumerate() {
+                for c in 0..5 {
+                    if row & (0x10 >> c) != 0 {
+                        for sy in 0..scale {
+                            for sx in 0..scale {
+                                self.blend(x0 + (k * 6 + c) as i64 * scale as i64 + sx as i64, y0 + r as i64 * scale as i64 + sy as i64, color, 1.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adds a band of `px` rows of background at the bottom (room for a legend).
+    pub fn extend_bottom(&mut self, px: usize) {
+        let mut rgba = Vec::with_capacity((self.h + px) * self.w * 4);
+        rgba.extend_from_slice(&self.rgba);
+        for _ in 0..px * self.w {
+            rgba.extend_from_slice(&BACKGROUND);
+        }
+        self.rgba = rgba;
+        self.h += px;
+    }
+
+    /// A colour-scale legend for a plate diagram in a band at the picture's bottom (added by
+    /// `extend_bottom`): the diverging bar from -vmax (blue) through 0 to +vmax (red), the
+    /// quantity, the result and the units.
+    pub fn legend(&mut self, vmax: f64, label: &str, units: &str) {
+        self.extend_bottom(64);
+        let (x0, y0, w, h) = (14i64, self.h as i64 - 34, 300i64, 12i64);
+        for i in 0..w {
+            let t = i as f64 / (w - 1) as f64 * 2.0 - 1.0;
+            let c = crate::scene::diverging(t);
+            for yy in y0..y0 + h {
+                self.blend(x0 + i, yy, [c[0], c[1], c[2], 255], 1.0);
+            }
+        }
+        let ink: Rgba = [222, 222, 224, 255];
+        let digits = if vmax >= 100.0 { 0 } else if vmax >= 10.0 { 1 } else { 2 };
+        let lo = format!("-{vmax:.digits$}");
+        let hi = format!("+{vmax:.digits$}");
+        self.text(x0 as f64, (y0 + h + 4) as f64, &lo, ink, 2, None);
+        self.text((x0 + w / 2) as f64 - 6.0, (y0 + h + 4) as f64, "0", ink, 2, None);
+        self.text((x0 + w) as f64 - text_width(&hi, 2) as f64, (y0 + h + 4) as f64, &hi, ink, 2, None);
+        self.text((x0 + w + 24) as f64, (y0 + h + 4) as f64 - 10.0, &format!("{label} ({units})"), ink, 2, None);
+    }
 }
 
 pub fn write_png(img: &Image, path: &std::path::Path) -> Result<(), String> {

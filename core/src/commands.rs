@@ -43,7 +43,8 @@ pub fn specs() -> Vec<Spec> {
         s("add_load_case", "Adds a load case: kind D (dead), L (live), Lr (roof live), W, E or Other; self_weight adds the members' weight.", true, json!({"type": "object", "properties": {"name": {"type": "string"}, "kind": {"type": "string", "enum": ["D", "L", "Lr", "W", "E", "Other"]}, "self_weight": {"type": "boolean"}}, "required": ["name", "kind"]})),
         s("add_combination", "Adds a load combination: factors by case name, e.g. {\"D\": 1.2, \"L\": 1.6}; kind uls (strength, used to design) or sls (service, used for deflections).", true, json!({"type": "object", "properties": {"name": {"type": "string"}, "kind": {"type": "string", "enum": ["uls", "sls"]}, "factors": {"type": "object", "additionalProperties": {"type": "number"}}}, "required": ["name", "factors"]})),
         s("add_loads", "Adds loads to a case (name or id). Each load: {type: 'nodal', at: [x,y,z] or node, f: [fx,fy,fz,mx,my,mz] kN, kN·m}, {type: 'line', members: [ids] or z (all beams at that height), w: [wx,wy,wz] kN/m global (down is negative z), w_end for a varying load, a/b m from node i for part of the member}, {type: 'point', member, a (m from node i), p: [px,py,pz] kN}, {type: 'settlement', at or node (a support), d: [dx,dy,dz,rx,ry,rz] m, rad (a settlement of 10 mm down: dz -0.01)} or {type: 'thermal', members, dt (uniform °C), dt_y, dt_z (gradients across the section, °C)}. Slab loads come from the slabs; do not add them again.", true, json!({"type": "object", "properties": {"case": {"type": "string", "description": "case name (or id)"}, "loads": {"type": "array", "items": {"type": "object"}}}, "required": ["case", "loads"]})),
-        s("add_slabs", "Adds rectangular slab panels on the beams under their edges: {x0, y0, x1, y1, z (top, at the beams' level), h (m), dead (superimposed, kPa), live (kPa), name, bim_id}. Their weight (24 kN/m³ x h + dead) goes to the first D case and live to the first L case, by the 45° lines (one-way past 2:1). Or 'bays': {z, h, dead, live} makes one panel in every closed bay of the beams at height z.", true, json!({"type": "object", "properties": {"panels": {"type": "array", "items": {"type": "object"}}, "bays": {"type": "object", "properties": {"z": {"type": "number"}, "h": {"type": "number"}, "dead": {"type": "number"}, "live": {"type": "number"}}}}})),
+        s("add_mat", "Adds a pile cap or a mat (raft) foundation as a plate panel resting on its supports, with no beams: the panel x0, y0, x1, y1 (m) at z (its top, default 0) and thickness h (m, default 0.6); the piles as points [[x, y], ...] or as pile_grid {nx, ny, sx, sy (m), edge (m, pile centre to the mat edge, default half the spacing)} centred on the panel (without x0..y1 the panel is made around the grid); pile_k (kN/m, the pile's axial stiffness EA/L or from a load test, as a spring support: give it, because the cap then shares a column load between the piles by stiffness, whereas a pinned pile right under a column load takes all of it and the cap does not bend; 0 = pinned), pile_size (m, pile or pedestal width for punching, default 0.3), uplift (piles take compression only); subgrade (kN/m³, soil under the mat as Winkler springs: a mat on soil needs no piles). Sets slab_method 'plate' and a mesh of a quarter of the pile spacing. Then put the column loads with add_loads nodal at [x, y, z] (a node is made on the mat) or add_members for the columns, analyze (get_results reactions true = the pile loads; node 0 = the soil), get_slab_results (moments) and design (bars of both faces, punching at every pile and column).", true, json!({"type": "object", "properties": {"x0": {"type": "number"}, "y0": {"type": "number"}, "x1": {"type": "number"}, "y1": {"type": "number"}, "z": {"type": "number"}, "h": {"type": "number"}, "piles": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}}, "pile_grid": {"type": "object", "properties": {"nx": {"type": "integer"}, "ny": {"type": "integer"}, "sx": {"type": "number"}, "sy": {"type": "number"}, "edge": {"type": "number"}}}, "pile_k": {"type": "number"}, "pile_size": {"type": "number"}, "uplift": {"type": "boolean"}, "subgrade": {"type": "number"}, "dead": {"type": "number"}, "live": {"type": "number"}, "name": {"type": "string"}}})),
+        s("add_slabs", "Adds rectangular slab panels on the beams under their edges: {x0, y0, x1, y1, z (top, at the beams' level), h (m), dead (superimposed, kPa), live (kPa), name, bim_id, and for a panel that rests directly on columns or supports with no beams (a flat plate, a pile cap, a mat; slab_method 'plate'): subgrade (kN/m³, Winkler soil under it), mat (true: foundation design, bars of each face over the whole panel, punching at every support and column), support_size (m, the pile or pedestal width for punching)}. Their weight (24 kN/m³ x h + dead) goes to the first D case and live to the first L case, by the 45° lines (one-way past 2:1). Or 'bays': {z, h, dead, live} makes one panel in every closed bay of the beams at height z.", true, json!({"type": "object", "properties": {"panels": {"type": "array", "items": {"type": "object"}}, "bays": {"type": "object", "properties": {"z": {"type": "number"}, "h": {"type": "number"}, "dead": {"type": "number"}, "live": {"type": "number"}}}}})),
         s("delete", "Deletes members, nodes (with their members), slabs, walls, supports (by node), lumped masses (by node) or all loads of a case.", true, json!({"type": "object", "properties": {"members": ids, "nodes": ids, "slabs": ids, "walls": ids, "supports": ids, "masses": ids, "loads_of_case": {"type": "string", "description": "case name (or id)"}}})),
         s("set_design", "Design settings: fy and fyt (MPa, main bars and stirrups, default SD40 390 and SR24 235), cover_beam / cover_slab (m), beam_bars / stirrup_bars / slab_bars (diameters, mm), defl_live / defl_total (span / limit), steel_shapes (names to choose from), target_ratio (largest utilisation accepted when sizing), shear_deformation (true: frame members deform in shear too, Timoshenko beams as SAP2000 and ETABS use; off by default), second_order (true: every ULS combination is solved second order with P-Delta, and column slenderness magnifiers are then not applied), footing ({q_allow kPa, depth m (base below ground), gamma_soil kN/m³, mu, min_h m, bars mm, cover m}: spread footings are designed under the concrete columns), steel_code ('aisc' AISC 360-16 or 'ec3' EN 1993-1-1, for checks and for select), ec2_check (also check concrete beams to EN 1992-1-1 with their bars), steel_min_depth / steel_max_depth (mm, limits for select), connection ({bolt_d mm, fnv MPa, plate_t mm, plate_fy, plate_fu MPa, pitch, edge, e mm, weld mm, fexx MPa}: shear tabs designed at steel beam ends), vibration_hz (floor beams' f = 0.18 √(g/Δ) limit, 0 = off), tension_connection ({kind 'bolted' | 'welded' | 'none', connected 'flanges' | 'web' | 'all', bolt_d mm, holes_flange, holes_web (holes across each flange and the web in one section), bolts_per_line, length m}: the end connection of steel members in tension, from which the net area An and shear lag U of AISC Table D3.1 / the net area of EC3 6.2.3 follow; default bolted flanges, M20, 2 holes per flange, 3 bolts per line), slab_method ('coefficients' or 'plate': slabs as plate elements with the frame) and slab_mesh (plate element size, m, default 0.5).", true, json!({"type": "object", "properties": {"fy": {"type": "number"}, "fyt": {"type": "number"}, "cover_beam": {"type": "number"}, "cover_slab": {"type": "number"}, "beam_bars": {"type": "array", "items": {"type": "number"}}, "stirrup_bars": {"type": "array", "items": {"type": "number"}}, "slab_bars": {"type": "array", "items": {"type": "number"}}, "defl_live": {"type": "number"}, "defl_total": {"type": "number"}, "steel_shapes": {"type": "array", "items": {"type": "string"}}, "target_ratio": {"type": "number"}, "slab_method": {"type": "string", "enum": ["coefficients", "plate"]}, "slab_mesh": {"type": "number"}, "second_order": {"type": "boolean"}, "footing": {"type": "object"}, "steel_code": {"type": "string", "enum": ["aisc", "ec3"]}, "ec2_check": {"type": "boolean"}, "steel_min_depth": {"type": "number"}, "steel_max_depth": {"type": "number"}, "connection": {"type": "object"}, "vibration_hz": {"type": "number"}, "tension_connection": {"type": "object"}}})),
         s("list_sections", "The steel H shapes of the catalogue (JIS G 3192 / TIS 1227), lightest first, with mass, depth and Ix / Zx; and the model's sections.", false, json!({"type": "object", "properties": {}})),
@@ -55,6 +56,109 @@ pub fn specs() -> Vec<Spec> {
         s("merge_members", "Merges two collinear members that share a node where nothing else connects (no other member, support or nodal load), with the same section and behaviour; their loads are remapped.", true, json!({"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}, "required": ["a", "b"]})),
         s("check_model", "Problems in the model (missing sections, unconnected supports, members on each other, combinations of missing cases).", false, json!({"type": "object", "properties": {}})),
     ]
+}
+
+/// The node at `p`, made when the point lies on a slab panel (a plate on supports carries
+/// supports and loads at any point of it), otherwise an error with `why`.
+fn node_on_slab_or_member(m: &mut Model, p: [f64; 3], why: &str) -> Result<Id, String> {
+    if let Some(n) = m.find_node(p) {
+        return Ok(n);
+    }
+    if m.slabs.iter().any(|s| s.contains(p[0], p[1], p[2])) {
+        return Ok(m.node_at(p));
+    }
+    Err(format!("no node at {p:?}: {why}"))
+}
+
+/// A pile cap or a mat: one plate panel with pile supports under it and / or a subgrade.
+fn add_mat(m: &mut Model, a: &Value) -> Result<Value, String> {
+    let z = num(a, "z").unwrap_or(0.0);
+    let h = num(a, "h").unwrap_or(0.6);
+    if !(0.1..=5.0).contains(&h) {
+        return Err("h: the mat's thickness in m (0.1 to 5)".into());
+    }
+    let mut piles: Vec<[f64; 2]> = vec![];
+    for p in a.get("piles").and_then(Value::as_array).into_iter().flatten() {
+        let q = p.as_array().filter(|q| q.len() >= 2).ok_or("piles: [[x, y], ...] in m")?;
+        piles.push([q[0].as_f64().ok_or("pile x")?, q[1].as_f64().ok_or("pile y")?]);
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (num(a, "x0"), num(a, "y0"), num(a, "x1"), num(a, "y1"));
+    let mut spacing = f64::MAX;
+    if let Some(g) = a.get("pile_grid") {
+        let nx = g.get("nx").and_then(Value::as_u64).unwrap_or(3).max(1) as usize;
+        let ny = g.get("ny").and_then(Value::as_u64).unwrap_or(nx as u64).max(1) as usize;
+        let sx = num(g, "sx").or(num(g, "s")).unwrap_or(1.2);
+        let sy = num(g, "sy").unwrap_or(sx);
+        if sx <= 0.05 || sy <= 0.05 {
+            return Err("pile_grid: sx and sy are the pile spacings in m".into());
+        }
+        spacing = sx.min(sy);
+        let edge = num(g, "edge").unwrap_or(sx.max(sy) / 2.0);
+        let (cx, cy) = match (x0, x1, y0, y1) {
+            (Some(a0), Some(a1), Some(b0), Some(b1)) => ((a0 + a1) / 2.0, (b0 + b1) / 2.0),
+            _ => {
+                let c = a.get("centre").or(a.get("center")).and_then(Value::as_array);
+                (c.and_then(|c| c.first()).and_then(Value::as_f64).unwrap_or(0.0), c.and_then(|c| c.get(1)).and_then(Value::as_f64).unwrap_or(0.0))
+            }
+        };
+        for i in 0..nx {
+            for j in 0..ny {
+                piles.push([cx + (i as f64 - (nx - 1) as f64 / 2.0) * sx, cy + (j as f64 - (ny - 1) as f64 / 2.0) * sy]);
+            }
+        }
+        if x0.is_none() || x1.is_none() || y0.is_none() || y1.is_none() {
+            x0 = Some(cx - (nx - 1) as f64 / 2.0 * sx - edge);
+            x1 = Some(cx + (nx - 1) as f64 / 2.0 * sx + edge);
+            y0 = Some(cy - (ny - 1) as f64 / 2.0 * sy - edge);
+            y1 = Some(cy + (ny - 1) as f64 / 2.0 * sy + edge);
+        }
+    }
+    let (x0, y0, x1, y1) = match (x0, y0, x1, y1) {
+        (Some(a0), Some(b0), Some(a1), Some(b1)) => (a0, b0, a1, b1),
+        _ if !piles.is_empty() => {
+            let edge = num(a, "edge").unwrap_or(0.6);
+            let (xs, ys): (Vec<f64>, Vec<f64>) = piles.iter().map(|p| (p[0], p[1])).unzip();
+            (xs.iter().copied().fold(f64::MAX, f64::min) - edge, ys.iter().copied().fold(f64::MAX, f64::min) - edge, xs.iter().copied().fold(f64::MIN, f64::max) + edge, ys.iter().copied().fold(f64::MIN, f64::max) + edge)
+        }
+        _ => return Err("give the panel x0, y0, x1, y1 (m), or piles / a pile_grid to make it around".into()),
+    };
+    if (x1 - x0).abs() < 0.2 || (y1 - y0).abs() < 0.2 {
+        return Err("the mat is smaller than 0.2 m on a side".into());
+    }
+    let subgrade = num(a, "subgrade").unwrap_or(0.0).max(0.0);
+    if piles.is_empty() && subgrade <= 0.0 {
+        return Err("a mat needs piles (piles or pile_grid) or a subgrade modulus (kN/m³) under it".into());
+    }
+    for (i, p) in piles.iter().enumerate() {
+        if p[0] < x0.min(x1) - 1e-6 || p[0] > x0.max(x1) + 1e-6 || p[1] < y0.min(y1) - 1e-6 || p[1] > y0.max(y1) + 1e-6 {
+            return Err(format!("pile {} at {p:?} lies outside the mat", i + 1));
+        }
+        for q in &piles[i + 1..] {
+            spacing = spacing.min(((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt());
+        }
+    }
+    let id = m.next_slab_id();
+    let name = a.get("name").and_then(Value::as_str).map(String::from).unwrap_or(format!("MAT{id}"));
+    m.slabs.push(Slab { id, name: name.clone(), x0, y0, x1, y1, z, h, dead: num(a, "dead").unwrap_or(0.0), live: num(a, "live").unwrap_or(0.0), bim_id: None, subgrade, mat: true, support_size: num(a, "pile_size").unwrap_or(0.3) });
+    let k = num(a, "pile_k").unwrap_or(0.0);
+    let uplift = a.get("uplift").and_then(Value::as_bool).unwrap_or(false);
+    let mut nodes = vec![];
+    for p in &piles {
+        let n = m.node_at([p[0], p[1], z]);
+        m.supports.retain(|s| s.node != n);
+        m.supports.push(if k > 0.0 { Support { node: n, fix: [true, true, false, false, false, false], springs: [0.0, 0.0, k, 0.0, 0.0, 0.0], uplift } } else { Support { node: n, fix: [true, true, true, false, false, false], springs: [0.0; 6], uplift } });
+        nodes.push(n);
+    }
+    m.design.slab_method = crate::slabfe::SlabMethod::Plate;
+    let side = (x1 - x0).abs().min((y1 - y0).abs());
+    let want = if spacing < f64::MAX { spacing / 4.0 } else { side / 8.0 };
+    m.design.slab_mesh = m.design.slab_mesh.min(want).clamp(0.1, 1.0);
+    let plan = [x0, y0, x1, y1].map(|v| (v * 1000.0).round() / 1000.0);
+    Ok(json!({
+        "slab": id, "name": name, "plan": plan, "z": z, "h": h, "piles": nodes, "pile_support": if k > 0.0 { format!("spring kz {k} kN/m, held in plan") } else { "pinned".into() },
+        "subgrade": subgrade, "slab_method": "plate", "slab_mesh": m.design.slab_mesh,
+        "next": "column loads: add_loads nodal at [x, y, z] (a node is made on the mat) or add_members for the columns; then analyze (reactions balance), get_results reactions true (pile loads), get_slab_results (mx, my per metre), design (bars of both faces, punching at every pile and column)"
+    }))
 }
 
 fn num(v: &Value, k: &str) -> Option<f64> {
@@ -159,6 +263,7 @@ fn run_inner(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
             Ok(json!({"ok": true}))
         }
         "add_frame" => add_frame(m, a),
+        "add_mat" => add_mat(m, a),
         "add_members" => {
             let list = a.get("members").and_then(Value::as_array).ok_or("give members: [{from, to, section}]")?;
             let mut made = vec![];
@@ -293,7 +398,7 @@ fn run_inner(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
             let mut nodes = ids(a, "nodes");
             for p in a.get("points").and_then(Value::as_array).into_iter().flatten() {
                 let p = p3(p)?;
-                nodes.push(m.find_node(p).ok_or_else(|| format!("no node at {p:?}: supports go where members end"))?);
+                nodes.push(node_on_slab_or_member(m, p, "supports go where members end, or on a slab panel with slab_method 'plate' (a pile under a cap, a pedestal under a mat)")?);
             }
             let springs: [f64; 6] = match a.get("springs").and_then(Value::as_array) {
                 Some(v) if v.len() == 6 => [0, 1, 2, 3, 4, 5].map(|k| v[k].as_f64().unwrap_or(0.0)),
@@ -418,7 +523,7 @@ fn run_inner(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
                         let node = match l.get("at") {
                             Some(p) => {
                                 let p = p3(p)?;
-                                m.find_node(p).ok_or_else(|| format!("no node at {p:?}"))?
+                                node_on_slab_or_member(m, p, "nodal loads go where members end, or on a slab panel with slab_method 'plate' (a column load on a mat)")?
                             }
                             None => l.get("node").and_then(Value::as_u64).ok_or("a nodal load needs 'at' or 'node'")? as Id,
                         };
@@ -495,7 +600,7 @@ fn run_inner(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
             for p in a.get("panels").and_then(Value::as_array).into_iter().flatten() {
                 let id = m.next_slab_id();
                 let g = |k: &str| num(p, k).ok_or(format!("a panel needs {k}"));
-                let s = Slab { id, name: p.get("name").and_then(Value::as_str).map(String::from).unwrap_or(format!("S{id}")), x0: g("x0")?, y0: g("y0")?, x1: g("x1")?, y1: g("y1")?, z: g("z")?, h: num(p, "h").unwrap_or(0.15), dead: num(p, "dead").unwrap_or(1.5), live: num(p, "live").unwrap_or(2.0), bim_id: p.get("bim_id").and_then(Value::as_str).map(String::from) };
+                let s = Slab { id, name: p.get("name").and_then(Value::as_str).map(String::from).unwrap_or(format!("S{id}")), x0: g("x0")?, y0: g("y0")?, x1: g("x1")?, y1: g("y1")?, z: g("z")?, h: num(p, "h").unwrap_or(0.15), dead: num(p, "dead").unwrap_or(1.5), live: num(p, "live").unwrap_or(2.0), bim_id: p.get("bim_id").and_then(Value::as_str).map(String::from), subgrade: num(p, "subgrade").unwrap_or(0.0), mat: p.get("mat").and_then(Value::as_bool).unwrap_or(false), support_size: num(p, "support_size").unwrap_or(0.0) };
                 m.slabs.push(s);
                 made.push(id);
             }
@@ -503,7 +608,7 @@ fn run_inner(m: &mut Model, name: &str, a: &Value) -> Result<Value, String> {
                 let z = num(b, "z").ok_or("bays needs z")?;
                 for (x0, y0, x1, y1) in bays(m, z) {
                     let id = m.next_slab_id();
-                    m.slabs.push(Slab { id, name: format!("S{id}"), x0, y0, x1, y1, z, h: num(b, "h").unwrap_or(0.15), dead: num(b, "dead").unwrap_or(1.5), live: num(b, "live").unwrap_or(2.0), bim_id: None });
+                    m.slabs.push(Slab { id, name: format!("S{id}"), x0, y0, x1, y1, z, h: num(b, "h").unwrap_or(0.15), dead: num(b, "dead").unwrap_or(1.5), live: num(b, "live").unwrap_or(2.0), bim_id: None, ..Default::default() });
                     made.push(id);
                 }
             }
@@ -842,7 +947,7 @@ fn add_frame(m: &mut Model, a: &Value) -> Result<Value, String> {
             for wx in gx.windows(2) {
                 for wy in gy.windows(2) {
                     let id = m.next_slab_id();
-                    m.slabs.push(Slab { id, name: format!("S{k}-{id}"), x0: wx[0], y0: wy[0], x1: wx[1], y1: wy[1], z: *z, h, dead, live: if k == gz.len() - 1 { roof } else { live }, bim_id: None });
+                    m.slabs.push(Slab { id, name: format!("S{k}-{id}"), x0: wx[0], y0: wy[0], x1: wx[1], y1: wy[1], z: *z, h, dead, live: if k == gz.len() - 1 { roof } else { live }, bim_id: None, ..Default::default() });
                     slabs += 1;
                 }
             }

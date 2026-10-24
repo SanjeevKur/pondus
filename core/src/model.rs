@@ -376,7 +376,7 @@ pub struct Combination {
 /// A rectangular floor panel in plan, x0..x1 by y0..y1 at height z (its top), carried by the
 /// beams on its edges. Its own weight and `dead` go to the dead case, `live` to the live
 /// case, both by the 45° lines of a two-way slab (one-way past a 2:1 aspect).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Slab {
     pub id: Id,
     #[serde(default)]
@@ -394,9 +394,29 @@ pub struct Slab {
     pub live: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bim_id: Option<String>,
+    /// Winkler subgrade modulus of the soil under the panel, kN/m³ (0: none). With the plate
+    /// method a spring of ks × tributary area goes under every plate node (and the same in
+    /// plan, the soil's friction), so the panel is a mat foundation on soil.
+    #[serde(default)]
+    pub subgrade: f64,
+    /// A foundation mat or pile cap: designed with the bars of each face enveloped over the
+    /// whole panel and punching checked at every support and column inside it (a flat plate
+    /// on columns gets the same treatment by itself).
+    #[serde(default)]
+    pub mat: bool,
+    /// Bearing width of the supports inside the panel (piles, pedestals) for punching, m
+    /// (0: 0.3 m).
+    #[serde(default)]
+    pub support_size: f64,
 }
 
 impl Slab {
+    /// Whether the point lies on the panel (in plan, within its edges) at its level.
+    pub fn contains(&self, x: f64, y: f64, z: f64) -> bool {
+        let (lo, hi) = (self.lo(), self.hi());
+        (z - self.z).abs() < 0.05 && x >= lo.0 - 1e-6 && x <= hi.0 + 1e-6 && y >= lo.1 - 1e-6 && y <= hi.1 + 1e-6
+    }
+
     pub fn lx(&self) -> f64 {
         (self.x1 - self.x0).abs()
     }

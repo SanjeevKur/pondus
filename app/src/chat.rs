@@ -722,7 +722,7 @@ mod tests {
     }
 
     /// One real agent run through the chat's own code (costs an LLM run):
-    /// PONDUS_AGENT_TEST=<dir> TIGRIMOS_API_URL=.. TIGRIMOS_MODEL=.. TIGRIMOS_API_KEY=..
+    /// PONDUS_AGENT_TEST=<dir> TIGRIMOS_API_URL=.. TIGRIMOS_MODEL=.. TIGRIMOS_API_KEY=.. [PONDUS_AGENT_MSG=<prompt>]
     /// target/release/deps/pondus-<hash> agent_ --ignored --nocapture  (run the test binary
     /// itself under `env -i HOME=.. PATH=/usr/bin:/bin ...`: started by `cargo test`, tigrim
     /// sat 600 s without a tool call and returned empty content; outside cargo it passes in 37 s)
@@ -741,12 +741,15 @@ mod tests {
                 }
             }
         });
-        let msg = "Build a two-storey reinforced concrete frame: 2 bays of 6 m along x and 1 bay of 5 m along y, storeys 3.5 m, columns 400 x 400, beams 300 x 600, 150 mm slabs with 1.5 kPa finishes and 3 kPa office live load (roof 1 kPa). Analyse it, check the reactions, then design the beams and slabs and tell me the reinforcement of the most loaded beam.";
+        let custom = std::env::var("PONDUS_AGENT_MSG").ok();
+        let msg = custom.as_deref().unwrap_or("Build a two-storey reinforced concrete frame: 2 bays of 6 m along x and 1 bay of 5 m along y, storeys 3.5 m, columns 400 x 400, beams 300 x 600, 150 mm slabs with 1.5 kPa finishes and 3 kPa office live load (roof 1 kPa). Analyse it, check the reactions, then design the beams and slabs and tell me the reinforcement of the most loaded beam.");
         let o = run(&bin, &dir, &me, provider, "auto", true, msg, &[], &Model::new("Agent test"), &tx, &AtomicBool::new(false)).unwrap();
         eprintln!("REPLY: {}", o.reply);
         let m = o.project.expect("the agent changed the model");
         m.save(&dir.join("result.pondus")).unwrap();
         eprintln!("members {} slabs {} supports {}", m.members.len(), m.slabs.len(), m.supports.len());
-        assert!(m.members.len() >= 14 && m.slabs.len() >= 2);
+        if custom.is_none() {
+            assert!(m.members.len() >= 14 && m.slabs.len() >= 2);
+        }
     }
 }

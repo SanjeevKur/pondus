@@ -24,7 +24,7 @@ fn square(mesh: f64) -> Model {
     for n in m.nodes.clone() {
         m.supports.push(Support { node: n.id, fix: [true, true, true, false, false, true], springs: [0.0; 6], uplift: false });
     }
-    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: 4.0, y1: 4.0, z: 0.0, h: 0.2, dead: 0.0, live: 10.0, bim_id: None });
+    m.slabs.push(Slab { id: 1, name: "S1".into(), x0: 0.0, y0: 0.0, x1: 4.0, y1: 4.0, z: 0.0, h: 0.2, dead: 0.0, live: 10.0, bim_id: None, ..Default::default() });
     m
 }
 
@@ -81,7 +81,7 @@ fn plate_floor_on_frame_balances() {
         m.supports.push(Support::of_kind(n.id, "fixed").unwrap());
     }
     for (k, x) in [0.0, 6.0].iter().enumerate() {
-        m.slabs.push(Slab { id: k + 1, name: format!("S{}", k + 1), x0: *x, y0: 0.0, x1: x + 6.0, y1: 5.0, z: 3.5, h: 0.15, dead: 1.5, live: 3.0, bim_id: None });
+        m.slabs.push(Slab { id: k + 1, name: format!("S{}", k + 1), x0: *x, y0: 0.0, x1: x + 6.0, y1: 5.0, z: 3.5, h: 0.15, dead: 1.5, live: 3.0, bim_id: None, ..Default::default() });
     }
     let a = analyze(&m).unwrap();
     let l = a.case(2).unwrap();

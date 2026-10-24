@@ -406,12 +406,9 @@ pub fn design_pass(model: &Model, a: &Analysis, o: &Options) -> Report {
             if plate {
                 let uls: Vec<Vec<&crate::slabfe::PlateResult>> = res.uls.iter().map(|(_, r)| r.plates.iter().filter(|p| p.slab == s.id).collect()).collect();
                 let sls: Vec<&crate::slabfe::PlateResult> = res.dead_live.plates.iter().filter(|p| p.slab == s.id).collect();
-                // columns standing under the panel's interior: punching is not designed
-                let (lo, hi) = (s.lo(), s.hi());
-                let inside = model.members.iter().filter(|m| model.kind(m) == MemberKind::Column).filter(|m| {
-                    [m.i, m.j].iter().filter_map(|n| model.node(*n)).any(|n| (n.z - s.z).abs() < 0.05 && n.x > lo.0 + 0.05 && n.x < hi.0 - 0.05 && n.y > lo.1 + 0.05 && n.y < hi.1 - 0.05)
-                }).count();
-                rep.slabs.push(crate::slabfe::design(s, &uls, &sls, inside, &mat, &model.design));
+                // the columns on the panel and the supports under it: punching is checked there
+                let punch = crate::slabfe::punch_points(model, s, &res.uls);
+                rep.slabs.push(crate::slabfe::design(s, &uls, &sls, &punch, &mat, &model.design));
             } else {
                 let cont = slab_continuity(model, s);
                 rep.slabs.push(rc::design_slab(s, cont, gamma * s.h + s.dead, s.live, &mat, &model.design));
