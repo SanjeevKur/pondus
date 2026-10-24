@@ -193,7 +193,9 @@ impl View {
                 let d = match p {
                     Prim::Line { a, b, .. } => (to(*a).1 + to(*b).1) / 2.0,
                     Prim::Poly { pts, .. } => pts.iter().map(|q| to(*q).1).sum::<f64>() / pts.len().max(1) as f64 + 1e-6,
-                    Prim::Dot { p, .. } | Prim::Text { p, .. } => to(*p).1,
+                    Prim::Shaded { pts, .. } => pts.iter().map(|q| to(*q).1).sum::<f64>() / 4.0 + 1e-6,
+                    Prim::Dot { p, .. } => to(*p).1,
+                    Prim::Text { p, .. } => to(*p).1 - 1e-3,
                 };
                 (-d, i)
             })
@@ -211,6 +213,15 @@ impl View {
                 Prim::Poly { pts, color } => {
                     let pts: Vec<Pos2> = pts.iter().map(|q| to(*q).0).collect();
                     painter.add(egui::Shape::convex_polygon(pts, c32(*color), Stroke::NONE));
+                }
+                Prim::Shaded { pts, colors } => {
+                    // a quad with a colour per corner: the GPU shades between them
+                    let mut mesh = egui::epaint::Mesh::default();
+                    for (q, c) in pts.iter().zip(colors) {
+                        mesh.vertices.push(egui::epaint::Vertex { pos: to(*q).0, uv: egui::epaint::WHITE_UV, color: c32(*c) });
+                    }
+                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    painter.add(egui::Shape::mesh(mesh));
                 }
                 Prim::Dot { p, color, r } => {
                     painter.circle_filled(to(*p).0, *r, c32(*color));

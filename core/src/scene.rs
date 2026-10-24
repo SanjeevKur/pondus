@@ -21,6 +21,30 @@ pub enum Prim {
     /// A value written at a point (the app draws it with its font, the agent's pictures with a
     /// bitmap font).
     Text { p: [f64; 3], text: String, color: Rgba },
+    /// A plate element with a colour at each corner, shaded between them (the nodal values of a
+    /// plate result, so the field reads as a smooth contour instead of one flat value per element).
+    Shaded { pts: [[f64; 3]; 4], colors: [Rgba; 4] },
+}
+
+/// The nodal values of a plate diagram: at every plate node the mean of the elements that share
+/// it (the usual stress recovery of a finite element post-processor). Keyed by the node's
+/// position to the mm. The element values themselves are what the design uses.
+pub fn plate_nodal(r: &CaseResult, diagram: Diagram, keep: impl Fn(&crate::slabfe::PlateResult) -> bool) -> std::collections::HashMap<(i64, i64, i64), f64> {
+    let mut sum: std::collections::HashMap<(i64, i64, i64), (f64, usize)> = std::collections::HashMap::new();
+    for p in r.plates.iter().filter(|p| keep(p)) {
+        let v = diagram.plate_value(p);
+        let (hx, hy) = (p.dx / 2.0, p.dy / 2.0);
+        for (x, y) in [(p.x - hx, p.y - hy), (p.x + hx, p.y - hy), (p.x + hx, p.y + hy), (p.x - hx, p.y + hy)] {
+            let e = sum.entry(key3(x, y, p.slab as f64)).or_insert((0.0, 0));
+            e.0 += v;
+            e.1 += 1;
+        }
+    }
+    sum.into_iter().map(|(k, (s, n))| (k, s / n as f64)).collect()
+}
+
+fn key3(x: f64, y: f64, s: f64) -> (i64, i64, i64) {
+    ((x * 1000.0).round() as i64, (y * 1000.0).round() as i64, s as i64)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,19 +260,26 @@ pub fn build(model: &Model, analysis: Option<&Analysis>, report: Option<&Report>
         }
     }
     let result = analysis.and_then(|a| pick_result(model, a, spec));
-    // slab plate results: each element coloured on the diverging scale, values if asked
+    // slab plate results: the nodal values (each node the mean of its elements) shaded across
+    // every element on the diverging scale, and written at the nodes if asked
     if let (Some(r), true) = (result.as_ref(), spec.diagram.is_plate()) {
         let vmax = plate_range(model, r, spec).max(1e-9);
-        for p in &r.plates {
+        let shown = |p: &crate::slabfe::PlateResult| model.slabs.iter().find(|s| s.id == p.slab).is_some_and(|s| !(spec.view == "plan" && spec.z.is_some_and(|z| (s.z - z).abs() > 0.05)));
+        let nodal = plate_nodal(r, spec.diagram, shown);
+        let mut written: std::collections::HashSet<(i64, i64, i64)> = std::collections::HashSet::new();
+        for p in r.plates.iter().filter(|p| shown(p)) {
             let Some(s) = model.slabs.iter().find(|s| s.id == p.slab) else { continue };
-            if spec.view == "plan" && spec.z.is_some_and(|z| (s.z - z).abs() > 0.05) {
-                continue;
-            }
-            let v = spec.diagram.plate_value(p);
             let (hx, hy) = (p.dx / 2.0, p.dy / 2.0);
-            out.push(Prim::Poly { pts: vec![[p.x - hx, p.y - hy, s.z], [p.x + hx, p.y - hy, s.z], [p.x + hx, p.y + hy, s.z], [p.x - hx, p.y + hy, s.z]], color: diverging(v / vmax) });
+            let corners = [[p.x - hx, p.y - hy, s.z], [p.x + hx, p.y - hy, s.z], [p.x + hx, p.y + hy, s.z], [p.x - hx, p.y + hy, s.z]];
+            let at = |c: &[f64; 3]| nodal.get(&key3(c[0], c[1], p.slab as f64)).copied().unwrap_or(spec.diagram.plate_value(p));
+            out.push(Prim::Shaded { pts: corners, colors: corners.map(|c| diverging(at(&c) / vmax)) });
             if spec.values {
-                out.push(Prim::Text { p: [p.x, p.y, s.z], text: if v.abs() >= 10.0 { format!("{v:.0}") } else { format!("{v:.1}") }, color: [20, 20, 22, 255] });
+                for c in &corners {
+                    if written.insert(key3(c[0], c[1], p.slab as f64)) {
+                        let v = at(c);
+                        out.push(Prim::Text { p: *c, text: if v.abs() >= 10.0 { format!("{v:.0}") } else { format!("{v:.1}") }, color: [20, 20, 22, 255] });
+                    }
+                }
             }
         }
     }
@@ -453,6 +484,7 @@ pub fn bounds(prims: &[Prim], cam: &Camera) -> Option<(f64, f64, f64, f64)> {
     let pts = prims.iter().flat_map(|p| match p {
         Prim::Line { a, b, .. } => vec![*a, *b],
         Prim::Poly { pts, .. } => pts.clone(),
+        Prim::Shaded { pts, .. } => pts.to_vec(),
         Prim::Dot { p, .. } | Prim::Text { p, .. } => vec![*p],
     });
     let mut b: Option<(f64, f64, f64, f64)> = None;

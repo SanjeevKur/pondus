@@ -83,6 +83,40 @@ impl Image {
     }
 }
 
+impl Image {
+    /// A triangle with a colour at each corner, interpolated across it (Gouraud shading).
+    fn tri_shaded(&mut self, p: [(f64, f64); 3], c: [Rgba; 3]) {
+        let det = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[2].0 - p[0].0) * (p[1].1 - p[0].1);
+        if det.abs() < 1e-9 {
+            return;
+        }
+        let x0 = p.iter().map(|q| q.0).fold(f64::MAX, f64::min).floor().max(0.0) as i64;
+        let x1 = p.iter().map(|q| q.0).fold(f64::MIN, f64::max).ceil().min(self.w as f64 - 1.0) as i64;
+        let y0 = p.iter().map(|q| q.1).fold(f64::MAX, f64::min).floor().max(0.0) as i64;
+        let y1 = p.iter().map(|q| q.1).fold(f64::MIN, f64::max).ceil().min(self.h as f64 - 1.0) as i64;
+        // a little tolerance on the edges so neighbouring triangles leave no seam
+        let eps = 0.75 / det.abs().sqrt().max(1.0);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let l1 = ((p[1].0 - p[0].0) * (py - p[0].1) - (px - p[0].0) * (p[1].1 - p[0].1)) / det;
+                let l2 = ((px - p[0].0) * (p[2].1 - p[0].1) - (p[2].0 - p[0].0) * (py - p[0].1)) / det;
+                let (w2, w1) = (l1, l2);
+                let w0 = 1.0 - w1 - w2;
+                if w0 < -eps || w1 < -eps || w2 < -eps {
+                    continue;
+                }
+                let (w0, w1, w2) = (w0.max(0.0), w1.max(0.0), w2.max(0.0));
+                let s = w0 + w1 + w2;
+                // opaque, so the pixels the two triangles of an element share show no seam
+                let mut col = [0, 1, 2, 3].map(|k| ((c[0][k] as f64 * w0 + c[1][k] as f64 * w1 + c[2][k] as f64 * w2) / s).round() as u8);
+                col[3] = 255;
+                self.blend(x, y, col, 1.0);
+            }
+        }
+    }
+}
+
 pub const BACKGROUND: Rgba = [30, 30, 32, 255];
 
 pub fn render(prims: &[Prim], cam: &Camera, w: usize, h: usize) -> Image {
@@ -103,7 +137,10 @@ pub fn render(prims: &[Prim], cam: &Camera, w: usize, h: usize) -> Image {
             let d = match p {
                 Prim::Line { a, b, .. } => (to(*a).1 + to(*b).1) / 2.0,
                 Prim::Poly { pts, .. } => pts.iter().map(|q| to(*q).1).sum::<f64>() / pts.len().max(1) as f64 + 1e-6,
-                Prim::Dot { p, .. } | Prim::Text { p, .. } => to(*p).1,
+                Prim::Shaded { pts, .. } => pts.iter().map(|q| to(*q).1).sum::<f64>() / 4.0 + 1e-6,
+                Prim::Dot { p, .. } => to(*p).1,
+                // values are written last, over the dots and lines at their point
+                Prim::Text { p, .. } => to(*p).1 - 1e-3,
             };
             (-d, i)
         })
@@ -114,6 +151,11 @@ pub fn render(prims: &[Prim], cam: &Camera, w: usize, h: usize) -> Image {
         match &prims[i] {
             Prim::Line { a, b, color, width, .. } => img.line(to(*a).0, to(*b).0, *color, *width * 1.3),
             Prim::Poly { pts, color } => img.poly(&pts.iter().map(|q| to(*q).0).collect::<Vec<_>>(), *color),
+            Prim::Shaded { pts, colors } => {
+                let q = pts.map(|p| to(p).0);
+                img.tri_shaded([q[0], q[1], q[2]], [colors[0], colors[1], colors[2]]);
+                img.tri_shaded([q[0], q[2], q[3]], [colors[0], colors[2], colors[3]]);
+            }
             Prim::Dot { p, color, r } => {
                 let c = to(*p).0;
                 img.line(c, c, *color, *r * 2.0);
