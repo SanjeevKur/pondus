@@ -630,7 +630,11 @@ pub fn bim_export(model: &Model, rep: &Report) -> serde_json::Value {
         elems.push(e);
     }
     let slabs: Vec<_> = model.slabs.iter().map(|s| {
-        let mut e = json!({"slab": s.id, "bim_id": s.bim_id, "name": s.name, "outline": [[s.x0, s.y0], [s.x1, s.y0], [s.x1, s.y1], [s.x0, s.y1]], "z_top": s.z, "family": "Floor", "type": format!("Concrete - {:.0} mm", s.h * 1e3), "thickness_m": s.h});
+        let cont = slab_continuity(model, s);
+        let mut e = json!({"slab": s.id, "bim_id": s.bim_id, "name": s.name, "outline": [[s.x0, s.y0], [s.x1, s.y0], [s.x1, s.y1], [s.x0, s.y1]], "z_top": s.z, "family": "Floor", "type": format!("Concrete - {:.0} mm", s.h * 1e3), "thickness_m": s.h,
+            // which edges continue into a neighbouring panel (top bars run over them): the
+            // edges y = y0, x = x1, y = y1, x = x0
+            "continuous_edges": {"y0": cont[0], "x1": cont[1], "y1": cont[2], "x0": cont[3]}});
         if let Some(d) = rep.slabs.iter().find(|d| d.slab == s.id) {
             e["reinforcement"] = json!(d.strips.iter().map(|t| format!("{} {}: {}", t.direction, t.location, t.bars)).collect::<Vec<_>>());
             e["method"] = json!(d.method);
@@ -655,8 +659,11 @@ pub fn bim_export(model: &Model, rep: &Report) -> serde_json::Value {
             "code": "ACI 318-19 Ch. 11 / 18.10",
         })
     }).collect();
+    let conc = model.materials.iter().find(|m| m.kind == MaterialKind::Concrete);
     json!({
         "format": "pondus-bim-1",
+        // what the bars were designed with, so the BIM side can lay them out and check them
+        "settings": {"code": "ACI 318-19", "fc_MPa": conc.map(|m| m.fc), "fy_MPa": model.design.fy, "fyt_MPa": model.design.fyt, "cover_beam_mm": model.design.cover_beam * 1e3, "cover_slab_mm": model.design.cover_slab * 1e3, "cover_footing_mm": model.design.footing.cover * 1e3, "aggregate_mm": model.design.aggregate},
         "walls": walls,
         "footings": footings,
         "units": "m, kN, MPa",

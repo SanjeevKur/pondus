@@ -582,7 +582,7 @@ impl Default for DesignSettings {
             cover_beam: 0.030,
             cover_slab: 0.020,
             beam_bars: vec![12.0, 16.0, 20.0, 25.0, 28.0, 32.0],
-            stirrup_bars: vec![9.0, 12.0],
+            stirrup_bars: vec![9.0, 10.0, 12.0],
             slab_bars: vec![9.0, 12.0, 16.0],
             aggregate: 20.0,
             defl_live: 360.0,

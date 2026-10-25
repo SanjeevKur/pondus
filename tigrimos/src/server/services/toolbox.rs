@@ -8684,6 +8684,21 @@ async fn llm_call(
                 body["tool_choice"] = json!("auto");
             }
         }
+        // Optional provider-specific request fields from settings.json
+        // (`"llmExtraBody": { "reasoning": { "effort": "low" } }` for OpenRouter
+        // reasoning models, etc.). Merged top-level into the OpenAI-compatible
+        // body only; keys already set above (model/messages/tools) are not
+        // overridable so a typo can't break the request.
+        {
+            let settings = crate::server::data::get_settings().await;
+            if let Some(extra) = settings.extra.get("llmExtraBody").and_then(|v| v.as_object()) {
+                for (k, v) in extra {
+                    if !matches!(k.as_str(), "model" | "messages" | "tools" | "tool_choice") {
+                        body[k] = v.clone();
+                    }
+                }
+            }
+        }
         let mut hdrs = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
             ("Authorization".to_string(), format!("Bearer {}", api_key)),

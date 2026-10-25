@@ -1002,7 +1002,12 @@ pub fn design_column(member: crate::model::Id, bim_id: Option<String>, b_m: f64,
     let (b, h) = (b_m * 1000.0, h_m * 1000.0);
     let (fc, fy, fyt) = (mat.fc, mat.fy, mat.fyt);
     let cover = set.cover_beam * 1000.0;
-    let dt = set.stirrup_bars.first().copied().unwrap_or(9.0);
+    // ties at least No. 10 round bars up to No. 32, No. 13 for larger (25.7.2.2): the
+    // first stirrup size that qualifies
+    let dt = {
+        let need = if set.beam_bars.iter().any(|d| *d >= 36.0) { 12.0 } else { 10.0 };
+        set.stirrup_bars.iter().copied().find(|d| *d >= need).unwrap_or(need)
+    };
     let ag = b * h;
     let mut notes = vec![];
     // slenderness per axis: klu/r with r = 0.3 x the dimension in the plane of bending
