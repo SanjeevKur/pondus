@@ -120,6 +120,7 @@ fn eff_width(w: f64, t: f64, k: f64, f: f64, e: f64) -> f64 {
 }
 
 /// Gross and effective properties of a lipped channel h x b x d x t (m) at stress fy (MPa).
+#[derive(Clone, Debug)]
 pub struct LippedProps {
     pub fe: crate::secfe::SectionFe,
     pub ae: f64,
@@ -129,6 +130,21 @@ pub struct LippedProps {
 }
 
 pub fn lipped_props(h: f64, b: f64, d: f64, t: f64, fy: f64) -> Result<LippedProps, String> {
+    // the section FE (3000 elements) is the cost of a cold-formed check: a roof of hundreds
+    // of purlins tries the same few catalogue sections again and again, so they are kept
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<[i64; 5], LippedProps>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = [(h * 1e6).round() as i64, (b * 1e6).round() as i64, (d * 1e6).round() as i64, (t * 1e6).round() as i64, (fy * 1e3).round() as i64];
+    if let Some(p) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(p);
+    }
+    let p = lipped_props_uncached(h, b, d, t, fy)?;
+    CACHE.with(|c| c.borrow_mut().insert(key, p.clone()));
+    Ok(p)
+}
+
+fn lipped_props_uncached(h: f64, b: f64, d: f64, t: f64, fy: f64) -> Result<LippedProps, String> {
     let fe = crate::secfe::analyze(&crate::secfe::lipped_c(h, b, d, t), 3000)?;
     let e = 203_000.0;
     // flat widths between the corners (sharp corners)

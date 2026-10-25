@@ -74,6 +74,46 @@ fn fmt(x: f64) -> String {
     }
 }
 
+/// Lipped channels (TIS 1228 cold-formed sections): h, b, lip d, t in mm.
+pub const LIPPED: [(f64, f64, f64, f64); 12] = [
+    (75.0, 45.0, 15.0, 2.3),
+    (100.0, 50.0, 20.0, 2.3),
+    (100.0, 50.0, 20.0, 3.2),
+    (125.0, 50.0, 20.0, 2.3),
+    (125.0, 50.0, 20.0, 3.2),
+    (150.0, 50.0, 20.0, 2.3),
+    (150.0, 50.0, 20.0, 3.2),
+    (150.0, 65.0, 20.0, 3.2),
+    (150.0, 75.0, 20.0, 3.2),
+    (200.0, 75.0, 20.0, 3.2),
+    (200.0, 75.0, 25.0, 4.0),
+    (250.0, 75.0, 25.0, 4.5),
+];
+
+/// A lipped channel of the catalogue: its name as `Model::section_named` makes it, its
+/// dimensions (m) and its mass (kg/m).
+#[derive(Clone, Debug)]
+pub struct LippedShape {
+    pub name: String,
+    pub h: f64,
+    pub b: f64,
+    pub d: f64,
+    pub t: f64,
+}
+
+impl LippedShape {
+    pub fn mass(&self) -> f64 {
+        (self.h + 2.0 * self.b + 2.0 * self.d - 4.0 * self.t) * self.t * 7850.0
+    }
+}
+
+/// The lipped channels, lightest first.
+pub fn lipped_catalogue() -> Vec<LippedShape> {
+    let mut v: Vec<LippedShape> = LIPPED.iter().map(|&(h, b, d, t)| LippedShape { name: format!("C {}x{}x{}x{}", fmt(h), fmt(b), fmt(d), fmt(t)), h: h / 1e3, b: b / 1e3, d: d / 1e3, t: t / 1e3 }).collect();
+    v.sort_by(|a, b| a.mass().total_cmp(&b.mass()));
+    v
+}
+
 /// The catalogue, lightest first.
 pub fn catalogue() -> Vec<HShape> {
     let mut v: Vec<HShape> = H.iter().map(|&(d, bf, tw, tf, r)| HShape { name: format!("H {}x{}x{}x{}", fmt(d), fmt(bf), fmt(tw), fmt(tf)), d, bf, tw, tf, r }).collect();

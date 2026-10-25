@@ -77,6 +77,10 @@ pub fn import(v: &Value) -> Result<(Model, ImportReport), String> {
             h.shape()
         } else if s.get("b").is_some() && s.get("h").is_some() && (s.get("shape").and_then(Value::as_str) == Some("rect") || (num(s, "a") - num(s, "b") * num(s, "h")).abs() < 0.02 * num(s, "a").max(1e-9)) {
             Shape::Rect { b: num(s, "b"), h: num(s, "h") }
+        } else if let Some((h, b, d, t)) = parse_lipped(name.rsplit(':').next().unwrap_or(&name).trim()) {
+            // a lipped channel by its name ("C 100x50x20x2.3": purlins and rafters)
+            steel_sections.push(sid);
+            Shape::LippedC { h, b, d, t }
         } else {
             steel_sections.push(sid);
             Shape::General { a: num(s, "a"), iy: num(s, "iy"), iz: num(s, "iz"), j: num(s, "j"), shear: None }

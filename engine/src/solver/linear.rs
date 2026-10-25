@@ -33,6 +33,15 @@ const DOF_MAP_12_TO_14: [usize; 12] = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12];
 /// Free DOFs threshold: use sparse solver when n_free >= this.
 pub const SPARSE_THRESHOLD: usize = 64;
 
+/// The largest free-DOF count for which the dense LU fallback (used when the sparse
+/// Cholesky fails) is attempted: a dense K_ff above it (12 000² × 8 B ≈ 1.2 GB) would
+/// exhaust memory, so the solve fails with the reason instead.
+pub const DENSE_FALLBACK_LIMIT: usize = 12_000;
+
+fn dense_fallback_refused(nf: usize) -> String {
+    format!("Stiffness matrix is not positive definite (a mechanism, a disconnected member or a near-zero stiffness) and with {nf} free DOFs it is too large for the dense fallback (limit {DENSE_FALLBACK_LIMIT}): check the supports and that every member is connected")
+}
+
 /// Free-DOF count at which explicitly requested Auto mode tries PCG after
 /// checking stability with unshifted Cholesky. Missing options remain direct.
 ///
@@ -1489,6 +1498,9 @@ impl PreparedStatic2D<'_> {
                             }
                             None => {
                                 used_lu_fallback = true;
+                                if nf > DENSE_FALLBACK_LIMIT {
+                                    return Err(dense_fallback_refused(nf));
+                                }
                                 let lu = direct.dense_lu.get_or_init(|| {
                                     let mut k_ff_d = p.k_ff.to_dense_symmetric();
                                     lu_factor(&mut k_ff_d, nf).map(|piv| (k_ff_d, piv))
@@ -2775,6 +2787,9 @@ impl PreparedStatic3D {
     /// corrected for prescribed displacements (same input the sparse solve used).
     fn dense_lu_fallback_3d(&self, p: &SparsePrepared3D, f_f: &[f64]) -> Result<Vec<f64>, String> {
         let nf = self.nf;
+        if nf > DENSE_FALLBACK_LIMIT {
+            return Err(dense_fallback_refused(nf));
+        }
         let lu = p.dense_lu.get_or_init(|| {
             let mut k_ff_d = p.k_ff.to_dense_symmetric();
             lu_factor(&mut k_ff_d, nf).map(|piv| (k_ff_d, piv))
@@ -3187,6 +3202,9 @@ impl PreparedStatic3D {
 
                 // Dense LU last resort (shared by both failure modes).
                 let dense_lu = |direct: &PcgDirectFallback3D, f_f: &[f64]| -> Result<Vec<f64>, String> {
+                    if nf > DENSE_FALLBACK_LIMIT {
+                        return Err(dense_fallback_refused(nf));
+                    }
                     let lu = direct.dense_lu.get_or_init(|| {
                         let mut k_ff_d = p.k_ff.to_dense_symmetric();
                         lu_factor(&mut k_ff_d, nf).map(|piv| (k_ff_d, piv))

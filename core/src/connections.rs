@@ -65,12 +65,21 @@ pub fn shear_tab(member: Id, end: &str, vu: f64, beam: (f64, f64, f64, f64, f64)
     let ab = std::f64::consts::PI * (cs.bolt_d / 1000.0).powi(2) / 4.0;
     let rn_bolt = cs.fnv * 1e6 * ab;
     let mut best: Option<ConnectionDesign> = None;
+    // layouts: one bolt and a horizontal pair for shallow members (purlins, rafters), then
+    // vertical rows of 2 to 12; each needs its depth inside the clear web
+    // the edge distance shrinks for a shallow web, never below 1.5 d (AISC J3.4 / AISI E3.1)
+    let edge = cs.edge.min(((clear - 2.0) / 2.0).max(1.5 * cs.bolt_d));
+    let mut layouts: Vec<(usize, bool, f64, Vec<BoltPosition>)> = vec![
+        (1, false, 2.0 * edge, vec![BoltPosition { x: 0.0, y: 0.0 }]),
+        (2, true, 2.0 * edge, vec![BoltPosition { x: -cs.pitch / 2000.0, y: 0.0 }, BoltPosition { x: cs.pitch / 2000.0, y: 0.0 }]),
+    ];
     for n in 2..=12usize {
-        let depth = (n - 1) as f64 * cs.pitch + 2.0 * cs.edge;
+        layouts.push((n, false, (n - 1) as f64 * cs.pitch + 2.0 * edge, (0..n).map(|k| BoltPosition { x: 0.0, y: (k as f64 - (n - 1) as f64 / 2.0) * cs.pitch / 1000.0 }).collect()));
+    }
+    for (n, row, depth, bolts) in layouts {
         if depth > clear {
-            break;
+            continue;
         }
-        let bolts: Vec<BoltPosition> = (0..n).map(|k| BoltPosition { x: 0.0, y: (k as f64 - (n - 1) as f64 / 2.0) * cs.pitch / 1000.0 }).collect();
         let g = BoltGroupData { connection_id: 1, bolts, rn_shear: rn_bolt, rn_bearing: None, phi: Some(0.75) };
         let f = BoltGroupForces { connection_id: 1, vx: 0.0, vy: vu * 1e3, m: Some(vu * 1e3 * cs.e / 1000.0) };
         let br = check_bolt_groups(&BoltGroupInput { groups: vec![g], forces: vec![f] }).remove(0);
@@ -93,7 +102,7 @@ pub fn shear_tab(member: Id, end: &str, vu: f64, beam: (f64, f64, f64, f64, f64)
             member,
             end: end.into(),
             vu,
-            bolts: format!("{n}-M{:.0} (Fnv {:.0} MPa) at {:.0} mm", cs.bolt_d, cs.fnv, cs.pitch),
+            bolts: if n == 1 { format!("1-M{:.0} (Fnv {:.0} MPa)", cs.bolt_d, cs.fnv) } else if row { format!("2-M{:.0} in a row (Fnv {:.0} MPa) at {:.0} mm", cs.bolt_d, cs.fnv, cs.pitch) } else { format!("{n}-M{:.0} (Fnv {:.0} MPa) at {:.0} mm", cs.bolt_d, cs.fnv, cs.pitch) },
             plate: format!("PL {:.0} x {:.0} mm", cs.plate_t, depth),
             weld: format!("2 x {:.0} mm fillet, E{:.0}", cs.weld, cs.fexx / 6.895),
             bolt_ratio: br.unity_ratio,
@@ -102,7 +111,7 @@ pub fn shear_tab(member: Id, end: &str, vu: f64, beam: (f64, f64, f64, f64, f64)
             weld_ratio: wr.unity_ratio,
             ratio,
             ok: ratio <= 1.0,
-            notes: vec![],
+            notes: if edge < cs.edge - 1e-9 { vec![format!("edge distance {edge:.0} mm (the web's clear depth is {clear:.0} mm)")] } else { vec![] },
         };
         let done = d.ok;
         best = Some(d);

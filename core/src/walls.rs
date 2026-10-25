@@ -89,7 +89,8 @@ pub fn levels_for(m: &Model, w: &Wall) -> Vec<f64> {
     // the levels already built stay (a wall alone has no other nodes to find them by)
     z.extend(w.levels.iter().copied().filter(|z| *z >= w.z0 - 1e-3 && *z <= w.z1 + 1e-3));
     z.sort_by(f64::total_cmp);
-    z.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+    // levels closer than the node tolerance would share a node and make a pier of zero length
+    z.dedup_by(|a, b| (*a - *b).abs() < crate::model::TOL);
     z
 }
 
@@ -162,7 +163,9 @@ fn build(m: &mut Model, w: &Wall, levels: &[f64]) {
         let nc = m.node_at([c[0], c[1], *z]);
         if k + 1 < levels.len() {
             let nt = m.node_at([c[0], c[1], levels[k + 1]]);
-            push(m, nc, nt, sec, w.material, MemberKind::Column, Role::WallPier(w.id), roll);
+            if nt != nc {
+                push(m, nc, nt, sec, w.material, MemberKind::Column, Role::WallPier(w.id), roll);
+            }
         }
         for e in [w.a, w.b] {
             let ne = m.node_at([e[0], e[1], *z]);

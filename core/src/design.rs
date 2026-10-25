@@ -376,9 +376,16 @@ pub fn design_pass(model: &Model, a: &Analysis, o: &Options) -> Report {
     }
     // the steel beams' end connections
     if o.steel {
-        for m in model.members.iter().filter(|m| wanted(m.id) && model.is_steel(m) && model.kind(m) == MemberKind::Beam) {
+        // beams and the sloping rafters (braces by inclination), not columns
+        for m in model.members.iter().filter(|m| wanted(m.id) && model.is_steel(m) && model.kind(m) != MemberKind::Column) {
             let (Some(sec), Some(mt)) = (model.section(m.section), model.material(m.material)) else { continue };
-            let Shape::H { d, bf, tw, tf, r } = sec.shape else { continue };
+            // an H shape by its web; a lipped channel (purlins, rafters) by its web plate t,
+            // the bolts bearing on the thin web
+            let (d, bf, tw, tf, r) = match sec.shape {
+                Shape::H { d, bf, tw, tf, r } => (d, bf, tw, tf, r),
+                Shape::LippedC { h, b, t, .. } => (h, b, t, t, 0.0),
+                _ => continue,
+            };
             for (node, end, first) in [(m.i, "start", true), (m.j, "end", false)] {
                 if free_end(model, m, node) {
                     continue;
@@ -452,6 +459,23 @@ fn select_shape(model: &Model, m: &Member, dem: &SteelDemand) -> Option<crate::s
     None
 }
 
+/// The lightest lipped channel of the catalogue that passes the cold-formed checks for a
+/// member's stations (`steel_shapes` names starting with C limit the choice).
+fn select_lipped(model: &Model, m: &Member, st: &crate::othermat::Stations) -> Option<crate::sections::LippedShape> {
+    let mt = model.material(m.material)?;
+    let names: Vec<(f64, f64, f64, f64)> = model.design.steel_shapes.iter().filter_map(|n| parse_lipped(n)).collect();
+    let len = model.length(m);
+    for s in crate::sections::lipped_catalogue() {
+        if !names.is_empty() && !names.iter().any(|&(h, b, d, t)| (h - s.h).abs() < 1e-6 && (b - s.b).abs() < 1e-6 && (d - s.d).abs() < 1e-6 && (t - s.t).abs() < 1e-6) {
+            continue;
+        }
+        if crate::othermat::cold_formed(m, mt, s.h, s.b, s.d, s.t, len, st, &model.design).is_ok_and(|d| d.ok) {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// Designs the model, resizing and re-analysing when asked. The model's sections change in
 /// place when `resize` or `select` changes them.
 pub fn run(model: &mut Model, o: &Options) -> Result<(Report, Analysis), String> {
@@ -465,34 +489,68 @@ pub fn run(model: &mut Model, o: &Options) -> Result<(Report, Analysis), String>
         rep.rounds = round;
         let mut changed = false;
         if o.select {
-            let res = results(model, &a);
-            let wanted = |id: Id| o.members.is_empty() || o.members.contains(&id);
-            let mut picks: Vec<(Id, Option<String>, crate::sections::HShape)> = vec![];
-            for m in model.members.iter().filter(|m| model.is_steel(m) && wanted(m.id)) {
-                let dem = steel_demand(model, m, &res);
-                match select_shape(model, m, &dem) {
-                    Some(s) => picks.push((m.id, m.group.clone(), s)),
-                    None => rep.warnings.push(format!("member {}: no catalogue shape passes", m.id)),
-                }
-            }
-            // a group takes its heaviest pick
-            let mut by_group: std::collections::HashMap<String, crate::sections::HShape> = Default::default();
-            for (_, g, s) in &picks {
-                if let Some(g) = g {
-                    let e = by_group.entry(g.clone()).or_insert_with(|| s.clone());
-                    if s.mass() > e.mass() {
-                        *e = s.clone();
+            // names the catalogue does not know would silently narrow the choice
+            if round == 1 {
+                for n in &model.design.steel_shapes {
+                    let lipped_known = parse_lipped(n).is_some_and(|(h, b, d, t)| crate::sections::lipped_catalogue().iter().any(|s| (h - s.h).abs() < 1e-6 && (b - s.b).abs() < 1e-6 && (d - s.d).abs() < 1e-6 && (t - s.t).abs() < 1e-6));
+                    if !lipped_known && crate::sections::find(n).is_none() {
+                        rep.warnings.push(format!("steel_shapes: '{n}' is not in the catalogue (lipped channels: {}; H shapes by their catalogue names)", crate::sections::lipped_catalogue().iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(", ")));
                     }
                 }
             }
-            for (id, g, s) in picks {
-                let s = g.and_then(|g| by_group.get(&g).cloned()).unwrap_or(s);
-                let sid = model.section_named(&s.name)?;
+            let res = results(model, &a);
+            let wanted = |id: Id| o.members.is_empty() || o.members.contains(&id);
+            // picks: (member, group, section name, mass kg/m); a lipped channel stays a
+            // lipped channel (purlins, rafters), an H shape an H shape
+            let mut picks: Vec<(Id, Option<String>, String, f64)> = vec![];
+            for m in model.members.iter().filter(|m| model.is_steel(m) && wanted(m.id)) {
+                let lipped = model.section(m.section).is_some_and(|s| matches!(s.shape, Shape::LippedC { .. }));
+                let pick = if lipped {
+                    let st = stations(&res.uls, m.id);
+                    select_lipped(model, m, &st).map(|s| (s.name.clone(), s.mass()))
+                } else {
+                    let dem = steel_demand(model, m, &res);
+                    select_shape(model, m, &dem).map(|s| (s.name.clone(), s.mass()))
+                };
+                // the pieces of one BIM member (a rafter between its purlins) are one group:
+                // a physical member has one section
+                let group = m.group.clone().or_else(|| m.bim_id.clone());
+                match pick {
+                    Some((name, mass)) => picks.push((m.id, group, name, mass)),
+                    None => {
+                        rep.warnings.push(format!("member {}: no catalogue shape passes", m.id));
+                        // the heaviest allowed shape, so its group goes up to it
+                        let heaviest = if lipped {
+                            let names: Vec<(f64, f64, f64, f64)> = model.design.steel_shapes.iter().filter_map(|n| parse_lipped(n)).collect();
+                            crate::sections::lipped_catalogue().into_iter().filter(|s| names.is_empty() || names.iter().any(|&(h, b, d, t)| (h - s.h).abs() < 1e-6 && (b - s.b).abs() < 1e-6 && (d - s.d).abs() < 1e-6 && (t - s.t).abs() < 1e-6)).last().map(|s| (s.name.clone(), s.mass()))
+                        } else {
+                            let names = &model.design.steel_shapes;
+                            crate::sections::catalogue().into_iter().filter(|s| names.is_empty() || names.iter().any(|n| crate::sections::find(n).is_some_and(|x| x.name == s.name))).max_by(|a, b| a.mass().total_cmp(&b.mass())).map(|s| (s.name.clone(), s.mass()))
+                        };
+                        if let Some((name, mass)) = heaviest {
+                            picks.push((m.id, group, name, mass));
+                        }
+                    }
+                }
+            }
+            // a group takes its heaviest pick
+            let mut by_group: std::collections::HashMap<String, (String, f64)> = Default::default();
+            for (_, g, name, mass) in &picks {
+                if let Some(g) = g {
+                    let e = by_group.entry(g.clone()).or_insert_with(|| (name.clone(), *mass));
+                    if *mass > e.1 {
+                        *e = (name.clone(), *mass);
+                    }
+                }
+            }
+            for (id, g, name, _) in picks {
+                let name = g.and_then(|g| by_group.get(&g).map(|x| x.0.clone())).unwrap_or(name);
+                let sid = model.section_named(&name)?;
                 let m = model.members.iter_mut().find(|m| m.id == id).unwrap();
                 if m.section != sid {
                     m.section = sid;
                     changed = true;
-                    changes.push(format!("member {id}: {}", s.name));
+                    changes.push(format!("member {id}: {name}"));
                 }
             }
         }
@@ -623,6 +681,15 @@ pub fn bim_export(model: &Model, rep: &Report) -> serde_json::Value {
             e["ok"] = json!(d.ok);
             e["code"] = json!("AISC 360-16 LRFD");
             e["mass_kg_m"] = json!(round(d.mass, 1));
+        } else if let Some(d) = rep.others.iter().find(|d| d.member == m.id) {
+            e["ratio"] = json!(round(d.ratio, 3));
+            e["ok"] = json!(d.ok);
+            e["code"] = json!(d.code);
+            e["governs"] = json!(d.governs);
+            let conns: Vec<_> = rep.connections.iter().filter(|c| c.member == m.id).map(|c| json!({"end": c.end, "bolts": c.bolts, "plate": c.plate, "weld": c.weld, "ok": c.ok})).collect();
+            if !conns.is_empty() {
+                e["connections"] = json!(conns);
+            }
         } else {
             e["ok"] = serde_json::Value::Null;
             e["code"] = json!("not designed");

@@ -577,9 +577,19 @@ pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analy
             cuts = vec![0.0, len];
         }
         cuts.sort_by(f64::total_cmp);
-        cuts.dedup_by(|x, y| (*x - *y).abs() < 1e-4);
+        // cuts closer than the node tolerance would snap to one engine node (a zero-length element)
+        cuts.dedup_by(|x, y| (*x - *y).abs() < TOL);
+        if cuts.len() > 1 && cuts[cuts.len() - 1] < len - 1e-9 {
+            // the end survives the dedup
+            let n = cuts.len();
+            cuts[n - 1] = len;
+        }
         // at least SEGMENTS pieces (columns 2), each long piece divided evenly
+        // short members (purlins, rafter pieces between purlins) need fewer: a station every
+        // 0.5 m at least, two per member, so a roof of a thousand pieces stays solvable; a
+        // beam on a Winkler foundation keeps the full count (its curvature varies along it)
         let want = if m.axial_only() { 1 } else if model.kind(m) == MemberKind::Column { columns.max(1) } else { beams.max(1) };
+        let want = if m.winkler.is_some() { want } else { want.min(((len / 0.5).ceil() as usize).max(2)) };
         let mut fine = vec![cuts[0]];
         for w in cuts.windows(2) {
             let k = ((w[1] - w[0]) / len * want as f64).ceil().max(1.0) as usize;
@@ -605,6 +615,8 @@ pub fn analyze_with(model: &Model, beams: usize, columns: usize) -> Result<Analy
             };
             ids.push((s, id));
         }
+        // two cuts snapped to the same engine node make no element
+        ids.dedup_by(|b, a| b.1 == a.1);
         for w in ids.windows(2) {
             pieces.push(Piece { member: m.id, s0: w[0].0, s1: w[1].0, ni: w[0].1, nj: w[1].1 });
         }
