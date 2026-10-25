@@ -31,6 +31,7 @@ pub mod sections;
 pub mod slabfe;
 pub mod stability;
 pub mod slabload;
+pub mod stairs;
 pub mod stabileo;
 pub mod steel;
 pub mod timehistory;

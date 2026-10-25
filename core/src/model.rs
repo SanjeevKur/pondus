@@ -630,6 +630,9 @@ pub struct Model {
     pub seismic: crate::seismic::Seismic,
     /// Structural walls (shear walls), each analysed as piers with rigid arms (`walls.rs`).
     pub walls: Vec<Wall>,
+    /// Stair flights and landings, designed as one-way slabs (`stairs.rs`).
+    #[serde(default)]
+    pub stairs: Vec<crate::stairs::Stair>,
     /// Lumped masses at nodes, for the modal, response spectrum and seismic weight; a node
     /// that carries only a mass (a floor's centre of mass) must lie on a rigid diaphragm.
     pub masses: Vec<NodalMass>,
@@ -727,7 +730,7 @@ impl Model {
             stages: vec![],
             design: DesignSettings::default(),
             seismic: Default::default(),
-            walls: vec![],
+            walls: vec![], stairs: vec![],
             masses: vec![],
         }
     }

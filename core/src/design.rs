@@ -53,6 +53,8 @@ pub struct Report {
     pub vibration: Vec<crate::connections::Vibration>,
     /// Structural walls, one row per wall and storey (ACI 318-19 Ch. 11, 18.10).
     pub walls: Vec<crate::walls::WallDesign>,
+    /// Stair flights and landings (one-way slabs).
+    pub stairs: Vec<crate::stairs::StairDesign>,
     /// Members not designed, and why.
     pub skipped: Vec<String>,
     /// Section changes made by resize / select.
@@ -117,6 +119,13 @@ impl Report {
             "others": self.others.iter().map(|o| serde_json::json!({
                 "member": o.member, "bim_id": o.bim_id, "code": o.code, "section": o.section, "ratio": round(o.ratio, 3), "governs": o.governs, "ok": o.ok,
                 "checks": o.checks.iter().map(|c| format!("{}: {:.2} ({})", c.name, c.ratio, c.detail)).collect::<Vec<_>>(), "notes": o.notes,
+            })).collect::<Vec<_>>(),
+            "stairs": self.stairs.iter().map(|s| serde_json::json!({
+                "stair": s.stair, "bim_id": s.bim_id, "name": s.name, "kind": s.kind, "width_m": round(s.width, 2), "waist_mm": round(s.waist * 1e3, 0), "span_m": round(s.span, 2),
+                "wd_kPa": round(s.wd, 2), "wl_kPa": round(s.wl, 2), "wu_kPa": round(s.wu, 2),
+                "bars": s.bars.iter().map(|b| format!("{}: {} (Mu {:.1} kN·m/m, As {:.0} / {:.0} mm²/m)", b.location, b.bars, b.mu, b.as_req, b.as_prov)).collect::<Vec<_>>(),
+                "Vu_kN_m": round(s.vu, 1), "phiVc_kN_m": round(s.phi_vc, 1), "h_min_mm": round(s.h_min, 0), "reaction_kN_m": [round(s.reaction[0], 2), round(s.reaction[1], 2)],
+                "ratio": round(s.ratio, 3), "governs": s.governs, "ok": s.ok, "notes": s.notes,
             })).collect::<Vec<_>>(),
             "slabs": self.slabs.iter().map(|s| serde_json::json!({
                 "slab": s.slab, "bim_id": s.bim_id, "size_m": format!("{:.2} x {:.2}", s.lx, s.ly), "h_mm": round(s.h * 1e3, 0), "method": s.method, "wu_kPa": round(s.wu, 2),
@@ -421,6 +430,9 @@ pub fn design_pass(model: &Model, a: &Analysis, o: &Options) -> Report {
                 rep.slabs.push(rc::design_slab(s, cont, gamma * s.h + s.dead, s.live, &mat, &model.design));
             }
         }
+        for s in &model.stairs {
+            rep.stairs.push(crate::stairs::design(s, &mat, &model.design, gamma));
+        }
     }
     rep
 }
@@ -619,6 +631,19 @@ pub fn run(model: &mut Model, o: &Options) -> Result<(Report, Analysis), String>
                     changes.push(format!("slab {}: h {:.0} mm", d.slab, h * 1000.0));
                 }
             }
+            for d in rep.stairs.iter().filter(|d| !d.ok) {
+                // a flight's waist or a landing's thickness: up to L/20 or L/24, else 25 mm more
+                let h = ((d.h_min / 1000.0).max(d.waist + 0.025) * 40.0 - 1e-6).ceil() / 40.0;
+                if h > 0.35 {
+                    rep.warnings.push(format!("stair {}: still failing at 350 mm, left as it is", d.stair));
+                    continue;
+                }
+                if let Some(s) = model.stairs.iter_mut().find(|s| s.id == d.stair) {
+                    s.waist = h;
+                    changed = true;
+                    changes.push(format!("stair {}: waist {:.0} mm", d.stair, h * 1000.0));
+                }
+            }
         }
         if !changed || round == 6 {
             // keep only the last change of each member
@@ -737,6 +762,19 @@ pub fn bim_export(model: &Model, rep: &Report) -> serde_json::Value {
         "model": model.name,
         "how_to_apply": "In Aedifex: for each member find the element by bim_id (or by start/end), duplicate_type of 'family' with type_params_m to get 'type' if the project lacks it, then change_type; write the reinforcement into the element's comments/marks. Slabs: set the floor type's thickness. Walls: a 'Basic Wall' of the given type (one concrete layer of thickness_m) from start to end, base_z to top_z, marked structural.",
         "members": elems,
+        "stairs": model.stairs.iter().map(|s| {
+            let mut e = json!({"stair": s.id, "bim_id": s.bim_id, "name": s.name, "kind": s.kind, "width_m": s.width, "waist_m": s.waist, "span_m": s.span, "riser_m": s.riser, "tread_m": s.tread, "risers": s.risers, "fixity": s.fixity, "z0": s.z0, "z1": s.z1});
+            if let Some(d) = rep.stairs.iter().find(|d| d.stair == s.id) {
+                e["reinforcement"] = json!(d.bars.iter().map(|b| json!({"location": b.location, "bars": b.bars})).collect::<Vec<_>>());
+                e["ratio"] = json!(round(d.ratio, 3));
+                e["ok"] = json!(d.ok);
+                e["code"] = json!("ACI 318-19");
+                e["h_min_mm"] = json!(round(d.h_min, 0));
+                e["reaction_kN_m"] = json!([round(d.reaction[0], 2), round(d.reaction[1], 2)]);
+                e["notes"] = json!(d.notes);
+            }
+            e
+        }).collect::<Vec<_>>(),
         "slabs": slabs,
     })
 }
