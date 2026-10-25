@@ -27,6 +27,9 @@ pub struct FootingSettings {
     pub gamma_soil: f64,
     pub mu: f64,
     pub min_h: f64,
+    /// Least plan side, m (0: as the bearing pressure needs).
+    #[serde(default)]
+    pub min_b: f64,
     /// Bars to choose from, mm, and the clear cover to the bottom bars, m.
     pub bars: Vec<f64>,
     pub cover: f64,
@@ -34,7 +37,7 @@ pub struct FootingSettings {
 
 impl Default for FootingSettings {
     fn default() -> Self {
-        FootingSettings { q_allow: 150.0, depth: 1.5, gamma_soil: 18.0, mu: 0.5, min_h: 0.3, bars: vec![12.0, 16.0, 20.0, 25.0], cover: 0.075 }
+        FootingSettings { q_allow: 150.0, depth: 1.5, gamma_soil: 18.0, mu: 0.5, min_h: 0.3, min_b: 0.0, bars: vec![12.0, 16.0, 20.0, 25.0], cover: 0.075 }
     }
 }
 
@@ -74,7 +77,7 @@ pub fn face_moment(qu: f64, c: f64) -> f64 {
 }
 
 /// Designs a footing under every supported node that carries a concrete column.
-pub fn design(model: &Model, a: &Analysis) -> Vec<FootingDesign> {
+pub fn design(model: &Model, a: &Analysis, columns: &[crate::rc::ColumnDesign]) -> Vec<FootingDesign> {
     let fs = &model.design.footing;
     let conc = model.materials.iter().find(|m| m.kind == MaterialKind::Concrete);
     let (fc, gamma_c) = (conc.map(|m| m.fc).filter(|f| *f > 0.0).unwrap_or(24.0), conc.map(|m| m.gamma).unwrap_or(24.0));
@@ -105,9 +108,18 @@ pub fn design(model: &Model, a: &Analysis) -> Vec<FootingDesign> {
         let mut notes = vec![];
         // size: service load plus the footing and the soil over it
         let over = |h: f64| gamma_c * h + fs.gamma_soil * (fs.depth - h).max(0.0);
-        let mut h = fs.min_h;
+        // thick enough for the column's dowels to develop in compression (ACI 318-19
+        // 25.4.9.2: 0.24 fy db / √f'c, at least 0.043 fy db and 200 mm) above the mat
+        let h_dowel = columns.iter().find(|c| c.member == col.id).map(|c| {
+            let ldc = (0.24 * model.design.fy / fc.sqrt() * c.db).max(0.043 * model.design.fy * c.db).max(200.0) / 1000.0;
+            ldc + fs.cover + 2.0 * 0.016 + 0.01
+        }).unwrap_or(0.0);
+        if h_dowel > fs.min_h {
+            notes.push(format!("thickness {:.0} mm for the column dowels' development length", h_dowel * 1000.0));
+        }
+        let mut h = fs.min_h.max((h_dowel * 20.0).ceil() / 20.0);
         let mut side = ((rs[2] / (fs.q_allow - over(h)).max(10.0)).sqrt() * 10.0).ceil() / 10.0;
-        side = side.max(cl.max(cw) + 0.3);
+        side = side.max(cl.max(cw) + 0.3).max(fs.min_b);
         let mut chk = None;
         for _ in 0..200 {
             let ps = rs[2] + over(h) * side * side;

@@ -369,7 +369,7 @@ pub fn design_pass(model: &Model, a: &Analysis, o: &Options) -> Report {
         }
     }
     if o.footings && o.beams {
-        rep.footings = crate::footing::design(model, a);
+        rep.footings = crate::footing::design(model, a, &rep.columns);
         if model.walls.iter().any(|w| model.supports.iter().any(|s| model.members.iter().any(|m| m.role == Role::WallPier(w.id) && (m.i == s.node || m.j == s.node)))) {
             rep.skipped.push("wall footings are not designed (a strip footing or a raft under each wall is for the engineer)".into());
         }
